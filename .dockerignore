@@ -1,0 +1,52 @@
+# Docker 构建上下文排除（ADR-0027 §2.1 / 任务卡 T28）
+#
+# 铁律：镜像是可分发物，可分发物里不许有凭证。
+# 构建上下文是仓库根，没有本文件时 `COPY config ./config` 会把真实 .env
+# （上游 key + client keys）烧进镜像层，push 到 registry 即泄漏。
+# 运行时配置一律走 volume / env_file 注入（compose 已挂 ../config）。
+
+# ── 凭证与 live 配置（绝不进镜像）──
+config/.env
+config/.env.*
+!config/.env.example
+config/*.bak
+config/*.bak*
+config/routing.toml
+config/identity.toml
+config/export.toml
+**/*.pem
+**/*.key
+
+# ── 运行时数据与残留 ──
+data/
+logs/
+dump.rdb
+dump*.rdb
+appendonlydir/
+*.pid
+
+# ── 归档 / 暂存 / 基准冻结区 ──
+archive/
+public-tree/
+bench_frozen/
+docs/adr/
+docs/planning/
+docs/research/
+docs/reviews/
+docs/benchmarks/
+docs/experiments/
+
+# ── 开发环境 ──
+.venv/
+venv/
+.git/
+.github/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store

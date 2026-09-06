@@ -1,0 +1,37 @@
+# BladeX 在线协同导出配置（Beta T13/B3.2；`cp export.toml.example export.toml` 后生效）
+#
+# worker 跑在 consolidator 进程里，rebuild 主管线之后执行：
+#   - 增量（游标水位，状态存 data/export_state.json）
+#   - 失败指数退避（目标不可达只降级不阻塞主管线）
+#   - 墓碑同步（BladeX 删除 → 目标侧删除）
+#   - 敏感联动：exporter 声明 exposure，Fact.exposure_ceiling 越级不出境
+# 凭证纪律：toml 只写 env 变量名，密钥放 config/.env。
+
+# ── 参考实现：JSONL 目录（调试/自定义管道）──
+# [[exporters]]
+# type = "jsonl"
+# name = "debug-out"
+# enabled = true
+# exposure = "private"        # local | private | public（目标的暴露等级）
+# interval_s = 300
+# scopes = []                 # 空 = 全部；如 ["personal"]
+# [exporters.options]
+# dir = "data/export_out"
+
+# ── Obsidian vault（T14）──
+# [[exporters]]
+# type = "obsidian"
+# name = "my-vault"
+# enabled = true
+# exposure = "private"
+# [exporters.options]
+# vault_dir = "~/Documents/Obsidian/BladeX"   # vault 内子目录（会自动创建）
+
+# ── PostgreSQL（T15）──
+# [[exporters]]
+# type = "postgres"
+# name = "team-pg"
+# enabled = true
+# exposure = "private"
+# [exporters.options]
+# dsn_env = "BLADEX_PG_DSN"   # 连接串放 env（如 postgresql://user:pw@host/db）

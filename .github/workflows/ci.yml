@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # integration 测试需要 Redis（Pipeline 接入缓冲）；unit 测试不依赖。
+    services:
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+          enable-cache: true
+
+      # 缓存 e5 模型（fastembed 首跑下载 ~2GB；命中缓存避免每次 CI 重下）
+      - name: Cache e5 model
+        uses: actions/cache@v4
+        with:
+          path: data/fastembed_cache
+          key: fastembed-multilingual-e5-large-${{ runner.os }}
+
+      - run: uv sync --all-extras
+
+      - name: ruff
+        run: uv run ruff check .
+
+      # mypy 非阻塞：BladeX 代码有 ~160 条 strict 类型债待清理（独立任务），beta 阶段只出报告不拦 CI。
+      - name: mypy (informational, non-blocking)
+        continue-on-error: true
+        run: uv run mypy packages/bladex-core/bladex_core packages/bladex-proxy/bladex_proxy
+
+      - name: pytest
+        run: uv run pytest -q
+        env:
+          BLADEX_REDIS_URL: redis://127.0.0.1:6379/0

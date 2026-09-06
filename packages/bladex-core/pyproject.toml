@@ -1,0 +1,23 @@
+[project]
+name = "bladex-core"
+version = "0.1.0"
+description = "BladeX core - memory orchestration (the moat): prefetch, consolidation, consistency. Agent-neutral."
+requires-python = ">=3.11"
+# v4 记忆编排核心（护城河，agent 中立）：prefetch 相关性注入 + consolidation 增量蒸馏 +
+# consistency 矛盾校验 + recall 跨 session 召回。权威见项目 ADR：0008 / 0009 / 0018。
+# 日志：本包被 bladex-proxy 进程加载，随宿主用 stdlib logging（被外部进程加载的库不引 structlog）。
+# pydantic：domain 对象（Fact / HardRule / RouteDecision 等）用 Pydantic v2，是硬运行期依赖
+# （v4 proxy 形态下 bladex-core 被 bladex-proxy import，不能再靠传递依赖拿 pydantic）。
+dependencies = ["pydantic>=2"]
+
+[project.optional-dependencies]
+# pip install bladex-core[semantic]
+# fastembed: ONNX·CPU·多语 embedding（multilingual-e5-large），无 GPU 依赖，向量推理全本地。
+semantic = ["fastembed>=0.3", "numpy>=1.24"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bladex_core"]

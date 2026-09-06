@@ -1,0 +1,282 @@
+# BladeX 路由配置示例（Phase 1 schema v2 + RA 修复卡 20260712）
+# 复制为 config/routing.toml 后按需修改。
+# 密钥只引环境变量名（api_key_env），不要把密钥写进本文件（对齐 ADR-0009 密钥不入 git）。
+#
+# ══ api_base 的两种写法（二选一）═══════════════════════════════════════════════
+#
+#   ① 字面 URL —— 每个模型各写各的，适合多家上游混用：
+#        api_base = "https://ark.cn-beijing.volces.com/api/coding/v3"
+#
+#   ② 引用环境变量 —— 多个模型共用同一上游时，改 .env 一处即可全部切换：
+#        api_base_env = "BLADEX_UPSTREAM_API_BASE"
+#      （变量值在 config/.env 里：export BLADEX_UPSTREAM_API_BASE="https://..."）
+#
+#   两者同时配置时 api_base_env 优先；两者都不配 = 用 Router 的默认端点。
+#
+# 🔴 注意字段语义的差别，这是踩过坑的地方：
+#      api_base      存**字面 URL**      —— 不做环境变量解析
+#      api_base_env  存**环境变量名**    —— 运行时读 os.environ
+#      api_key_env   存**环境变量名**    —— 同上（密钥永远只用这种形式）
+#    把变量名直接写进 api_base（如 api_base = "BLADEX_UPSTREAM_API_BASE"）
+#    **不会**被解析。proxy 启动时会校验 api_base 必须以 http:// 或 https:// 开头，
+#    不合法即**拒绝启动**并打印具体是哪个模型、错在哪、两种正确写法。
+# 启用：BLADEX_ROUTE_ENABLED=true + BLADEX_ROUTING_CONFIG=config/routing.toml
+#
+# 路由固定流水线：aux → req_model → 规模floor → ① 选池(agent→filter→upstream)
+#   → ② 能力过滤(始终生效) → floor过滤 → 熔断过滤 → 粘性 → ③ failover。
+
+# ══ 统一模型列表（唯一真相：策略只引用 name；tier 也是三档池的唯一真相）═════════
+# tier 三级：strong / medium / weak
+# capabilities 词表：text(默认) / vision / audio / file / code（非法值会被忽略+告警）
+# provider：故障域分组（429 只跨 provider failover）。不配则从 api_base host 推导；
+#           同一账号/配额池的模型务必标同组，否则 429 failover 会在同配额上空转。
+
+[[models]]
+name = "openai/doubao-seed-2.0-pro"
+# 写法① 字面 URL（本条示范）
+api_base = "https://ark.cn-beijing.volces.com/api/plan/v3"
+api_key_env = "BLADEX_UPSTREAM_API_KEY"
+capabilities = ["text", "vision", "code"]
+tier = "strong"
+provider = "ark"
+# ADR-0028 §2：该模型的 Prompt Cache TTL（秒）。默认 300；`0` = 该模型无 prompt cache，
+# 视为永远冷。BladeX 据此决定"这一轮能不能改写送出的消息前缀"：
+#   温热 → 全量转发、复用上一轮冻结的降解/裁剪计划，不新增任何改写（保 cache 命中）；
+#   冷   → 装配正常跑 + 冷启相关性裁剪（cache 反正要重建，此时裁剪只赚不赔）。
+cache_ttl_s = 300
+
+[[models]]
+name = "openai/glm-5.2"
+api_base = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "GLM_API_KEY"
+capabilities = ["text", "code"]
+tier = "medium"
+provider = "zhipu"
+
+[[models]]
+name = "openai/kimi-k2.7-code"
+api_base = "https://api.moonshot.cn/v1"
+api_key_env = "KIMI_API_KEY"
+capabilities = ["text", "code"]
+tier = "medium"
+provider = "moonshot"
+
+[[models]]
+name = "openai/deepseek-v4-flash"
+api_base = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+capabilities = ["text"]
+tier = "weak"
+provider = "deepseek"
+
+[[models]]
+name = "openai/doubao-seed-2.0-lite"
+# 写法② 引用环境变量（本条示范）——与上面 pro 那条效果等价，
+# 但改 .env 里的 BLADEX_UPSTREAM_API_BASE 就能一次切换所有用此写法的模型
+api_base_env = "BLADEX_UPSTREAM_API_BASE"
+api_key_env = "BLADEX_UPSTREAM_API_KEY"
+capabilities = ["text"]
+tier = "weak"
+provider = "ark"
+
+# ══ 默认上游（策略全关时用；有序 = failover 链）════════════════════════════════
+# 首选失败（5xx/超时）→ 按序 failover；429 只跨 provider 切；4xx 不切。
+[upstream]
+models = ["openai/glm-5.2", "openai/kimi-k2.7-code"]   # 首选 → 备选
+
+# ══ agent 策略（默认关；支持 profile 级；模板预置）══════════════════════════════
+# map 的键支持两种粒度，匹配时"精确 profile 优先、base 兜底"：
+#   "hermes:accept" —— 特定 profile（agent_id 已是 base:profile 形式，ADR-0010）
+#   "hermes"        —— 该 agent 任意 profile 的兜底
+[strategies.agent]
+enabled = false
+# [strategies.agent.map]
+# "hermes:accept" = ["openai/doubao-seed-2.0-pro", "openai/glm-5.2"]   # 有序 = failover
+# "hermes"        = ["openai/glm-5.2"]                                  # base 兜底
+# "codex"         = ["openai/kimi-k2.7-code"]
+
+# ══ principal / team 级路由（ADR-0021：优先级 team > principal > agent）════════
+# 选池优先级：team 命中优先 -> 否则 principal -> 否则 agent -> 否则 filter/upstream。
+# map 键 = principal_id / team_id（identity.toml 声明）。团队级可强制走本地模型。
+# [strategies.principal]
+# enabled = false
+# [strategies.principal.map]
+# "alice" = ["openai/glm-5.2"]
+# [strategies.team]
+# enabled = false
+# [strategies.team.map]
+# "legal" = ["ollama/qwen3.6:35b-a3b"]   # 法务团队全员走本地 ollama（敏感数据不出网）
+# "rd"    = ["openai/deepseek-v4-flash"]
+
+# ══ 多模态策略（默认关；能力过滤始终生效，此开关只管偏好排序/空池兜底）═══════════
+# RA9：不参与选池——带图请求照常走档位判断，能力过滤保证不选到无 vision 模型，
+# map 只决定"同为合格时谁排前"与"池被清空时的兜底"。
+# map 的键只能用能力词表里的模态：vision / audio / file（text 不用配）。
+[strategies.multimodal]
+enabled = false
+# [strategies.multimodal.map]
+# vision = ["openai/doubao-seed-2.0-pro"]   # 仅放真实支持 vision 的模型（glm-5.2 ARK 不支持图）
+# audio  = []   # 有语音模型再填
+# file   = []   # 有文档模型再填
+
+# ══ 筛选器策略（LLM 裁判在三档池里判一档；默认关）════════════════════════════════
+# 三档候选池默认由 [[models]].tier 自动生成（单一 tier 真相，推荐）；
+# 显式配置 [strategies.filter.candidates] 可覆盖，但与 tier 不一致会告警
+# （routing_tier_mismatch）。
+# T3：裁判结果按 (session, query) LRU 缓存；失败/超时兜底 = 本会话上次档 > default_tier。
+[strategies.filter]
+enabled = false
+judge_model = "openai/doubao-seed-2.0-mini"   # 极速便宜模型当裁判
+no_think = true              # ARK 方言（extra_body thinking disabled），非 ARK 裁判模型无效
+max_prompt_chars = 2000      # 超过 → 不判，直接走 default_tier
+default_tier = "weak"        # 裁判失败且本会话无历史档时落此档
+judge_timeout_s = 5.0        # 裁判超时
+# [strategies.filter.candidates]  # 可选覆盖（不配则按 tier 自动生成）
+# weak   = ["openai/deepseek-v4-flash", "openai/doubao-seed-2.0-lite"]
+# medium = ["openai/glm-5.2", "openai/kimi-k2.7-code"]
+# strong = ["openai/doubao-seed-2.0-pro"]
+
+# ══ 规模层（T1/RA1：上下文规模 → tier 下限；默认关）═════════════════════════════
+# 成本主轴 = 上下文膨胀而非难度（2026-07-06 流量复盘）。floor 只升不降：
+# 巨型上下文 + 短 query（"继续"）不再被判 weak。judge_bypass：超阈值跳裁判省 RTT。
+# 阈值为占位默认值，用 scripts/inspect_hub.py 看真实请求 chars 分布后校准。
+[strategies.scale]
+enabled = false
+# floor_medium_chars = 60000    # 超过 → tier 下限 medium
+# floor_strong_chars = 400000   # 超过 → tier 下限 strong（0 = 关此档）
+# judge_bypass_chars = 60000    # 超过 → 跳裁判，直接取 floor 档
+
+# ══ 会话粘性（T2/RA2：同会话粘住所选模型，只升不降；默认关）══════════════════════
+# 消除逐轮判档的模型乒乓（每切一次 = 上游 prompt cache 全废）。
+# 升档或 failover 实际切换时才换模型；auxiliary 内部调用不参与。
+#
+# G14/MQ-RT1（2026-08-21 事故驱动）：**failover 被动粘上的模型有释放条件**，
+# 裁判/选池主动选出的没有。事故形状——ARK 一次 2 秒连接抖动 → 会话 failover 到
+# 本地 ollama → 粘性只升不降、且不看故障是否恢复 → 该会话在降级模型上待了 53 分钟，
+# 而日志里 `source=sticky` 读起来完全正常（所以是人撞见的，不是系统报出来的）。
+#
+# 释放的**主触发器是"上游 prompt cache 已经冷了"**，不是下面这个计时器：
+# 粘性存在的唯一理由就是复用 cache，cache 冷了它就没在保护任何东西，此刻释放代价为零；
+# 反过来 cache 还热时释放 = 白付一次全量 prefill。下面这个参数只是**兜底**，
+# 兜住"会话一直高频往来、cache 始终热"导致无限期粘在降级模型上的情况。
+#   0 = 关闭全部自动释放（回到 G14 之前的行为，只能靠 `bladex sticky flush` 手动放）
+# 查看当前粘性与降级漂移：`bladex sticky status`（origin=failover 且 held 很大 = 事故形状）
+[strategies.sticky]
+enabled = false
+# max_sessions = 500
+# failover_max_hold_s = 300
+
+# ══ req_model 显式指定（T5b/RA7：默认关！开启前务必理解旁路后果）══════════════════
+# 开启后：请求体 model 命中 [[models]] 名单（全名或去前缀展示名）→ 跳过选池与
+# 裁判直接使用（仍过能力过滤）。注意：agent 配置的静态模型名若恰好命中会静默
+# 旁路整个路由——例如 Hermes 配置的模型名 = /v1/models 返回的展示名时。
+[strategies.request]
+enabled = false
+
+# ══ 敏感度路由（ADR-0021 §3，默认关=个人模式全 public 零回归）══════════════════════
+# 开启后：身份解析产敏感等级 -> 候选池裁剪为 exposure <= allowed_exposure（敏感硬边界），
+# 裁判钉本地（敏感 query 绝不外发）。需同时在 [[models]] 标 exposure + identity.toml
+# 的 principal/team 标 sensitivity。
+# exposure 取值：local=自建 vLLM/Ollama | private=租赁裸卡 | public=公网 API（缺省=public 最坏暴露）
+#
+# [[models]]
+# name = "openai/local-vllm"
+# exposure = "local"          # 自建算力，可服务敏感流量
+#
+# [strategies.sensitivity]
+# enabled = true
+# default_level = "normal"    # 未标注主体默认等级（敏感部署建议配最严）
+# [strategies.sensitivity.agents]
+# "finance-agent" = "sensitive"   # agent 维敏感（如财务 agent 整体敏感）
+# [strategies.sensitivity.levels]
+# normal = "public"           # normal -> 允许公网
+# internal = "private"        # internal -> 仅受控外部算力
+# sensitive = "local"         # sensitive -> 仅本地推理
+
+# ══ 能力检测补充（T5c/RA8）════════════════════════════════════════════════════
+# 这些 base agent 的请求自动 requires "code"（能力护栏，防止编码 agent 被路由到
+# 无 code 能力的模型；池内全模型有 code 时无行为差异）。
+[capability]
+code_agents = ["codex", "claude-code", "cursor"]
+
+# ══ 蒸馏模型（ADR-0018 §3.6；可选）═════════════════════════════════════════════
+# 留空/不配 = 自举（首次启动从池里选最弱档写回本段，可手动改）。
+# [distill]
+# model = "openai/deepseek-v4-flash"
+
+# ══ Embedding 后端（2026-07-26 可选化；可选）═══════════════════════════════════
+# 优先级：显式 env（BLADEX_EMBED_*，作回滚通道）> 本段 > 内置默认（local + e5-large）。
+# 密钥纪律同 [[models]]：只写 *_env（环境变量名），密钥不入 toml。
+# ⚠️ 切换 backend/model = 换向量空间：先停两进程跑 python scripts/reembed_index.py。
+# ⚠️ api 档 = 全部记忆内容外发；敏感层（[strategies.sensitivity]）启用时被强制回 local。
+#
+# ── local 档模型（必须在 fastembed 白名单内）─────────────────────────────────
+# 默认 BAAI/bge-small-en-v1.5（英语优先、最轻量，开箱即用）。按语言/机器选档：
+#
+#   model                                                        dim   size   langs  note
+#   BAAI/bge-small-en-v1.5                                       384   0.07GB en     默认；最轻，弱机器/小 VPS 首选
+#   BAAI/bge-base-en-v1.5                                        768   0.21GB en     英语，召回优于 small，体积 3x
+#   BAAI/bge-large-en-v1.5                                      1024   1.20GB en     英语最强档；每进程约 2GB 内存
+#   sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2  384   0.22GB 50+    最轻多语；同体积下 CJK 覆盖好
+#   jinaai/jina-embeddings-v2-base-zh                            768   0.64GB zh+en  中英双语语料调优
+#   sentence-transformers/paraphrase-multilingual-mpnet-base-v2  768   1.00GB 50+    多语强于 MiniLM-L12，体积约 5x
+#   intfloat/multilingual-e5-large                              1024   2.24GB 100+   旧默认；多语最强、最重；
+#                                                                                    唯一经真实流量标定阈值的模型
+#
+# 模型缺失时 proxy/consolidator 启动会**自动下载**（阻塞至完成）；HF 主站不可达时
+# 自动切 hf-mirror.com。显式设了 HF_ENDPOINT 则完全尊重你的设置，不做回退猜测。
+# ⚠️ 换 model = 换向量空间：先停两进程跑 python scripts/reembed_index.py。
+# 注：已有 Memory Index 库且本项留空时，沿用库内已盖章的模型（升级不会废掉现有向量空间）。
+# [embedding]
+# backend = "local"                              # local | ipc | api | proxy(已被 ipc 取代)
+# model = "BAAI/bge-small-en-v1.5"
+#
+# ipc 档 = **单机推荐**（V-A6）：嵌入跑在独立进程 `bladex embed` 里，proxy 与
+# consolidator 经 UDS 共用同一份模型（省一份内存），且服务端按角色让路——
+# proxy 侧 hot、consolidator 侧 bulk，批量重建不再堵住热路径（MQ-W8 的解）。
+# 连不上时**回落各自加载本地模型**并打 warning（`embed_ipc_fallback_local`），
+# 不拒服务。`bladex start` 会一并拉起它；`bladex stop` 也会一并停掉。
+# [embedding]
+# backend = "ipc"
+# model = "BAAI/bge-small-en-v1.5"               # 回落 local 时加载的就是它
+#
+# api 档示例：
+# [embedding]
+# backend = "api"
+# model = "openai/doubao-embedding"              # Router 格式（provider/model）
+# api_base = "https://ark.cn-beijing.volces.com/api/v3"
+# api_key_env = "ARK_EMBED_KEY"
+#
+# ⚠️ proxy 档**已被 ipc 取代**（2026-08-31），下面这段保留作历史说明。
+#    它的两个已知代价：① consolidator 的批量嵌入直接跑在 proxy 的事件循环上，
+#    实测一次 1063 条重建把 proxy 堵了 65 秒、连 Redis 读都超时（MQ-W8）；
+#    ② 全量重建的前置是"停 proxy"，而本档要 proxy 活着——两条互斥，
+#    绕过它需要临时 `BLADEX_EMBED_BACKEND=local`。ipc 档两条都没有。
+#
+# proxy 档示例 = 单机共享模型（consolidator 复用 proxy 已加载的那份，省一份内存）。
+# backend 是全局值，但**两个角色解读不同**（同一份配置，两种行为）：
+#   proxy 侧        -> 真正加载 model 指定的本地模型，经 /v1/embeddings 对外服务
+#   consolidator 侧 -> 不再自载模型，HTTP 调 proxy；向量空间身份由 proxy 透传，
+#                      自动与 Memory Index 已盖的章对齐
+# 所以 model 仍要写：它就是 proxy 侧实际加载、两边共用的那份模型。
+# [embedding]
+# backend = "proxy"
+# model = "BAAI/bge-small-en-v1.5"               # proxy 侧加载的模型（两边共用）
+# proxy_url = "http://127.0.0.1:38080"
+# proxy_key_env = "BLADEX_EMBED_PROXY_KEY_VALUE" # 仅 BLADEX_AUTH_ENABLED=true 时需要
+#
+# ⚠️ proxy_key_env 指向的环境变量必须存**纯 key 值**，不能指向 BLADEX_CLIENT_KEYS
+#    （那是 "key||label||key||label" 列表格式，不能直接当 Bearer token）。
+#    在 config/.env 里另建一个变量，值取 BLADEX_CLIENT_KEYS 里的某个 key：
+#      export BLADEX_EMBED_PROXY_KEY_VALUE="bladex-xxxxxxxxxxxx"
+# 注：run_proxy.sh 先拉 consolidator 再起 proxy，首次探测必然早于 proxy 监听 ——
+#    consolidator 会自动重试等待（默认 180s，BLADEX_EMBED_PROXY_WAIT_S 可调），
+#    覆盖 proxy 加载模型甚至首次下载的时间，无需手工调整启动顺序。
+#
+# 阈值 profile：上表七档已内置（仅 e5-large 经真实流量标定，其余用保守默认+启动告警）。
+# 任意模型（含 api 档）可在此声明/覆盖阈值；真实流量重标后写 calibrated = true 消告警：
+# [embedding.profiles."openai/doubao-embedding"]
+# novelty = 0.93
+# semantic = 0.83
+# digestion = 0.83
+# calibrated = true

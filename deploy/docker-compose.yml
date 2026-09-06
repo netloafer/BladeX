@@ -1,0 +1,132 @@
+# BladeX 自部署全栈（ADR-0021 §4 单机企业就绪）。
+# 三服务：proxy + redis（AOF）+ consolidator。数据卷挂 /app/data。
+#
+# 用法：
+#   cp config/.env.example config/.env  # 填上游 key 等
+#   cp config/identity.toml.example config/identity.toml  # 可选：身份两体系
+#   cd deploy && docker compose up -d
+#
+# TLS：compose 只起 HTTP（127.0.0.1:38080）。公网暴露务必前置 TLS 反代
+# （见 docs/deployment-selfhost.md 的 nginx/caddy 示例）。BLADEX_HOST=0.0.0.0
+# 仅在容器内监听所有接口，由反代/Docker 网络控制外部可达性。
+#
+# 不做 HA / 水平扩展（ADR-0021 §2.6/§4 明确 v1 单机形态）。
+
+services:
+  redis:
+    image: redis:7-alpine
+    # AOF 防掉电（ADR-0009 Pipeline）。落库成功才 ack，不丢不重复。
+    command: redis-server --appendonly yes --appendfsync everysec --tcp-keepalive 0
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    # 仅容器内网络可达（不暴露端口到宿主）
+    networks:
+      - bladex
+
+  proxy:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      # 🔴 编排器说了算（2026-08-06）：默认语义已翻成"config/.env 压过环境变量"
+      # （宿主上终端里的残留 export 曾静默劫持配置文件，两次事故见 deployment.py）。
+      # 容器里必须反过来——下面这些容器内路径是 compose 注入的，而挂进来的宿主
+      # config/.env 里是 `data/bladex_hub` 这类相对路径，不钉死会被它清掉。
+      BLADEX_ENV_PRECEDENCE: "env"
+      # 指向同栈 redis（容器名解析）
+      BLADEX_REDIS_URL: "redis://redis:6379/0"
+      BLADEX_HOST: "0.0.0.0"          # 容器内监听所有接口；外部可达性由端口映射/反代控制
+      BLADEX_PORT: "38080"
+      BLADEX_ROCKSDB_PATH: "/app/data/bladex_hub"
+      BLADEX_INDEX_PATH: "/app/data/bladex_index"
+      BLADEX_OVERFLOW_DIR: "/app/data/overflow"
+      BLADEX_FASTEMBED_CACHE_PATH: "/app/data/fastembed_cache"
+      BLADEX_ROUTING_CONFIG: "/app/config/routing.toml"
+      BLADEX_IDENTITY_CONFIG: "/app/config/identity.toml"
+      # V-A6：容器形态走 tcp 指向 embed 服务（开关默认关，配了 backend=ipc 才生效）
+      BLADEX_EMBED_TRANSPORT: "tcp"
+      BLADEX_EMBED_ADDRESS: "embed:38081"
+      # 上游 + 客户端 key 经 .env 注入（env_file）
+    env_file:
+      - ../config/.env
+    volumes:
+      - app-data:/app/data
+      - ../config:/app/config:ro
+    ports:
+      - "127.0.0.1:38080:38080"       # 仅宿主本地；公网经反代
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - bladex
+    # T27：readiness 探针做 healthcheck--/ready 在 redis+ledger 就绪后才 200，
+    # 冷启动期（e5 warmup + redis 连接）503 由 start_period 容忍。
+    # 503/连接拒绝 -> urlopen 抛异常 -> exit 1（unhealthy）。
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:38080/ready', timeout=3).read()\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── V-A6：embedding 独立模块（MQ-W8 的解）──────────────────────────────
+  # proxy 与 consolidator 都是它的客户端，模型实例只此一份；它按 hot/bulk
+  # 两级队列排队、bulk 切片让路 ⇒ 重建大批不再饿死 proxy 热路径与 /health。
+  # 🔴 容器形态**必须走 tcp**：proxy/consolidator 是独立容器，uds 跨容器不通
+  #    （`embed_transport.resolve` 的 auto 会检测到容器并自动选 tcp）。
+  embed:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["bladex-embed"]
+    environment:
+      BLADEX_ENV_PRECEDENCE: "env"
+      BLADEX_EMBED_TRANSPORT: "tcp"
+      BLADEX_EMBED_ADDRESS: "0.0.0.0:38081"
+      BLADEX_FASTEMBED_CACHE_PATH: "/app/data/fastembed_cache"
+      BLADEX_ROUTING_CONFIG: "/app/config/routing.toml"
+    env_file:
+      - ../config/.env
+    volumes:
+      - app-data:/app/data
+      - ../config:/app/config:ro
+    restart: unless-stopped
+    networks:
+      - bladex
+
+  consolidator:
+    # Memory Index 后台提炼独立进程（ADR-0009 §7）：proxy 崩溃不影响 Memory Index，proxy 退出不杀它。
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["python", "scripts/run_index_consolidator.py", "--interval", "60"]
+    environment:
+      BLADEX_ENV_PRECEDENCE: "env"    # 同 proxy：容器内编排器注入的路径不许被挂进来的 .env 清掉
+      BLADEX_REDIS_URL: "redis://redis:6379/0"
+      BLADEX_ROCKSDB_PATH: "/app/data/bladex_hub"
+      BLADEX_INDEX_PATH: "/app/data/bladex_index"
+      BLADEX_FASTEMBED_CACHE_PATH: "/app/data/fastembed_cache"
+      BLADEX_ROUTING_CONFIG: "/app/config/routing.toml"
+      BLADEX_IDENTITY_CONFIG: "/app/config/identity.toml"
+      # V-A6：容器形态走 tcp 指向 embed 服务（开关默认关，配了 backend=ipc 才生效）
+      BLADEX_EMBED_TRANSPORT: "tcp"
+      BLADEX_EMBED_ADDRESS: "embed:38081"
+    env_file:
+      - ../config/.env
+    volumes:
+      - app-data:/app/data
+      - ../config:/app/config:ro
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - bladex
+
+volumes:
+  redis-data:
+  app-data:
+
+networks:
+  bladex:
+    driver: bridge

@@ -1,0 +1,43 @@
+[project]
+name = "bladex-proxy"
+version = "0.1.0"
+description = "BladeX proxy - memory-first HTTP middleware built on FastAPI + LiteLLM, with tiered storage (Redis / RocksDB / LanceDB)."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "litellm>=1.40,<1.90",  # 1.90.2 打包缺 litellm.responses.litellm_completion_transformation，litellm 修复后去掉上限
+    "redis[hiredis]>=5.0",
+    "rocksdict>=0.3",
+    "structlog>=24.0",
+    "msgpack>=1.0",
+    "pydantic>=2.0",
+    "bladex-core",
+    "lancedb>=0.20",
+    "fastembed>=0.3",
+    "numpy>=1.24",
+    "pyarrow>=14.0",
+    "typer>=0.12",
+]
+
+[project.scripts]
+bladex = "bladex_proxy.cli:main"
+# ADR-0027 §4.2：consolidator 必须随 wheel 发布——否则 pip/uv tool 安装的用户
+# 启动不了 Memory Index 提炼，等于发了个没有记忆的记忆产品。
+bladex-consolidator = "bladex_proxy.consolidator:main"
+# V-F2：Flash 维护进程（账本池/Flash 树唯一写者；与 consolidator 不合并，拍板 §10-5）
+bladex-flash = "bladex_proxy.flash_daemon:main"
+# V-A6：embedding 独立模块。proxy/consolidator 都当它的客户端（IPC），
+# 它一个人持有模型实例并按 hot/bulk 优先级排队——同理必须随 wheel 发布。
+bladex-embed = "bladex_proxy.embed_server:main"
+
+[project.optional-dependencies]
+# T15 PostgreSQL connector（可选：pip install 'bladex-proxy[postgres]'）
+postgres = ["psycopg[binary]>=3.1"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bladex_proxy"]

@@ -1,0 +1,73 @@
+# 敏感配置（绝不提交）
+config/.env
+config/identity.toml
+# routing.toml 含模型池结构但无密钥（密钥走 api_key_env）；按需保留本地覆盖版
+config/routing.toml.local
+
+# 运行时数据
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/dump.rdb
+data/appendonlydir/
+data/bladex_ledger/
+data/bladex_index/
+# P1 Memory Flash（G12.4）：MD 文件是投影不是存储，删掉重渲染即可 —— 不进版本库。
+# 🔴 里面还有 `*.local.md`（用户手写）：那是本机的个人内容，更不该被提交。
+data/bladex_flash/
+# 2026-08-07 改名前的旧名，保留以防旧克隆/旧备份目录被误提交
+data/bladex_rocksdb/
+data/bladex_p2/
+
+# Redis 运行文件（防根目录残留）
+dump.rdb
+appendonlydir/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+.uv/
+*.egg-info/
+dist/
+build/
+
+# 测试缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# macOS
+.DS_Store
+
+# 临时测试脚本
+test_ollama.py
+data/fastembed_cache/
+
+# proxy 运行日志
+logs/
+
+# 公开仓文件树生成器输出（T5；T24 初始化公开仓前的暂存区，不入库）
+public-tree/
+
+# ── 2026-08-29 连 GitHub 前收口：data/ 整目录不入库 ──
+# 逐条列举漏掉了归档（pre0024_archive 1.9G 完整会话语料）、损坏备份、
+# bench 数据、各类 runtime json——data/ 下没有任何东西属于版本库。
+data/
+# 杂物
+.DS_Store
+.idea/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.rdb
+
+# 2026-09-03：任何 .env 备份都不入库（三份 .env.bak.* 曾带真 key 进过历史）
+config/.env.*
+!config/.env.example

@@ -1,0 +1,18 @@
+[project]
+name = "bladex-mcp"
+version = "0.1.0"
+description = "BladeX MCP server - expose the personal memory layer (facts / matters / hard rules) to MCP clients via the proxy admin API."
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.2",
+]
+
+[project.scripts]
+bladex-mcp = "bladex_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bladex_mcp"]

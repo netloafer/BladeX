@@ -1,0 +1,1645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BladeX Dashboard</title>
+<style>
+/* ── 设计令牌：三级 surface / 双级 border / 三级文字色 + 语义色（各配 soft 底）── */
+:root{
+  --bg:#0b0e14;--surface:#121722;--surface-2:#171d2b;--surface-3:#1e2534;
+  --border:#222b3d;--border-2:#2e3950;
+  --text:#dde3ec;--text-2:#98a2b5;--text-dim:#657084;
+  --acc:#5b9dff;--acc-soft:rgba(91,157,255,.12);
+  --ok:#3ecf8e;--ok-soft:rgba(62,207,142,.12);
+  --warn:#e8a33d;--warn-soft:rgba(232,163,61,.12);
+  --err:#e5615c;--err-soft:rgba(229,97,92,.12);
+  --manual:#b07aff;--manual-soft:rgba(176,122,255,.12);
+  --r:10px;--r-sm:7px;
+  --sidebar-w:220px;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:13px/1.55 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+.num{font-variant-numeric:tabular-nums}
+.dim{color:var(--text-2)}
+.dim2{color:var(--text-dim)}
+a.link{color:var(--acc);cursor:pointer;text-decoration:none}
+a.link:hover{text-decoration:underline}
+
+/* ── 布局骨架：固定侧栏 + 内容区 ── */
+#app{display:flex;min-height:100vh}
+#sidebar{width:var(--sidebar-w);flex:0 0 auto;background:var(--surface);
+  border-right:1px solid var(--border);display:flex;flex-direction:column;
+  position:sticky;top:0;height:100vh}
+.brand{display:flex;align-items:baseline;gap:8px;padding:18px 18px 14px}
+.brand b{font-size:16px;letter-spacing:.02em}
+.brand .ver{font-size:11px;color:var(--text-dim)}
+#nav{flex:1;padding:4px 10px;display:flex;flex-direction:column;gap:2px}
+#nav a{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:var(--r-sm);
+  color:var(--text-2);font-size:13px;text-decoration:none;cursor:pointer}
+#nav a svg{width:15px;height:15px;flex:0 0 auto;opacity:.75}
+#nav a:hover{background:var(--surface-2);color:var(--text)}
+#nav a.on{background:var(--acc-soft);color:var(--acc)}
+#nav a.on svg{opacity:1}
+.side-foot{padding:12px 14px;border-top:1px solid var(--border);display:flex;
+  align-items:center;gap:8px;font-size:12px}
+.conn-dot{width:8px;height:8px;border-radius:50%;background:var(--text-dim);flex:0 0 auto}
+.conn-dot.ok{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
+.conn-dot.err{background:var(--err);box-shadow:0 0 0 3px var(--err-soft)}
+#conn-label{flex:1;color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#shell{flex:1;min-width:0;display:flex;flex-direction:column}
+#topbar{display:flex;align-items:center;gap:14px;padding:14px 26px;
+  border-bottom:1px solid var(--border);background:var(--bg);position:sticky;top:0;z-index:5}
+#topbar h2{margin:0;font-size:15px;font-weight:600}
+#page-sub{color:var(--text-dim);font-size:12px}
+main{padding:22px 26px 40px;max-width:1320px;width:100%;margin:0 auto}
+
+/* ── 卡片 / stat / 区块 ── */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);
+  padding:16px 18px;margin-bottom:16px}
+.card>h3{margin:0 0 12px;font-size:11px;font-weight:600;color:var(--text-2);
+  text-transform:uppercase;letter-spacing:.08em}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
+.grid .card{margin:0}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:16px}
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:14px 16px}
+.stat .v{font-size:22px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.2}
+.stat .l{font-size:11px;color:var(--text-2);text-transform:uppercase;letter-spacing:.07em;margin-top:4px}
+.stat .s{font-size:11px;color:var(--text-dim);margin-top:2px}
+.stat.warn .v{color:var(--warn)}
+.kv{display:flex;justify-content:space-between;gap:12px;padding:3px 0;font-size:13px}
+.kv .k{color:var(--text-2)}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.row .grow{flex:1}
+.hbar{display:flex;align-items:center;gap:10px;padding:3px 0}
+.hbar .lbl{width:130px;flex:0 0 auto;color:var(--text-2);font-size:12px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
+.hbar .track{flex:1;height:6px;background:var(--surface-3);border-radius:3px;overflow:hidden}
+.hbar .fill{height:100%;background:var(--acc);border-radius:3px}
+.hbar .cnt{width:64px;flex:0 0 auto;text-align:right;font-variant-numeric:tabular-nums;font-size:12px}
+
+/* ── 表格 ── */
+.tbl-wrap{overflow-x:auto;margin:0 -18px;padding:0 18px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{color:var(--text-2);text-align:left;font-weight:500;font-size:11px;
+  text-transform:uppercase;letter-spacing:.06em;padding:7px 10px;
+  border-bottom:1px solid var(--border-2);white-space:nowrap;
+  position:sticky;top:0;background:var(--surface);z-index:1}
+th.r,td.r{text-align:right}
+td{padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+tbody tr{cursor:default}
+tbody tr.click{cursor:pointer}
+tbody tr.click:hover td{background:var(--surface-2)}
+tr:last-child td{border-bottom:none}
+
+/* ── badge / tag ── */
+.tag{display:inline-block;padding:1px 7px;border-radius:99px;font-size:11px;line-height:1.5;
+  background:var(--surface-3);color:var(--text-2);margin-right:4px;white-space:nowrap}
+.tag.ok{background:var(--ok-soft);color:var(--ok)}
+.tag.warn{background:var(--warn-soft);color:var(--warn)}
+.tag.err{background:var(--err-soft);color:var(--err)}
+.tag.acc{background:var(--acc-soft);color:var(--acc)}
+.tag.manual{background:var(--manual-soft);color:var(--manual)}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px}
+.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.err{background:var(--err)}
+
+/* ── 按钮 / 表单控件 ── */
+.btn{background:var(--surface-2);border:1px solid var(--border-2);color:var(--text);
+  padding:6px 13px;border-radius:var(--r-sm);cursor:pointer;font-size:12.5px;line-height:1.4;
+  transition:border-color .12s,background .12s}
+.btn:hover{border-color:var(--acc)}
+.btn:disabled{opacity:.5;cursor:default}
+.btn-primary{background:var(--acc);border-color:var(--acc);color:#0b0e14;font-weight:600}
+.btn-primary:hover{filter:brightness(1.1)}
+.btn-danger{color:var(--err)}
+.btn-danger:hover{border-color:var(--err);background:var(--err-soft)}
+.btn-ghost{background:none;border-color:transparent;color:var(--text-2)}
+.btn-ghost:hover{color:var(--text);border-color:var(--border-2)}
+.btn-sm{padding:3px 9px;font-size:11.5px}
+input.input,select.input,textarea.input{background:var(--surface);border:1px solid var(--border-2);
+  color:var(--text);padding:7px 10px;border-radius:var(--r-sm);font-size:13px;font-family:inherit}
+input.input:focus,select.input:focus,textarea.input:focus{outline:none;border-color:var(--acc)}
+input.q{width:300px}
+label.chk{display:inline-flex;align-items:center;gap:6px;color:var(--text-2);font-size:12.5px;cursor:pointer}
+
+/* ── pre / 代码块 ── */
+pre{background:var(--bg);border:1px solid var(--border);border-radius:var(--r-sm);
+  padding:12px;overflow:auto;font-size:12px;line-height:1.5;max-height:420px;
+  white-space:pre-wrap;word-break:break-word;margin:8px 0}
+details summary{cursor:pointer;color:var(--text-2);font-size:12px;padding:4px 0}
+
+/* ── 抽屉（详情统一容器）── */
+#overlay{position:fixed;inset:0;background:rgba(4,6,10,.55);opacity:0;pointer-events:none;
+  transition:opacity .15s;z-index:20}
+#drawer{position:fixed;top:0;right:0;bottom:0;width:min(640px,94vw);background:var(--surface);
+  border-left:1px solid var(--border-2);transform:translateX(102%);transition:transform .18s ease;
+  z-index:21;display:flex;flex-direction:column;box-shadow:-18px 0 40px rgba(0,0,0,.35)}
+body.drawer-open #overlay{opacity:1;pointer-events:auto}
+body.drawer-open #drawer{transform:none}
+.drawer-head{display:flex;align-items:center;gap:10px;padding:15px 20px;
+  border-bottom:1px solid var(--border)}
+.drawer-head h3{margin:0;font-size:14px;flex:1;min-width:0;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.drawer-body{flex:1;overflow-y:auto;padding:16px 20px}
+.drawer-foot{padding:12px 20px;border-top:1px solid var(--border);display:flex;gap:8px;
+  justify-content:flex-end;flex-wrap:wrap}
+.fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px 16px;margin:10px 0}
+.fields .f .fk{font-size:10.5px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em}
+.fields .f .fv{font-size:12.5px;word-break:break-all;margin-top:1px}
+.sect{margin:16px 0 4px;font-size:11px;font-weight:600;color:var(--text-2);
+  text-transform:uppercase;letter-spacing:.08em}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--border);margin:6px 0 12px}
+.tabs button{background:none;border:none;border-bottom:2px solid transparent;color:var(--text-2);
+  padding:7px 12px;cursor:pointer;font-size:12.5px}
+.tabs button.on{color:var(--acc);border-bottom-color:var(--acc)}
+
+/* ── 弹窗 ── */
+dialog{background:var(--surface);color:var(--text);border:1px solid var(--border-2);
+  border-radius:12px;width:min(480px,92vw);padding:0}
+dialog::backdrop{background:rgba(4,6,10,.6)}
+dialog form{padding:20px 22px}
+dialog h3{margin:0 0 8px;font-size:14px}
+.dlg-body{color:var(--text-2);font-size:12.5px;margin:0 0 12px;line-height:1.6}
+dialog label{display:block;font-size:12px;color:var(--text-2);margin:10px 0 0}
+dialog input,dialog textarea,dialog select{width:100%;margin-top:4px;background:var(--bg);
+  border:1px solid var(--border-2);color:var(--text);padding:7px 10px;border-radius:var(--r-sm);
+  font-size:13px;font-family:inherit}
+dialog textarea{min-height:88px;resize:vertical}
+.dlg-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
+
+/* ── toast ── */
+#toasts{position:fixed;bottom:18px;right:18px;display:flex;flex-direction:column;gap:8px;z-index:40}
+.toast{background:var(--surface-2);border:1px solid var(--border-2);border-left:3px solid var(--acc);
+  border-radius:var(--r-sm);padding:10px 14px;max-width:400px;font-size:12.5px;
+  box-shadow:0 8px 24px rgba(0,0,0,.4);animation:tin .18s ease}
+.toast.ok{border-left-color:var(--ok)}
+.toast.err{border-left-color:var(--err)}
+.toast.warn{border-left-color:var(--warn)}
+@keyframes tin{from{transform:translateY(8px);opacity:0}to{transform:none;opacity:1}}
+
+/* ── 骨架屏 / 空状态 / 横幅 ── */
+.skel{border-radius:var(--r-sm);background:linear-gradient(90deg,var(--surface-2) 25%,var(--surface-3) 50%,var(--surface-2) 75%);
+  background-size:200% 100%;animation:sh 1.3s infinite}
+@keyframes sh{from{background-position:200% 0}to{background-position:-200% 0}}
+.empty{text-align:center;padding:44px 20px;color:var(--text-dim)}
+.empty .t{font-size:13px;color:var(--text-2);margin-bottom:4px}
+.empty .s{font-size:12px}
+.banner{border:1px solid var(--warn);background:var(--warn-soft);border-radius:var(--r);
+  padding:12px 16px;margin-bottom:16px}
+.banner.err{border-color:var(--err);background:var(--err-soft)}
+.banner h4{margin:0 0 6px;font-size:12px;color:var(--warn);text-transform:uppercase;letter-spacing:.06em}
+.banner.err h4{color:var(--err)}
+.banner .item{padding:2px 0;font-size:12.5px}
+.pager{display:flex;align-items:center;gap:10px;justify-content:flex-end;margin-top:10px;font-size:12px;color:var(--text-2)}
+
+/* ── graph ── */
+#graph-canvas{width:100%;height:580px;background:var(--bg);border:1px solid var(--border);
+  border-radius:var(--r);cursor:grab;display:block}
+.legend{display:flex;gap:14px;align-items:center;font-size:12px;color:var(--text-2);flex-wrap:wrap}
+.legend span{display:inline-flex;align-items:center}
+
+/* ── 鉴权引导页 ── */
+.gate{max-width:400px;margin:10vh auto;text-align:center}
+.gate .card{padding:30px 28px}
+.gate h3{font-size:15px;margin:0 0 6px;text-transform:none;letter-spacing:0;color:var(--text)}
+.gate p{color:var(--text-2);font-size:12.5px;margin:0 0 16px;line-height:1.6}
+.gate input{width:100%;margin-bottom:12px}
+
+/* ── 响应式 ── */
+@media (max-width:900px){
+  #app{flex-direction:column}
+  #sidebar{width:100%;height:auto;position:static;flex-direction:row;align-items:center;
+    border-right:none;border-bottom:1px solid var(--border)}
+  .brand{padding:12px 14px}
+  #nav{flex-direction:row;overflow-x:auto;padding:6px}
+  #nav a{white-space:nowrap;padding:6px 10px}
+  #nav a svg{display:none}
+  .side-foot{border-top:none;padding:8px 12px}
+  #conn-label{display:none}
+  main{padding:16px 14px 32px}
+  #topbar{padding:12px 14px}
+  input.q{width:100%}
+  .fields{grid-template-columns:1fr 1fr}
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="brand"><b>BladeX</b><span class="ver" id="ver"></span></div>
+    <nav id="nav"></nav>
+    <div class="side-foot">
+      <span class="conn-dot" id="conn-dot"></span>
+      <span id="conn-label">Not connected</span>
+      <span class="dim2" id="tz" title="All timestamps are shown in this time zone"></span>
+      <button class="btn btn-ghost btn-sm" onclick="openKeyModal()" title="Admin key">Key</button>
+    </div>
+  </aside>
+  <div id="shell">
+    <header id="topbar"><h2 id="page-title"></h2><span id="page-sub"></span></header>
+    <main id="main"></main>
+  </div>
+</div>
+<div id="overlay" onclick="closeDrawer()"></div>
+<aside id="drawer"></aside>
+<div id="toasts"></div>
+<dialog id="dlg"></dialog>
+
+<script>
+"use strict";
+/* ═══════════════ 基础工具 ═══════════════ */
+const $=s=>document.querySelector(s);
+/* ADR-0027 §2.3：单引号必须转义 —— 大量 onclick="fn('${esc(id)}')" 用单引号包裹插值，
+   而 session key 含 agent_id/session_id（来源是外部请求 header 与被动指纹），记忆内容
+   本身也来自 LLM 流量。漏 ' 就是一条从"对话内容/请求头"到"操作员浏览器"的注入路径。 */
+function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+function fmtBytes(n){
+  if(n===null||n===undefined)return "-";
+  let v=Number(n);const u=["B","KB","MB","GB","TB"];
+  for(let i=0;i<u.length;i++){if(v<1024||i===u.length-1)return (i===0?v.toFixed(0):v.toFixed(1))+u[i];v/=1024;}
+  return v.toFixed(1)+"TB";
+}
+function fmtNum(n){return (n===null||n===undefined)?"-":Number(n).toLocaleString("en-US");}
+/* ── 时间显示：存的是 UTC，看的是本地 ──
+   后端所有时间戳都是 UTC 产生的，序列化后带 `Z`（Memory Hub turn.ts）或
+   `+00:00`（Fact/Matter/画像 model_dump）。这里统一转成**浏览器所在时区**再显示。
+   🔴 naive 串（无 Z、无 ±HH:MM）也必须按 UTC 解释：ES2015+ 规定 `new Date()` 对
+   不带偏移的 date-time 按**本地时区**解析，不补 Z 就会整体偏移（东八区差 8 小时），
+   而且偏得很像"对的时间"，最难发现。 */
+function parseTs(s){
+  if(!s)return null;
+  let t=String(s).trim();
+  if(!/([Zz]|[+-]\d{2}:?\d{2})$/.test(t))t+="Z";
+  const d=new Date(t);
+  return isNaN(d.getTime())?null:d;
+}
+/* mode="min" → 到分钟（表格列用），默认到秒。固定宽度，便于对齐。 */
+function fmtTs(s,mode){
+  const d=parseTs(s);if(!d)return "-";
+  const p=n=>String(n).padStart(2,"0");
+  const day=`${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`;
+  const hm=`${p(d.getHours())}:${p(d.getMinutes())}`;
+  return mode==="min"?`${day} ${hm}`:`${day} ${hm}:${p(d.getSeconds())}`;
+}
+/* 表格单元格：显示本地时间，悬停可看服务端原值（排查跨时区问题时要的就是原值）。 */
+function tsCell(s,mode){
+  if(!s)return '<span class="dim2">-</span>';
+  return `<span title="${esc(s)}">${esc(fmtTs(s,mode))}</span>`;
+}
+/* 相对时间：一眼看出"多久以前"，绝对时间仍在 title 里 */
+function fmtAgo(s){
+  const d=parseTs(s);if(!d)return "";
+  const sec=Math.floor((Date.now()-d.getTime())/1000);
+  if(sec<0)return "in the future";
+  if(sec<60)return `${sec}s ago`;
+  if(sec<3600)return `${Math.floor(sec/60)}m ago`;
+  if(sec<86400)return `${Math.floor(sec/3600)}h ago`;
+  return `${Math.floor(sec/86400)}d ago`;
+}
+/* 当前时区标签（侧栏常驻，让"这是本地时间"这件事不用猜） */
+function tzLabel(){
+  const off=-new Date().getTimezoneOffset();
+  const sign=off<0?"-":"+",a=Math.abs(off);
+  const hhmm=`${String(Math.floor(a/60)).padStart(2,"0")}:${String(a%60).padStart(2,"0")}`;
+  let zone="";
+  try{zone=Intl.DateTimeFormat().resolvedOptions().timeZone||"";}catch(_){zone="";}
+  return {short:`UTC${sign}${hhmm}`,zone};
+}
+function skel(n,h){let out="";for(let i=0;i<(n||3);i++)out+=`<div class="skel" style="height:${h||16}px;margin:10px 0"></div>`;return out;}
+function emptyState(t,s){return `<div class="empty"><div class="t">${esc(t)}</div><div class="s">${esc(s||"")}</div></div>`;}
+function errorCard(msg,retry){return `<div class="card"><div class="empty"><div class="t">Request failed</div>
+  <div class="s">${esc(msg)}</div>
+  ${retry?`<div style="margin-top:12px"><button class="btn" onclick="${retry}">Retry</button></div>`:""}</div></div>`;}
+
+/* ═══════════════ 鉴权 + API 封装 ═══════════════ */
+function key(){return sessionStorage.getItem("bladex_key")||"";}
+function setKey(v){sessionStorage.setItem("bladex_key",v.trim());}
+function setConn(state,label){
+  const d=$("#conn-dot"),l=$("#conn-label");
+  d.className="conn-dot"+(state==="ok"?" ok":state==="err"?" err":"");
+  l.textContent=label||(state==="ok"?"Connected":state==="err"?"Disconnected":"Not connected");
+}
+async function api(method,path,body){
+  const h={"Content-Type":"application/json"};
+  if(key()) h["Authorization"]="Bearer "+key();
+  let r;
+  try{r=await fetch(path,{method,headers:h,body:body?JSON.stringify(body):undefined});}
+  catch(e){setConn("err");const err=new Error("Cannot reach proxy: "+e.message);err.net=true;throw err;}
+  if(r.status===401){setConn("err","Auth required");
+    const err=new Error("Unauthorized: an admin key is required (BLADEX_ADMIN_KEYS, or BLADEX_CLIENT_KEYS if unset)");
+    err.auth=true;throw err;}
+  const data=await r.json().catch(()=>({}));
+  /* 🔴 2026-08-26：错误文本要从**本仓真实的响应形状**里取。
+     admin 端点走 `_admin_response`，产出 `{"status": "...", "detail": "...", ...}`
+     —— **没有 `error` 字段**。只认 `data.error.message` 的后果是所有 admin 侧
+     4xx 都退化成一句 "HTTP 400"：调用方拿不到任何语义，用户看到的是一个三秒
+     就淡出的 "HTTP 400" 红条，跟"点了没反应"没有区别。
+     实测代价：合并的二次确认（`status=confirm_required`）**从来没跑通过**
+     ——前端判 `/confirm/i.test(e.message)`，而 message 恒为 "HTTP 400"。
+     顺序：detail（人话）> status（机器码，判据用）> HTTP 码（兜底）。 */
+  if(!r.ok&&r.status!==202){
+    const err=new Error((data.error&&data.error.message)||data.detail||data.status||("HTTP "+r.status));
+    err.status=data.status||"";err.httpStatus=r.status;err.data=data;throw err;
+  }
+  setConn("ok");data.__status=r.status;return data;
+}
+
+/* ═══════════════ toast / 弹窗 / 抽屉 ═══════════════ */
+function toastMsg(msg,type){
+  const box=$("#toasts"),t=document.createElement("div");
+  t.className="toast "+(type||"ok");t.textContent=msg;box.appendChild(t);
+  setTimeout(()=>{t.style.opacity="0";t.style.transition="opacity .3s";
+    setTimeout(()=>t.remove(),320);},4200);
+}
+/* 兼容旧签名 toast(msg, isErr) 的薄壳 */
+function toast(msg,err){toastMsg(msg,err?"err":"ok");}
+/* Promise 化弹窗：fields 为空即确认框；resolve 表单值对象或 null（取消） */
+function ask(o){return new Promise(res=>{
+  const dlg=$("#dlg");
+  dlg.innerHTML=`<form method="dialog">
+    <h3>${esc(o.title)}</h3>
+    ${o.body?`<p class="dlg-body">${o.body}</p>`:""}
+    ${(o.fields||[]).map(f=>{
+      /* select：合并目标必须**选**不能**打**——打错一个字不是合并，是悄悄新建
+         一个 agent，也就是身份分裂（2026-08-26 Jason 指出）。 */
+      const inner=f.type==="textarea"
+        ?`<textarea name="${f.name}" placeholder="${esc(f.ph||"")}">${esc(f.value||"")}</textarea>`
+        :f.type==="select"
+        ?`<select name="${f.name}">${(f.options||[]).map(o=>
+            `<option value="${esc(o.value)}"${o.value===f.value?" selected":""}>${esc(o.label||o.value)}</option>`
+          ).join("")}</select>`
+        :`<input name="${f.name}" value="${esc(f.value||"")}" placeholder="${esc(f.ph||"")}"${
+            f.enableWhen&&!(f.enableWhen.equals===((o.fields.find(x=>x.name===f.enableWhen.field)||{}).value))?" disabled":""}>`;
+      return `<label>${esc(f.label)}${inner}</label>`;}).join("")}
+    <div class="dlg-actions">
+      <button type="button" class="btn" onclick="this.closest('dialog').close('cancel')">Cancel</button>
+      <button class="btn ${o.danger?"btn-danger":"btn-primary"}" value="ok">${esc(o.ok||"OK")}</button>
+    </div></form>`;
+  /* 声明式联动：`enableWhen:{field,equals}` —— 控制字段取到那个值时本字段才可用。
+     🔴 不注入裸 JS 字符串（那会让 ask() 变成一个执行任意代码的洞），
+     也不写死"target/to"这对具体名字（下一个用到联动的对话框就会各写一份）。
+     顺带一个好处：**disabled 的输入不会进 FormData** —— 选了合并目标之后
+     `v.to` 直接不存在，调用方拿不到一个"用户其实没打算用"的值。 */
+  (o.fields||[]).filter(f=>f.enableWhen).forEach(f=>{
+    const ctl=dlg.querySelector(`[name="${f.enableWhen.field}"]`);
+    const el=dlg.querySelector(`[name="${f.name}"]`);
+    if(!ctl||!el)return;
+    const sync=()=>{const on=ctl.value===f.enableWhen.equals;
+      el.disabled=!on; el.closest("label").style.opacity=on?"":"0.45";};
+    ctl.addEventListener("change",sync); sync();
+  });
+  dlg.onclose=()=>{const v=dlg.returnValue;dlg.returnValue="";
+    if(v==="ok"){const fd=new FormData(dlg.querySelector("form"));res(Object.fromEntries(fd.entries()));}
+    else res(null);};
+  dlg.showModal();
+});}
+function openKeyModal(){
+  ask({title:"Admin key",body:"Stored in sessionStorage for this tab only. Required when auth is enabled.",
+    fields:[{name:"k",label:"Key",value:key(),ph:"admin key"}]})
+  .then(v=>{if(v!==null){setKey(v.k||"");toastMsg("Key saved");route();}});
+}
+function openDrawer(html){
+  $("#drawer").innerHTML=html;document.body.classList.add("drawer-open");
+}
+function closeDrawer(){document.body.classList.remove("drawer-open");}
+document.addEventListener("keydown",e=>{if(e.key==="Escape")closeDrawer();});
+function drawerShell(title,tags,body,foot){
+  return `<div class="drawer-head"><h3>${title}</h3>${tags||""}
+      <button class="btn btn-ghost btn-sm" onclick="closeDrawer()">Close</button></div>
+    <div class="drawer-body">${body}</div>
+    ${foot?`<div class="drawer-foot">${foot}</div>`:""}`;
+}
+function field(k,v,mono){
+  return `<div class="f"><div class="fk">${esc(k)}</div><div class="fv ${mono?"mono":""}">${v===""||v===null||v===undefined?'<span class="dim2">-</span>':esc(v)}</div></div>`;
+}
+
+/* ═══════════════ 路由（hash）+ 导航 ═══════════════ */
+const IC={
+  overview:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
+  facts:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>',
+  matters:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
+  graph:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="6" r="2.2"/><circle cx="19" cy="6" r="2.2"/><circle cx="12" cy="18" r="2.2"/><path d="M6.8 7.5 10.6 16M17.2 7.5 13.4 16M7.2 6h9.6"/></svg>',
+  sessions:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a8 8 0 0 1-8 8H4l2.5-2.5A8 8 0 1 1 21 12z"/></svg>',
+  files:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg>',
+  projects:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/></svg>',
+  profiles:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5"/></svg>',
+  agents:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 2v6M15 2v6"/><path d="M6 8h12v3a6 6 0 0 1-12 0z"/><path d="M12 17v5"/></svg>',
+  config:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6z"/></svg>',
+  ledgers:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 4h11a2 2 0 0 1 2 2v14H7a2 2 0 0 1-2-2z"/><path d="M9 8h6M9 12h6M9 16h3"/></svg>'
+};
+const TABS=[["overview","Overview"],["ledgers","Ledgers"],["facts","Memory"],
+            ["matters","Matters"],
+            ["files","Files"],["projects","Projects"],["profiles","Profiles"],
+            ["graph","Graph"],["sessions","Sessions"],["agents","Agents"],
+            ["config","Rules & Config"]];
+const SUBS={overview:"Pipeline, storage tiers, routing and degradation",
+  ledgers:"Task ledgers: goal, sections, activation and Matter anchor",
+  facts:"Browse, search and curate distilled facts",
+  matters:"MatterGraph cards, attribution edges and manual operations",
+  files:"File index: names, types, summaries and keywords from traffic",
+  projects:"Project library: roots, languages and progress",
+  profiles:"USER.md, per-agent habit docs, rule file copies and tool usage",
+  graph:"Force-directed view of Matters and member facts",
+  agents:"Connected agents, unrecognised clients and claim history",
+  sessions:"Hub sessions and turn-level replay",
+  config:"Hard rules and effective memory configuration"};
+let tab="overview",statusTimer=null;
+function renderNav(){
+  $("#nav").innerHTML=TABS.map(([id,label])=>
+    `<a href="#/${id}" class="${tab===id?"on":""}">${IC[id]||""}<span>${label}</span></a>`).join("");
+  const t=TABS.find(x=>x[0]===tab);
+  $("#page-title").textContent=t?t[1]:"";
+  $("#page-sub").textContent=SUBS[tab]||"";
+}
+function route(){
+  const h=(location.hash||"").replace(/^#\//,"");
+  tab=TABS.some(x=>x[0]===h)?h:"overview";
+  clearInterval(statusTimer);closeDrawer();renderNav();
+  VIEWS[tab]().catch(e=>handleViewError(e));
+}
+function handleViewError(e){
+  if(e&&e.auth)return authGate();
+  $("#main").innerHTML=errorCard(e.message,"route()");
+}
+function authGate(){
+  $("#main").innerHTML=`<div class="gate"><div class="card">
+    <h3>Connect to BladeX</h3>
+    <p>Auth is enabled on this proxy. Enter an admin key
+       (<span class="mono">BLADEX_ADMIN_KEYS</span>, or <span class="mono">BLADEX_CLIENT_KEYS</span> if unset).</p>
+    <input class="input" id="gate-key" type="password" placeholder="admin key"
+      onkeydown="if(event.key==='Enter')gateConnect()">
+    <button class="btn btn-primary" style="width:100%" onclick="gateConnect()">Connect</button>
+  </div></div>`;
+  $("#gate-key").focus();
+}
+function gateConnect(){setKey($("#gate-key").value);route();}
+
+/* ═══════════════ Overview（/admin/status 轮询）═══════════════ */
+/* ── 降级横幅（ADR-0027 §3.3）──
+   记忆管线的死亡必须出现在界面上，不能只在日志文件里。计数来自
+   /admin/status 的 degradation（滚动 1h 窗口，不是自启动以来的累计值）。 */
+function degradationBanner(s){
+  const d=s.degradation||{},w=[];
+  if(d.inject_timeout_1h)w.push(`${d.inject_timeout_1h} turns degraded on inject timeout in the last hour (hard rules only) - raise BLADEX_HOTPATH_BUDGET_MS or narrow retrieval`);
+  if(d.enqueue_skipped_1h)w.push(`${d.enqueue_skipped_1h} turns spilled to disk in the last hour (Redis unreachable) - no memory from them until replay`);
+  if(d.index_unavailable_1h)w.push(`${d.index_unavailable_1h} lookups hit an unavailable Memory Index layer in the last hour - check the embedding backend`);
+  if(d.inject_failed_1h)w.push(`${d.inject_failed_1h} injections failed in the last hour - see inject_source_failed in the log`);
+  const lag=(s.index||{}).lag_turns;
+  if(typeof lag==="number"&&lag>500)w.push(`consolidator is behind by ${lag} turns - new memory stays unrecallable`);
+  if(!w.length)return "";
+  return `<div class="banner"><h4>Degraded</h4>
+    ${w.map(x=>`<div class="item">${esc(x)}</div>`).join("")}</div>`;
+}
+/* ── 配置漂移横幅：.env 声明值与进程实际生效值不一致（2026-08-05 事故驱动）── */
+function driftBanner(s){
+  const drift=((s.memory_config||{}).drift)||[];
+  if(!drift.length)return "";
+  return `<div class="banner err"><h4>Config drift</h4>
+    <div class="item">The running process differs from config/.env for ${drift.length} value(s) - the file was edited without a restart, or a stale export shadows it. Details in <a class="link" href="#/config">Rules &amp; Config</a>.</div>
+    ${drift.map(x=>`<div class="item mono">${esc(x.key)}: declared ${esc(x.declared)}, effective ${esc(x.effective)}</div>`).join("")}</div>`;
+}
+async function viewOverview(){
+  const m=$("#main");
+  m.innerHTML=`<div class="stats">${'<div class="stat"><div class="skel" style="height:40px"></div></div>'.repeat(5)}</div>`+skel(4,80);
+  async function poll(){
+    if(document.hidden)return;
+    let s;
+    try{s=await api("GET","/admin/status");}
+    catch(e){clearInterval(statusTimer);
+      if(e.auth)return authGate();
+      m.innerHTML=errorCard(e.message,"route()");return;}
+    $("#ver").textContent=s.version?("v"+s.version):"";
+    const pipe=s.pipeline||{},index=s.index||{},hub=s.hub||{},up=s.upstream||{},
+          req=s.requests||{},disk=s.disk||{},job=s.sync_job;
+    const lag=index.lag_turns;
+    const routeEntries=Object.entries((s.routing||{}).source_counts||{}).sort((a,b)=>b[1]-a[1]);
+    const routeMax=Math.max(1,...routeEntries.map(([,v])=>v));
+    const byLabel=(req.by_label||[]).slice().sort((a,b)=>(b.count||0)-(a.count||0)).slice(0,8);
+    const lat=req.latency_ms;
+    const diskRows=[["Memory Hub",disk.hub_bytes],["Memory Index",disk.index_bytes],["Memory Flash",disk.flash_bytes],
+      ["Pipeline overflow",disk.overflow_bytes],["Logs",disk.logs_bytes]];
+    const diskMax=Math.max(1,...diskRows.map(([,v])=>v||0));
+    m.innerHTML=`
+    ${degradationBanner(s)}
+    ${driftBanner(s)}
+    <div class="stats">
+      <div class="stat"><div class="v">${fmtNum(req.total??0)}</div><div class="l">Requests</div></div>
+      <div class="stat"><div class="v">${fmtNum(hub.turns)}</div><div class="l">Hub turns</div></div>
+      <div class="stat"><div class="v">${fmtNum(index.facts)}</div><div class="l">Facts</div></div>
+      <div class="stat"><div class="v">${fmtNum(index.matters)}</div><div class="l">Matters</div></div>
+      <div class="stat ${typeof lag==="number"&&lag>50?"warn":""}"><div class="v">${lag??"-"}</div>
+        <div class="l">Consolidator lag</div><div class="s">turns not yet consolidated</div></div>
+    </div>
+    <div class="grid">
+      <div class="card"><h3>Pipeline - ingest buffer (Redis)</h3>
+        <div class="kv"><span class="k">Connection</span><span>${pipe.connected?'<span class="tag ok">online</span>':'<span class="tag err">offline</span>'}</span></div>
+        <div class="kv"><span class="k">Backlog</span><span class="num">${fmtNum(pipe.backlog)}</span></div>
+        <div class="kv"><span class="k">Undelivered / unconfirmed</span><span class="num">${fmtNum(pipe.undelivered)} / ${fmtNum(pipe.pending)}</span></div>
+        <div class="kv"><span class="k">Stale</span><span>${pipe.orphan?`<span class="tag warn">${fmtNum(pipe.orphan)} - run bladex queue flush</span>`:'<span class="tag ok">none</span>'}</span></div>
+        <div class="kv"><span class="k">Overflow / spill</span><span class="num">${fmtNum(pipe.overflow_count??0)} / ${fmtNum(pipe.spill_count??0)}</span></div>
+        ${pipe.error?`<div class="kv"><span class="k">Error</span><span class="mono">${esc(pipe.error)}</span></div>`:""}</div>
+      ${s.consolidator?`<div class="card"><h3>Consolidator heartbeat</h3>
+        <div class="kv"><span class="k">Freshness</span><span>${s.consolidator.fresh?'<span class="tag ok">fresh</span>':'<span class="tag warn">stale</span>'}</span></div>
+        <div class="kv"><span class="k">Last seen</span><span class="num">${s.consolidator.last_seen_s??"?"}s ago</span></div>
+        ${s.consolidator.state?`<div class="kv"><span class="k">State</span><span>${esc(s.consolidator.state)}</span></div>`:""}
+        ${s.consolidator.total?`<div class="kv"><span class="k">Batch progress</span><span class="num">${fmtNum(s.consolidator.done??0)} / ${fmtNum(s.consolidator.total)}</span></div>`:""}</div>`:""}
+      <div class="card"><h3>Memory Index - derived layer</h3>
+        <div class="kv"><span class="k">Facts / Matters</span><span class="num">${fmtNum(index.facts)} / ${fmtNum(index.matters)}</span></div>
+        <div class="kv"><span class="k">Consumed turns</span><span class="num">${fmtNum(index.consumed_turns)}</span></div>
+        <div class="kv"><span class="k">Rebuild backlog</span><span>${index.rebuild_backlog?'<span class="tag warn">backlog</span>':'<span class="tag ok">caught up</span>'}</span></div>
+        ${index.error?`<div class="kv"><span class="k">Error</span><span class="mono">${esc(index.error)}</span></div>`:""}</div>
+      <div class="card"><h3>Route source distribution</h3>
+        ${routeEntries.map(([k,v])=>`<div class="hbar"><span class="lbl" title="${esc(k)}">${esc(k)}</span>
+          <span class="track"><span class="fill" style="width:${(v/routeMax*100).toFixed(1)}%"></span></span>
+          <span class="cnt">${fmtNum(v)}</span></div>`).join("")||'<span class="dim2">No routed requests yet</span>'}</div>
+      <div class="card"><h3>Upstream health</h3>
+        ${(up.unhealthy_models||[]).length
+          ?up.unhealthy_models.map(x=>`<span class="tag err">${esc(x)}</span>`).join(" ")
+          :'<span class="dot ok"></span><span class="dim">All models healthy</span>'}</div>
+      <div class="card"><h3>Requests</h3>
+        ${byLabel.map(r=>{const lbl=Object.entries(r).filter(([k])=>k!=="count")
+            .map(([k,v])=>`${k}=${v}`).join(" ");
+          return `<div class="kv"><span class="k mono" style="overflow:hidden;text-overflow:ellipsis">${esc(lbl)}</span><span class="num">${fmtNum(r.count)}</span></div>`;}).join("")||'<span class="dim2">No requests yet</span>'}
+        ${lat&&!lat.series?`<div class="sect">Latency (ms)</div>${Object.entries(lat).map(([k,v])=>`<span class="tag">${esc(k)} ${esc(typeof v==="number"?v.toFixed(0):v)}</span>`).join("")}`:""}
+        ${lat&&lat.series?`<div class="sect">Latency (ms)</div>${lat.series.slice(0,4).map(r=>`<div class="kv"><span class="k mono">${esc(Object.entries(r).filter(([k,v])=>typeof v!=="number").map(([k,v])=>v).join(" "))}</span><span class="num">${esc(Object.entries(r).filter(([k,v])=>typeof v==="number").map(([k,v])=>k+" "+v.toFixed(0)).join("  "))}</span></div>`).join("")}`:""}</div>
+      <div class="card"><h3>Disk usage</h3>
+        ${diskRows.map(([k,v])=>`<div class="hbar"><span class="lbl">${esc(k)}</span>
+          <span class="track"><span class="fill" style="width:${((v||0)/diskMax*100).toFixed(1)}%"></span></span>
+          <span class="cnt">${fmtBytes(v)}</span></div>`).join("")}</div>
+      ${job?`<div class="card"><h3>Last sync job</h3>
+        <div class="kv"><span class="k">State</span><span><span class="tag ${job.state==="done"?"ok":job.state==="failed"?"err":"acc"}">${esc(job.state||"?")}</span></span></div>
+        ${job.phase?`<div class="kv"><span class="k">Phase</span><span>${esc(job.phase)}</span></div>`:""}
+        ${job.job_id?`<div class="kv"><span class="k">Job</span><span class="mono dim">${esc(job.job_id)}</span></div>`:""}</div>`:""}
+    </div>`;
+  }
+  await poll();statusTimer=setInterval(poll,5000);
+}
+
+/* ═══════════════ Memory（facts 浏览 / 搜索 / 管理）═══════════════ */
+const PAGE=50;
+let fOffset=0;
+async function viewFacts(){
+  const m=$("#main");
+  m.innerHTML=`<div class="row">
+    <input class="input q" id="fq" placeholder="Semantic search (empty = list by time)"
+      onkeydown="if(event.key==='Enter'){fOffset=0;loadFacts();}">
+    <select class="input" id="fkind"><option value="">All kinds</option>
+      <option>preference</option><option>event</option><option>task</option>
+      <option>decision</option><option>general</option></select>
+    <select class="input" id="forigin"><option value="">All origins</option>
+      <option value="conclusion">conclusion</option><option value="progress">progress</option>
+      <option value="manual">manual</option></select>
+    <select class="input" id="fexp"><option value="">All exposure</option>
+      <option>local</option><option>private</option><option>public</option></select>
+    <label class="chk"><input type="checkbox" id="fcur" onchange="fOffset=0;loadFacts()">current only</label>
+    <button class="btn" onclick="fOffset=0;loadFacts()">Search</button>
+    <span class="grow"></span>
+    <button class="btn btn-primary" onclick="rememberFact()">+ Remember</button></div>
+  <div class="card"><div class="tbl-wrap"><table id="ftab"><thead><tr>
+    <th style="width:42%">Content</th><th>Kind</th><th>Subject</th><th class="r">Trust</th>
+    <th>Flags</th><th>Created</th><th></th>
+  </tr></thead><tbody><tr><td colspan="7">${skel(4)}</td></tr></tbody></table></div>
+  <div class="pager" id="fpager"></div></div>`;
+  await loadFacts();
+}
+async function loadFacts(){
+  const q=$("#fq").value.trim(),kind=$("#fkind").value,origin=$("#forigin").value,
+        exp=$("#fexp").value,cur=$("#fcur").checked;
+  const p=new URLSearchParams({limit:String(PAGE),offset:String(fOffset)});
+  if(q)p.set("q",q);if(kind)p.set("kind",kind);if(origin)p.set("origin",origin);
+  if(exp)p.set("exposure",exp);if(cur)p.set("current_only","true");
+  let d;try{d=await api("GET","/admin/facts?"+p);}
+  catch(e){if(e.auth)return authGate();toastMsg(e.message,"err");return;}
+  $("#ftab tbody").innerHTML=(d.facts||[]).map(f=>`<tr class="click" onclick="factDetail('${esc(f.id)}')">
+    <td>${esc(f.content).slice(0,140)}</td>
+    <td><span class="tag">${esc(f.kind)}</span>${f.item_kind&&f.item_kind!=="assertion"?`<span class="tag acc">${esc(f.item_kind)}</span>`:""}</td>
+    <td class="dim">${esc(f.subject||"")}</td>
+    <td class="r num">${(f.trust??1).toFixed(2)}</td>
+    <td>${(f.tags||"").includes("origin:manual")?'<span class="tag manual">manual</span>':""}
+        ${(f.tags||"").includes("origin:conclusion")?'<span class="tag">conclusion</span>':""}
+        ${(f.tags||"").includes("origin:progress")?'<span class="tag">progress</span>':""}
+        ${f.exposure_ceiling&&f.exposure_ceiling!=="public"?`<span class="tag warn">${esc(f.exposure_ceiling)}</span>`:""}
+        ${f.t_invalid?'<span class="tag warn">superseded</span>':""}</td>
+    <td class="dim num">${tsCell(f.created_at,"min")}</td>
+    <td><button class="btn btn-danger btn-sm" onclick="event.stopPropagation();forgetFact('${esc(f.id)}')">Delete</button></td>
+  </tr>`).join("")||`<tr><td colspan="7">${emptyState("No facts found",
+    q?"Try a different query or clear the filters":"Facts appear here once the consolidator distills traffic")}</td></tr>`;
+  $("#fpager").innerHTML=pagerHtml(d.total,fOffset,"fPage")+`<span class="dim2">mode: ${esc(d.mode)}</span>`;
+}
+function pagerHtml(total,offset,fn){
+  const from=total?offset+1:0,to=Math.min(offset+PAGE,total);
+  return `<span>${from}-${to} of ${fmtNum(total)}</span>
+    <button class="btn btn-sm" ${offset<=0?"disabled":""} onclick="${fn}(-1)">Prev</button>
+    <button class="btn btn-sm" ${to>=total?"disabled":""} onclick="${fn}(1)">Next</button>`;
+}
+function fPage(dir){fOffset=Math.max(0,fOffset+dir*PAGE);loadFacts();}
+async function factDetail(id){
+  let f;try{f=await api("GET","/admin/facts/"+encodeURIComponent(id));}
+  catch(e){toastMsg(e.message,"err");return;}
+  const tags=(f.tags||"").split(",").map(s=>s.trim()).filter(Boolean);
+  openDrawer(drawerShell(`Fact`,
+    `${f.t_invalid?'<span class="tag warn">superseded</span>':'<span class="tag ok">current</span>'}`,
+    `<p style="margin:0 0 6px;font-size:13.5px;line-height:1.6">${esc(f.content)}</p>
+     <div class="fields">
+       ${field("id",f.id,1)}${field("kind",f.kind)}${field("item kind",f.item_kind)}
+       ${field("subject",f.subject)}${field("attribute",f.attribute)}
+       ${field("trust",(f.trust??1).toFixed(2))}${field("scope",f.scope)}
+       ${field("exposure ceiling",f.exposure_ceiling)}
+       ${field("created",fmtTs(f.created_at))}${field("updated",fmtTs(f.updated_at))}
+       ${field("t_valid",fmtTs(f.t_valid))}${field("t_invalid",fmtTs(f.t_invalid))}
+       ${field("source user",f.source_user_id,1)}${field("source session",f.source_session,1)}
+     </div>
+     ${tags.length?`<div class="sect">Tags</div>${tags.map(t=>`<span class="tag ${t==="origin:manual"?"manual":""}">${esc(t)}</span>`).join(" ")}`:""}
+     ${f.entities?`<div class="sect">Entities</div><span class="dim">${esc(String(f.entities))}</span>`:""}
+     <details style="margin-top:14px"><summary>Raw JSON</summary><pre>${esc(JSON.stringify(f,null,2))}</pre></details>`,
+    `<button class="btn" onclick="promoteScope('fact','${esc(f.id)}')">Promote scope</button>
+     <button class="btn btn-danger" onclick="forgetFact('${esc(f.id)}')">Delete</button>`));
+}
+async function forgetFact(id){
+  const v=await ask({title:"Delete fact",danger:true,ok:"Delete",
+    body:`Tombstone semantics: a tombstone is appended to the Memory Hub, the Memory Index entry is cascaded out, and rebuilds never revive it.<br><span class="mono">${esc(id)}</span><br><br>This cannot be undone.`});
+  if(!v)return;
+  try{const r=await api("DELETE","/admin/facts/"+encodeURIComponent(id));
+    toastMsg(r.__status===202?"Tombstone written (Memory Index cleanup deferred)":"Deleted");
+    closeDrawer();loadFacts();
+  }catch(e){toastMsg(e.message,"err");}
+}
+async function rememberFact(){
+  const v=await ask({title:"Remember a fact",ok:"Remember",
+    body:"Stored as a manual fact (trust=1.0, origin:manual) and journaled as FACT_IMPORT, so it survives full rebuilds. Same text is idempotent.",
+    fields:[{name:"content",label:"Content",type:"textarea",ph:"What should BladeX remember?"},
+            {name:"scope",label:"Scope (optional)",ph:"personal / team:<id> / org:<id>"}]});
+  if(!v||!(v.content||"").trim())return;
+  try{const r=await api("POST","/admin/facts",{content:v.content.trim(),scope:(v.scope||"").trim()});
+    toastMsg(r.__status===202?"Journaled (Memory Index apply deferred)":"Remembered");
+    fOffset=0;loadFacts();
+  }catch(e){toastMsg(e.message,"err");}
+}
+async function promoteScope(type,id){
+  const v=await ask({title:"Promote scope",ok:"Promote",
+    body:`ADR-0021: promotes a ${esc(type)} from personal to a wider scope. Journaled as SCOPE_PROMOTE, replayed on rebuild.`,
+    fields:[{name:"scope",label:"New scope",ph:"team:<id> / org:<id>"}]});
+  if(!v||!(v.scope||"").trim())return;
+  try{const r=await api("POST","/admin/scope/promote",
+      {target_type:type,target_key:id,new_scope:v.scope.trim()});
+    toastMsg(r.__status===202?"Journaled (Memory Index apply deferred)":"Scope promoted");
+  }catch(e){toastMsg(e.message,"err");}
+}
+
+/* ═══════════════ Matters（列表 / 详情抽屉 / 管理操作）═══════════════ */
+let mOffset=0;
+async function viewMatters(){
+  const m=$("#main");
+  m.innerHTML=`<div class="row">
+    <select class="input" id="mstatus" onchange="mOffset=0;loadMatters()"><option value="">All statuses</option>
+      <option>active</option><option>closed</option><option>provisional</option></select>
+    <button class="btn" onclick="loadMatters()">Refresh</button>
+    <button class="btn" onclick="mergeCandidates()">Merge candidates</button>
+    <span class="grow"></span>
+    <button class="btn btn-primary" onclick="matterCreate()">+ New Matter</button></div>
+  <div class="card"><div class="tbl-wrap"><table id="mtab"><thead><tr>
+    <th style="width:34%">Title</th><th>Status</th><th>Origin</th><th>Topic keys</th><th>Updated</th><th>Id</th>
+  </tr></thead><tbody><tr><td colspan="6">${skel(4)}</td></tr></tbody></table></div>
+  <div class="pager" id="mpager"></div></div>`;
+  await loadMatters();
+}
+/* topic_keys（2026-08-14 主题键机制）：dict key→计票，按票数降序取前 n 个渲染 chip */
+function topicKeyChips(tk,n){
+  const ks=Object.entries(tk||{}).sort((a,b)=>b[1]-a[1]).slice(0,n||3);
+  return ks.map(([k,c])=>`<span class="tag" title="votes: ${c}">${esc(k)}${c>1?` &times;${c}`:""}</span>`).join(" ");
+}
+async function loadMatters(){
+  const p=new URLSearchParams({limit:String(PAGE),offset:String(mOffset)});
+  const st=$("#mstatus").value;if(st)p.set("status",st);
+  let d;try{d=await api("GET","/admin/matters?"+p);}
+  catch(e){if(e.auth)return authGate();toastMsg(e.message,"err");return;}
+  $("#mtab tbody").innerHTML=(d.matters||[]).map(x=>`<tr class="click" onclick="matterDetail('${esc(x.matter_id)}')">
+    <td>${esc(x.title||"(untitled)")}</td>
+    <td><span class="tag ${x.status==="active"?"ok":x.status==="provisional"?"warn":""}">${esc(x.status)}</span></td>
+    <td>${x.origin==="manual"?'<span class="tag manual">manual</span>':'<span class="tag">auto</span>'}</td>
+    <td>${topicKeyChips(x.topic_keys,3)||'<span class="dim2">-</span>'}</td>
+    <td class="dim num">${tsCell(x.updated_at,"min")}</td>
+    <td class="mono dim">${esc(x.matter_id)}</td></tr>`).join("")||`<tr><td colspan="6">${emptyState("No Matters yet","Matters are proposed by the consolidator or created manually")}</td></tr>`;
+  $("#mpager").innerHTML=pagerHtml(d.total,mOffset,"mPage");
+}
+function mPage(dir){mOffset=Math.max(0,mOffset+dir*PAGE);loadMatters();}
+async function matterDetail(id){
+  let d;try{d=await api("GET","/admin/matters/"+encodeURIComponent(id));}
+  catch(e){toastMsg(e.message,"err");return;}
+  const mt=d.matter||{};
+  openDrawer(drawerShell(esc(mt.title||id),
+    `<span class="tag ${mt.status==="active"?"ok":mt.status==="provisional"?"warn":""}">${esc(mt.status)}</span>
+     ${mt.origin==="manual"?'<span class="tag manual">manual</span>':""}`,
+    `${mt.summary?`<p style="margin:0 0 10px;color:var(--text-2)">${esc(mt.summary)}</p>`:""}
+     <div class="fields">
+       ${field("id",id,1)}${field("scope",mt.scope)}
+       ${field("created",fmtTs(mt.created_at))}${field("updated",fmtTs(mt.updated_at))}
+       ${mt.ledger_id?field("anchored to ledger",mt.ledger_id,1):""}
+     </div>
+     ${mt.ledger_id?`<div class="kv dim2">Boundary comes from the ledger — this Matter
+       records a task boundary rather than inferring one.</div>`:""}
+     ${Object.keys(mt.topic_keys||{}).length?`<div class="sect">Topic keys</div>
+       ${topicKeyChips(mt.topic_keys,12)}`:""}
+     ${(mt.aliases||[]).length?`<div class="sect">Aliases</div>
+       ${mt.aliases.map(a=>`<span class="tag">${esc(a)}</span>`).join(" ")}`:""}
+     ${(mt.open_issues||[]).length?`<div class="sect">Open issues</div>
+       ${mt.open_issues.map(x=>`<div class="kv"><span>${esc(x)}</span></div>`).join("")}`:""}
+     ${(mt.participants||[]).length?`<div class="sect">Participants</div>
+       ${mt.participants.map(p=>`<span class="tag acc">${esc(p.agent_id||p)}</span>`).join(" ")}`:""}
+     <div class="sect">Member facts (${(d.facts||[]).length})</div>
+     ${(d.facts||[]).map(f=>`<div class="kv"><a class="link" onclick="factDetail('${esc(f.id)}')">${esc(f.content).slice(0,110)}</a></div>`).join("")||'<span class="dim2">none</span>'}
+     <div class="sect">Attribution edges (${d.edge_count}, manual ${d.manual_edge_count})</div>
+     ${(d.edges||[]).map(e=>`<div class="kv"><span class="mono">${esc(e.target_type)} &rarr; ${esc(e.target_key).slice(0,44)}</span>
+       <span>${e.provenance==="manual"?'<span class="tag manual">manual</span>':`<span class="tag">auto ${(e.confidence||0).toFixed(2)}</span>`}</span></div>`).join("")||'<span class="dim2">none</span>'}`,
+    `<button class="btn btn-sm" onclick="matterOp('rename','${esc(id)}')">Rename</button>
+     <button class="btn btn-sm" onclick="matterOp('assign','${esc(id)}')">Assign</button>
+     <button class="btn btn-sm" onclick="matterOp('merge','${esc(id)}')">Merge</button>
+     <button class="btn btn-sm" onclick="matterOp('detach','${esc(id)}')">Detach</button>
+     <button class="btn btn-sm" onclick="matterOp('split','${esc(id)}')">Split</button>
+     <button class="btn btn-sm" onclick="promoteScope('matter','${esc(id)}')">Promote scope</button>
+     <button class="btn btn-sm btn-danger" onclick="matterOp('close','${esc(id)}')">Close</button>`));
+}
+async function matterOp(op,id){
+  const run=async(path,body)=>{try{
+      const r=await api("POST",`/admin/matters/${encodeURIComponent(id)}/${path}`,body);
+      toastMsg(r.__status===202?"Admin event written (Memory Index apply deferred)":"Done");
+      matterDetail(id);if(tab==="matters")loadMatters();
+    }catch(e){toastMsg(e.message,"err");}};
+  if(op==="close"){
+    const v=await ask({title:"Close Matter",danger:true,ok:"Close",
+      body:"Recorded as an admin event and replayed on rebuild. Closed Matters stop attracting new attributions."});
+    if(v)run("close",{});return;}
+  if(op==="rename"){
+    const v=await ask({title:"Rename Matter",fields:[{name:"title",label:"New title"}]});
+    if(v&&v.title)run("rename",{title:v.title});return;}
+  if(op==="assign"){
+    const v=await ask({title:"Manual assignment",body:"Manual overrides auto (ADR-0012).",
+      fields:[{name:"target_key",label:"Target (fact_id or session prefix)"},
+              {name:"target_type",label:"Type (fact / session)",value:"fact"}]});
+    if(v&&v.target_key)run("assign",{target_key:v.target_key,target_type:v.target_type||"fact"});return;}
+  if(op==="merge"){
+    const v=await ask({title:"Merge into this Matter",
+      body:"The source Matter is absorbed and then closed.",
+      fields:[{name:"source",label:"Source matter_id"}]});
+    if(v&&v.source)run("merge",{source_matter_id:v.source});return;}
+  if(op==="detach"){
+    const v=await ask({title:"Detach attribution edge",
+      fields:[{name:"edge_id",label:"edge_id (or leave empty and use the fields below)"},
+              {name:"target_key",label:"target_key"},
+              {name:"target_type",label:"Type",value:"fact"}]});
+    if(v)run("detach",v.edge_id?{edge_id:v.edge_id}:{target_key:v.target_key,target_type:v.target_type||"fact"});return;}
+  if(op==="split"){
+    const v=await ask({title:"Split Matter",body:"Moves the listed edges to a new Matter.",
+      fields:[{name:"new_title",label:"New Matter title"},
+              {name:"edge_ids",label:"edge_ids (comma separated)"}]});
+    if(v&&v.new_title)run("split",{new_title:v.new_title,
+      edge_ids:(v.edge_ids||"").split(",").map(s=>s.trim()).filter(Boolean)});return;}
+}
+async function matterCreate(){
+  const v=await ask({title:"New Matter",ok:"Create",body:"Created with origin=manual.",
+    fields:[{name:"title",label:"Title"},{name:"summary",label:"Summary (optional)"}]});
+  if(!v||!v.title)return;
+  try{await api("POST","/admin/matters",{title:v.title,summary:v.summary||""});
+    toastMsg("Created");loadMatters();
+  }catch(e){toastMsg(e.message,"err");}
+}
+/* 合并提案（matter-dedup-keywords 拍板 C）：只读检测，合并永远走 manual merge */
+async function mergeCandidates(){
+  let d;try{d=await api("GET","/admin/matters/merge_candidates");}
+  catch(e){toastMsg(e.message,"err");return;}
+  const pairs=d.candidates||[];
+  openDrawer(drawerShell("Merge candidates",
+    `<span class="tag">${pairs.length}</span>`,
+    `<p class="dim" style="margin-top:0">Matter pairs with strong topic-key overlap. Detection is read-only:
+       merging is always a manual admin event, replayable on rebuild (misattribution red line = 0).</p>
+     ${pairs.map(p=>`<div class="card" style="margin-bottom:10px">
+       <div class="kv"><span>${esc(p.source_title||p.source_matter_id)} <span class="dim2 num">(${p.source_edges} edges)</span></span>
+         <span class="dim">&rarr;</span>
+         <span>${esc(p.target_title||p.target_matter_id)} <span class="dim2 num">(${p.target_edges} edges)</span></span></div>
+       <div style="margin:6px 0">${(p.shared_keys||[]).map(k=>`<span class="tag">${esc(k)}</span>`).join(" ")}
+         <span class="dim2 num">overlap ${p.overlap}, jaccard ${p.jaccard}</span></div>
+       <button class="btn btn-sm" onclick="mergePair('${esc(p.source_matter_id)}','${esc(p.target_matter_id)}')">Merge source into target</button>
+     </div>`).join("")||emptyState("No merge candidates","No Matter pairs currently share enough topic keys")}`));
+}
+async function mergePair(source,target){
+  const v=await ask({title:"Merge Matters",danger:true,ok:"Merge",
+    body:`Absorbs <span class="mono">${esc(source)}</span> into <span class="mono">${esc(target)}</span> and closes the source. Recorded as a MATTER_MERGE admin event.`});
+  if(!v)return;
+  try{const r=await api("POST",`/admin/matters/${encodeURIComponent(target)}/merge`,
+      {source_matter_id:source});
+    toastMsg(r.__status===202?"Admin event written (Memory Index apply deferred)":"Merged");
+    mergeCandidates();if(tab==="matters")loadMatters();
+  }catch(e){toastMsg(e.message,"err");}
+}
+
+/* ═══════════════ Graph（MatterGraph 力导向，vanilla canvas 零依赖）═══════════════ */
+async function viewGraph(){
+  const m=$("#main");
+  m.innerHTML=`<div class="row">
+    <div class="legend">
+      <span><span class="dot" style="background:var(--acc)"></span>Matter (auto)</span>
+      <span><span class="dot" style="background:var(--manual)"></span>Matter (manual)</span>
+      <span><span class="dot" style="background:#5a6274"></span>Matter (closed)</span>
+      <span><span class="dot ok"></span>Fact</span>
+      <span><span class="dot warn"></span>Session</span>
+      <span class="dim2">Drag to pan, scroll to zoom, click a Matter for details</span>
+    </div>
+    <span class="grow"></span>
+    <span class="dim2" id="gprog"></span>
+    <button class="btn btn-sm" onclick="viewGraph()">Reload</button></div>
+  <canvas id="graph-canvas"></canvas>`;
+  let matters;
+  try{matters=(await api("GET","/admin/matters?limit=200")).matters||[];}
+  catch(e){if(e.auth)return authGate();
+    m.innerHTML=errorCard(e.message,"viewGraph()");return;}
+  if(!matters.length){
+    m.insertAdjacentHTML("beforeend",emptyState("Nothing to draw yet","The graph appears once Matters exist"));
+    return;}
+  const nodes=[],links=[],idx={};
+  for(const mt of matters){
+    idx["m:"+mt.matter_id]=nodes.length;
+    nodes.push({id:mt.matter_id,label:mt.title||mt.matter_id,type:"matter",
+      manual:mt.origin==="manual",closed:mt.status==="closed"});
+  }
+  /* 逐 Matter 拉边，并发限 6，带进度提示 */
+  const queue=[...matters];let done=0;
+  async function pull(){
+    while(queue.length){
+      const mt=queue.shift();
+      try{const d=await api("GET","/admin/matters/"+encodeURIComponent(mt.matter_id)+"?facts_top_k=30");
+        for(const e of (d.edges||[])){
+          const tid=(e.target_type==="fact"?"f:":"s:")+e.target_key;
+          if(!(tid in idx)){idx[tid]=nodes.length;
+            const fact=(d.facts||[]).find(f=>f.id===e.target_key);
+            nodes.push({id:e.target_key,type:e.target_type,
+              label:fact?fact.content.slice(0,40):e.target_key.slice(0,24)});}
+          links.push({a:idx["m:"+mt.matter_id],b:idx[tid],manual:e.provenance==="manual"});
+        }}catch(_){}
+      done++;const g=$("#gprog");if(g)g.textContent=`loading edges ${done}/${matters.length}`;
+    }}
+  await Promise.all([pull(),pull(),pull(),pull(),pull(),pull()]);
+  const g=$("#gprog");if(g)g.textContent=`${nodes.length} nodes, ${links.length} edges`;
+  runForce(nodes,links);
+}
+function runForce(nodes,links){
+  const cv=$("#graph-canvas");if(!cv)return;
+  const dpr=window.devicePixelRatio||1;
+  cv.width=cv.clientWidth*dpr;cv.height=580*dpr;
+  const ctx=cv.getContext("2d");ctx.scale(dpr,dpr);
+  const W=cv.clientWidth,H=580;
+  nodes.forEach((n,i)=>{const a=i/nodes.length*Math.PI*2;
+    n.x=W/2+Math.cos(a)*(n.type==="matter"?120:220)+Math.random()*30;
+    n.y=H/2+Math.sin(a)*(n.type==="matter"?120:220)+Math.random()*30;n.vx=0;n.vy=0;});
+  let panX=0,panY=0,zoom=1,dragging=null,panning=false,px=0,py=0,alpha=1,live=true;
+  function step(){
+    if(!document.body.contains(cv)){live=false;return;}
+    alpha=Math.max(alpha*0.985,0.02);
+    for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++){
+      const a=nodes[i],b=nodes[j];let dx=b.x-a.x,dy=b.y-a.y;
+      let d2=dx*dx+dy*dy||1;if(d2<90000){const f=800/d2*alpha;
+        const d=Math.sqrt(d2);dx/=d;dy/=d;
+        a.vx-=dx*f;a.vy-=dy*f;b.vx+=dx*f;b.vy+=dy*f;}}
+    for(const l of links){const a=nodes[l.a],b=nodes[l.b];
+      const dx=b.x-a.x,dy=b.y-a.y,d=Math.sqrt(dx*dx+dy*dy)||1;
+      const f=(d-70)*0.02*alpha;
+      a.vx+=dx/d*f;a.vy+=dy/d*f;b.vx-=dx/d*f;b.vy-=dy/d*f;}
+    for(const n of nodes){if(n===dragging)continue;
+      n.vx+=(W/2-n.x)*0.0006*alpha;n.vy+=(H/2-n.y)*0.0006*alpha;
+      n.x+=n.vx;n.y+=n.vy;n.vx*=0.85;n.vy*=0.85;}
+    draw();requestAnimationFrame(step);
+  }
+  function draw(){
+    ctx.clearRect(0,0,W,H);ctx.save();ctx.translate(panX,panY);ctx.scale(zoom,zoom);
+    for(const l of links){const a=nodes[l.a],b=nodes[l.b];
+      ctx.strokeStyle=l.manual?"rgba(176,122,255,.6)":"rgba(120,130,150,.25)";
+      ctx.lineWidth=l.manual?1.6:0.8;
+      ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();}
+    for(const n of nodes){
+      const r=n.type==="matter"?9:3.5;
+      ctx.fillStyle=n.type==="matter"?(n.closed?"#5a6274":(n.manual?"#b07aff":"#5b9dff"))
+        :(n.type==="session"?"#e8a33d":"#3ecf8e");
+      ctx.beginPath();ctx.arc(n.x,n.y,r,0,7);ctx.fill();
+      if(n.type==="matter"&&zoom>0.6){ctx.fillStyle="#dde3ec";ctx.font="11px sans-serif";
+        ctx.fillText(n.label.slice(0,18),n.x+11,n.y+4);}}
+    ctx.restore();
+  }
+  function pick(mx,my){const x=(mx-panX)/zoom,y=(my-panY)/zoom;
+    return nodes.find(n=>{const r=n.type==="matter"?11:6;
+      return (n.x-x)**2+(n.y-y)**2<r*r;});}
+  cv.onmousedown=e=>{const r=cv.getBoundingClientRect();
+    const n=pick(e.clientX-r.left,e.clientY-r.top);
+    if(n){dragging=n;}else{panning=true;}px=e.clientX;py=e.clientY;};
+  cv.onmousemove=e=>{if(dragging){dragging.x+=(e.clientX-px)/zoom;dragging.y+=(e.clientY-py)/zoom;
+      alpha=Math.max(alpha,0.3);}
+    else if(panning){panX+=e.clientX-px;panY+=e.clientY-py;}
+    px=e.clientX;py=e.clientY;
+    const r=cv.getBoundingClientRect();
+    cv.style.cursor=pick(e.clientX-r.left,e.clientY-r.top)?"pointer":"grab";};
+  cv.onmouseup=e=>{if(dragging&&dragging.type==="matter"&&Math.abs(e.clientX-px)<4){matterDetail(dragging.id);}
+    dragging=null;panning=false;};
+  cv.onwheel=e=>{e.preventDefault();const f=e.deltaY<0?1.1:0.9;zoom=Math.min(3,Math.max(0.3,zoom*f));};
+  step();
+}
+
+/* ═══════════════ Sessions（会话 → turns → 回放抽屉）═══════════════ */
+let sOffset=0;
+// ── V-L5 附卡：账本视图 ──────────────────────────────────────────────────
+// 在此之前 dashboard 完全看不到账本（只能靠 probe 脚本），而 0.1.0 gate 的
+// 演示剧本之一就是「账本机制稳定运转」。只读——账本的作者是 agent 侧的模型，
+// Goal 只有用户能改（三红线），编辑通路属 V-L3，不在这里。
+async function viewLedgers(){
+  const m=$("#main");
+  m.innerHTML=`<div class="card"><div class="tbl-wrap"><table id="ltab"><thead><tr>
+    <th>Title</th><th>Active in</th><th>Sections</th><th>Anchor</th>
+    <th>Updated</th><th>Ledger</th>
+  </tr></thead><tbody><tr><td colspan="6">${skel(6)}</td></tr></tbody></table></div></div>
+  <div id="ldetail"></div>`;
+  let d;try{d=await api("GET","/admin/ledgers");}
+  catch(e){if(e.auth)return authGate();m.innerHTML=errorCard(e.message,"viewLedgers");return;}
+  const rows=d.ledgers||[];
+  $("#ltab tbody").innerHTML=rows.map(l=>{
+    // 激活作用域 = (agent, project)（MQ-L11）。服务端已拆好——分隔符是 core 的
+    // 实现细节，前端不碰。project=Global 是"还没有项目信号"，不占版面。
+    const scopes=(l.active_in||[]).map(s=>
+      `<span class="tag ok" title="activation scope: agent + project">${esc(s.agent)}`+
+      (s.project&&s.project!=="Global"?` <span class="dim2">/ ${esc(s.project)}</span>`:"")+
+      `</span>`).join(" ")||'<span class="dim2">-</span>';
+    const secs=Object.entries(l.entry_counts||{})
+      .map(([k,v])=>`<span class="tag" title="${esc(k)}">${esc(k)} ${v}</span>`).join(" ")
+      ||'<span class="dim2">empty</span>';
+    return `<tr class="click" onclick="ledgerDetail('${esc(l.ledger_id)}')">
+      <td>${esc(l.title||"(untitled)")}${l.parent_ledger_id
+        ?' <span class="tag warn" title="sub-task ledger">sub</span>':""}</td>
+      <td>${scopes}</td><td>${secs}</td>
+      <td>${l.matter_id
+        ?`<a class="link mono" onclick="event.stopPropagation();matterDetail('${esc(l.matter_id)}')">${esc(l.matter_id)}</a>`
+        :'<span class="dim2">none</span>'}</td>
+      <td class="dim num">${tsCell(l.updated_at,"min")}</td>
+      <td class="mono dim">${esc(l.ledger_id)}</td></tr>`;
+  }).join("")||`<tr><td colspan="6">${emptyState("No ledgers yet",
+      "Ledgers are created by the agent's model via bladex_ledger_switch")}</td></tr>`;
+}
+async function ledgerDetail(id){
+  let d;try{d=await api("GET","/admin/ledgers/"+encodeURIComponent(id));}
+  catch(e){toastMsg(e.message,"err");return;}
+  const l=d.ledger||{},order=(l.section_order||[]).filter(s=>s!=="goal");
+  const body=order.map(s=>{
+    const items=(l.sections||{})[s]||[];
+    if(!items.length)return "";
+    return `<div class="sect">${esc(s)}</div>`+items.map(it=>
+      `<div class="kv"><span>${esc(it.text||"")}</span>`+
+      (it.source?`<span class="tag dim2">${esc(it.source)}</span>`:"")+`</div>`).join("");
+  }).join("");
+  openDrawer(drawerShell(esc(l.title||id),
+    // 两个"active"意思不同却同名（状态 vs 是否被激活），并排出现只会让人以为是重复。
+    // 状态只在 closed 时才值得占位；激活态说清楚是"谁"在用。
+    `${l.status==="closed"?'<span class="tag">closed</span>':""}
+     ${(d.active_in||[]).length
+        ?`<span class="tag ok">in use by ${d.active_in.map(s=>esc(s.agent)).join(", ")}</span>`
+        :'<span class="tag dim2">not active</span>'}`,
+    // Goal 单列且标出来源——它是「取」不是「炼」，用户要能一眼核对原话
+    // Goal 由模型提炼；你的原话存在 goal_verbatim 里（不注入，只为核对）。
+    // goal_revisions > 0 = 任务中途改过目标，值得看一眼。
+    `${l.goal?`<div class="sect">Goal <span class="dim2">(${esc(({
+         user:"your words, verbatim",
+         model:"written by the model from your request",
+         model_revised:"revised mid-task at your request"
+       })[l.goal_source]||l.goal_source||"?")}${l.goal_revisions
+         ?` &middot; changed ${l.goal_revisions}&times;`:""})</span></div>
+       <p style="margin:0 0 10px;color:var(--text-2)">${esc(l.goal)}</p>
+       ${l.goal_verbatim&&l.goal_verbatim!==l.goal
+         ?`<details style="margin:0 0 10px"><summary class="dim2"
+              style="cursor:pointer">What you actually asked for</summary>
+            <p class="dim2" style="margin:6px 0 0">${esc(l.goal_verbatim)}</p>
+           </details>`:""}`
+      :`<div class="kv dim2">No goal captured yet.</div>`}
+     <div class="fields">
+       ${field("ledger",id,1)}
+       ${l.matter_id?field("matter anchor",l.matter_id,1):""}
+       ${l.parent_ledger_id?field("parent ledger",l.parent_ledger_id,1):""}
+       ${field("created",fmtTs(l.created_at))}${field("updated",fmtTs(l.updated_at))}
+     </div>
+     ${body||'<div class="kv dim2">No entries yet.</div>'}
+     ${(d.children||[]).length?`<div class="sect">Sub-task ledgers</div>`+
+       d.children.map(c=>`<div class="kv"><a class="link" onclick="ledgerDetail('${esc(c.ledger_id)}')">${esc(c.title||c.ledger_id)}</a></div>`).join(""):""}`));
+}
+
+async function viewSessions(){
+  const m=$("#main");
+  m.innerHTML=`<div class="row">
+    <input class="input q" id="sagent" placeholder="Filter by agent (e.g. hermes:default)"
+      onkeydown="if(event.key==='Enter'){sOffset=0;loadSessions();}">
+    <button class="btn" onclick="sOffset=0;loadSessions()">Search</button></div>
+  <div class="card"><div class="tbl-wrap"><table id="stab"><thead><tr>
+    <th>Session</th><th>Agent</th><th class="r">Turns</th><th>Last activity</th>
+  </tr></thead><tbody><tr><td colspan="4">${skel(4)}</td></tr></tbody></table></div>
+  <div class="pager" id="spager"></div></div>
+  <div id="sdetail"></div>`;
+  await loadSessions();
+}
+async function loadSessions(){
+  const p=new URLSearchParams({limit:String(PAGE),offset:String(sOffset)});
+  const a=$("#sagent").value.trim();if(a)p.set("agent",a);
+  let d;try{d=await api("GET","/admin/sessions?"+p);}
+  catch(e){if(e.auth)return authGate();toastMsg(e.message,"err");return;}
+  $("#stab tbody").innerHTML=(d.sessions||[]).map(s=>`<tr class="click" onclick="loadTurns('${esc(s.session)}')">
+    <td class="mono">${esc(s.session)}</td>
+    <td><span class="tag acc">${esc(s.agent_id)}</span></td>
+    <td class="r num">${fmtNum(s.turns)}</td>
+    <td class="dim num">${tsCell(s.last_ts)} <span class="dim2">${esc(fmtAgo(s.last_ts))}</span></td></tr>`).join("")||`<tr><td colspan="4">${emptyState("No sessions in the ledger","Sessions appear once traffic flows through the proxy")}</td></tr>`;
+  $("#spager").innerHTML=pagerHtml(d.total,sOffset,"sPage");
+}
+function sPage(dir){sOffset=Math.max(0,sOffset+dir*PAGE);loadSessions();}
+async function loadTurns(prefix){
+  let d;try{d=await api("GET","/admin/turns?"+new URLSearchParams({prefix,limit:"100"}));}
+  catch(e){toastMsg(e.message,"err");return;}
+  $("#sdetail").innerHTML=`<div class="card"><h3>Turns - <span class="mono">${esc(prefix)}</span></h3>
+    <div class="tbl-wrap"><table><thead><tr><th>Turn</th><th>Timestamp</th><th></th></tr></thead><tbody>
+    ${(d.turns||[]).map(t=>`<tr class="click" onclick="turnDetail('${esc(t.key)}')">
+      <td class="mono">${esc(t.key.split("/").pop())}</td>
+      <td class="dim num">${tsCell(t.ts)} <span class="dim2">${esc(fmtAgo(t.ts))}</span></td>
+      <td><a class="link">replay</a></td></tr>`).join("")||`<tr><td colspan="3">${emptyState("No turns")}</td></tr>`}
+    </tbody></table></div></div>`;
+  const sd=$("#sdetail");
+  if(sd.scrollIntoView)sd.scrollIntoView({behavior:"smooth",block:"start"});
+}
+function turnPath(key){return "/admin/turns/"+key.split("/").map(encodeURIComponent).join("/");}
+async function turnDetail(key){
+  let t;try{t=await api("GET",turnPath(key));}
+  catch(e){toastMsg(e.message,"err");return;}
+  const dm=t.decision_meta||{},rm=t.response_meta||{};
+  const tabsDef=[["ov","Overview"],["route","Route"],["resp","Response"],["mem","Injected memory"],["msg","Messages"]];
+  openDrawer(drawerShell(`Turn <span class="mono">${esc(key.split("/").pop())}</span>`,
+    `${t.auxiliary?'<span class="tag">auxiliary</span>':""}
+     ${t.sensitivity&&t.sensitivity!=="normal"?`<span class="tag warn">${esc(t.sensitivity)}</span>`:""}`,
+    `<div class="tabs">${tabsDef.map(([id,l],i)=>
+        `<button class="${i===0?"on":""}" onclick="turnTab(this,'${id}')">${l}</button>`).join("")}</div>
+     <div id="tt-ov">
+       <div class="fields">
+         ${field("key",key,1)}${field("timestamp",fmtTs(t.ts))}
+         ${field("user",(t.identity||{}).user_id,1)}${field("agent",(t.identity||{}).agent_id,1)}
+         ${field("session",(t.identity||{}).session_id,1)}
+         ${field("session source",t.session_id_source)}${field("aux source",t.aux_source)}
+       </div>
+       <details><summary>Identity JSON</summary><pre>${esc(JSON.stringify(t.identity,null,2))}</pre></details>
+     </div>
+     <div id="tt-route" hidden>
+       ${Object.keys(dm).length?`<pre>${esc(JSON.stringify(dm,null,2))}</pre>`:emptyState("No route decision recorded","decision_meta is empty for this turn")}
+     </div>
+     <div id="tt-resp" hidden>
+       ${Object.keys(rm).length?`<pre>${esc(JSON.stringify(rm,null,2))}</pre>`:emptyState("No response metadata")}
+     </div>
+     <div id="tt-mem" hidden>
+       ${t.injected_memory?`<pre>${esc(t.injected_memory)}</pre>`:emptyState("Nothing injected","This turn ran on hard rules only, or memory injection was skipped")}
+     </div>
+     <div id="tt-msg" hidden>
+       <p class="dim" style="margin-top:0">Full request messages and response text are loaded on demand (payloads can reach hundreds of KB).</p>
+       <button class="btn" onclick="turnMessages('${esc(key)}')">Load full messages</button>
+       <div id="tmsgs"></div>
+     </div>`,
+    `<button class="btn btn-danger" onclick="deleteTurn('${esc(key)}')">Delete turn</button>`));
+}
+function turnTab(btn,id){
+  btn.closest(".tabs").querySelectorAll("button").forEach(b=>b.classList.toggle("on",b===btn));
+  for(const s of ["ov","route","resp","mem","msg"])
+    $("#tt-"+s).hidden=(s!==id);
+}
+async function turnMessages(key){
+  const box=$("#tmsgs");box.innerHTML=skel(3);
+  try{const t=await api("GET",turnPath(key)+"?include_messages=true");
+    box.innerHTML=`<div class="sect">Request messages</div><pre>${esc(JSON.stringify(t.request_messages,null,2))}</pre>
+      <div class="sect">Response</div><pre>${esc(t.response_text||"")}</pre>`;
+  }catch(e){box.innerHTML="";toastMsg(e.message,"err");}
+}
+async function deleteTurn(key){
+  const v=await ask({title:"Delete turn",danger:true,ok:"Delete",
+    body:`Tombstone semantics (ADR-0012): appended to the Memory Hub, cascaded in the Memory Index, never revived on rebuild.<br><span class="mono">${esc(key)}</span><br><br>This cannot be undone.`});
+  if(!v)return;
+  try{await api("DELETE",turnPath(key));
+    toastMsg("Tombstone written");closeDrawer();
+  }catch(e){toastMsg(e.message,"err");}
+}
+
+/* ═══════════════ Rules & Config（硬规则 + 实际生效配置 + drift）═══════════════ */
+async function viewConfig(){
+  const m=$("#main");m.innerHTML=skel(4,60);
+  let rules,status;
+  try{[rules,status]=await Promise.all([api("GET","/admin/hard_rules"),api("GET","/admin/status")]);}
+  catch(e){if(e.auth)return authGate();m.innerHTML=errorCard(e.message,"viewConfig()");return;}
+  const mc=status.memory_config||{},eff=mc.effective||{},flags=mc.flags||{},drift=mc.drift||[];
+  const driftKeys=new Set(drift.map(d=>d.key));
+  m.innerHTML=`
+    ${driftBanner(status)}
+    <div class="card"><h3>MUST / NEVER hard rules (${rules.count}, injected every turn)</h3>
+      ${(rules.hard_rules||[]).map(r=>`<div class="kv"><span>${esc(r)}</span></div>`).join("")||emptyState("No hard rules configured")}
+      <p class="dim" style="margin-bottom:0">Hard rules live in configuration: edit <span class="mono">BLADEX_HARD_RULES</span> in config/.env, then restart the proxy.</p></div>
+    <div class="grid">
+      <div class="card"><h3>Effective memory configuration</h3>
+        <p class="dim" style="margin-top:0">Values the running process is actually using - not what the file says.</p>
+        ${Object.entries(eff).map(([k,v])=>`<div class="kv">
+          <span class="k mono">${esc(k)}</span>
+          <span class="num">${esc(v)} ${driftKeys.has(k)?'<span class="tag err">drift</span>':""}</span></div>`).join("")}</div>
+      <div class="card"><h3>Feature flags</h3>
+        ${Object.entries(flags).map(([k,v])=>`<div class="kv">
+          <span class="k mono">${esc(k)}</span>
+          <span>${v?'<span class="tag ok">on</span>':'<span class="tag">off</span>'} ${driftKeys.has(k)?'<span class="tag err">drift</span>':""}</span></div>`).join("")||'<span class="dim2">none</span>'}</div>
+    </div>
+    ${drift.length?`<div class="card"><h3>Drift detail</h3>
+      <div class="tbl-wrap"><table><thead><tr><th>Key</th><th>Declared in .env</th><th>Effective in process</th></tr></thead><tbody>
+      ${drift.map(x=>`<tr><td class="mono">${esc(x.key)}</td><td class="num">${esc(x.declared)}</td>
+        <td class="num" style="color:var(--err)">${esc(x.effective)}</td></tr>`).join("")}
+      </tbody></table></div>
+      <p class="dim" style="margin-bottom:0">Restart the proxy after editing config/.env, and check for stale exports in the launching shell.</p></div>`:""}`;
+}
+
+/* ═══════════════ Files（文件索引 E7.1）═══════════════ */
+let fiOffset=0;
+async function viewFiles(){
+  const m=$("#main");
+  m.innerHTML=`<div class="row">
+    <input class="input q" id="fiq" placeholder="Semantic search (empty = list by path)"
+      onkeydown="if(event.key==='Enter'){fiOffset=0;loadFiles();}">
+    <select class="input" id="fimime" onchange="fiOffset=0;loadFiles()"><option value="">All types</option>
+      <option value="doc">doc</option><option value="code">code</option>
+      <option value="image">image</option><option value="av">av</option>
+      <option value="other">other</option></select>
+    <select class="input" id="fiorigin" onchange="fiOffset=0;loadFiles()"><option value="">All origins</option>
+      <option value="read">read</option><option value="produced">produced</option></select>
+    <input class="input" id="fiagent" placeholder="Agent" style="width:150px"
+      onkeydown="if(event.key==='Enter'){fiOffset=0;loadFiles();}">
+    <button class="btn" onclick="fiOffset=0;loadFiles()">Search</button></div>
+  <div class="card"><div class="tbl-wrap"><table id="fitab"><thead><tr>
+    <th>Name</th><th style="width:28%">Path</th><th>Type</th><th>Origin</th>
+    <th>Keywords</th><th>Agent</th>
+  </tr></thead><tbody><tr><td colspan="6">${skel(4)}</td></tr></tbody></table></div>
+  <div class="pager" id="fipager"></div></div>`;
+  await loadFiles();
+}
+async function loadFiles(){
+  const p=new URLSearchParams({limit:String(PAGE),offset:String(fiOffset)});
+  const q=$("#fiq").value.trim();if(q)p.set("q",q);
+  const mm=$("#fimime").value;if(mm)p.set("mime_class",mm);
+  const og=$("#fiorigin").value;if(og)p.set("origin",og);
+  const ag=$("#fiagent").value.trim();if(ag)p.set("agent",ag);
+  let d;try{d=await api("GET","/admin/files?"+p);}
+  catch(e){if(e.auth)return authGate();toastMsg(e.message,"err");return;}
+  $("#fitab tbody").innerHTML=(d.files||[]).map(f=>`<tr class="click" onclick="fileDetail('${esc(f.file_id)}')">
+    <td>${esc(f.name||"(unnamed)")}</td>
+    <td class="mono dim" title="${esc(f.path)}">${esc((f.path||"").length>52?"…"+f.path.slice(-51):f.path)}</td>
+    <td><span class="tag acc">${esc(f.mime_class)}</span>${f.ext?`<span class="dim2 mono">${esc(f.ext)}</span>`:""}</td>
+    <td><span class="tag ${f.origin==="produced"?"ok":""}">${esc(f.origin)}</span></td>
+    <td>${(f.keywords||[]).slice(0,4).map(k=>`<span class="tag">${esc(k)}</span>`).join(" ")}</td>
+    <td class="dim">${esc(f.agent_id||"")}</td></tr>`).join("")||`<tr><td colspan="6">${emptyState("No files indexed yet",
+      "File entries appear when agents read or produce files in traffic")}</td></tr>`;
+  $("#fipager").innerHTML=pagerHtml(d.total,fiOffset,"fiPage")+`<span class="dim2">mode: ${esc(d.mode)}</span>`;
+}
+function fiPage(dir){fiOffset=Math.max(0,fiOffset+dir*PAGE);loadFiles();}
+async function fileDetail(id){
+  let f;try{f=await api("GET","/admin/files/"+encodeURIComponent(id));}
+  catch(e){toastMsg(e.message,"err");return;}
+  openDrawer(drawerShell(esc(f.name||f.file_id),
+    `<span class="tag acc">${esc(f.mime_class)}</span>
+     <span class="tag ${f.origin==="produced"?"ok":""}">${esc(f.origin)}</span>`,
+    `${f.summary?`<p style="margin:0 0 10px;line-height:1.6">${esc(f.summary)}</p>`:""}
+     <div class="fields">
+       ${field("file id",f.file_id,1)}${field("path",f.path,1)}
+       ${field("ext",f.ext)}${field("agent",f.agent_id,1)}
+       ${field("user",f.user_id,1)}${field("content hash",(f.content_hash||"").slice(0,16),1)}
+     </div>
+     ${(f.keywords||[]).length?`<div class="sect">Keywords</div>
+       ${f.keywords.map(k=>`<span class="tag">${esc(k)}</span>`).join(" ")}`:""}
+     ${f.origin==="produced"&&f.blob_ref?`<div class="sect">Produced copy</div>
+       <button class="btn" onclick="fileBody('${esc(f.file_id)}')">Load body</button>
+       <div id="fibody"></div>`:""}
+     <details style="margin-top:14px"><summary>Raw JSON</summary><pre>${esc(JSON.stringify(f,null,2))}</pre></details>`));
+}
+async function fileBody(id){
+  const box=$("#fibody");box.innerHTML=skel(3);
+  try{const f=await api("GET","/admin/files/"+encodeURIComponent(id)+"?include_body=true");
+    box.innerHTML=`<pre>${esc(f.body||"(no copy stored)")}</pre>`;
+  }catch(e){box.innerHTML="";toastMsg(e.message,"err");}
+}
+
+/* ═══════════════ Projects（项目库 E7.2）═══════════════ */
+async function viewProjects(){
+  const m=$("#main");
+  m.innerHTML=`<div class="card"><div class="tbl-wrap"><table id="ptab"><thead><tr>
+    <th style="width:22%">Name</th><th style="width:30%">Root path</th><th>Languages</th>
+    <th>Agents</th><th>Origin</th><th>Updated</th>
+  </tr></thead><tbody><tr><td colspan="6">${skel(4)}</td></tr></tbody></table></div></div>`;
+  let d;try{d=await api("GET","/admin/projects?limit=200");}
+  catch(e){if(e.auth)return authGate();m.innerHTML=errorCard(e.message,"viewProjects()");return;}
+  $("#ptab tbody").innerHTML=(d.projects||[]).map(p=>`<tr class="click" onclick="projectDetail('${esc(p.project_id)}')">
+    <td>${esc(p.name||"(unnamed)")}</td>
+    <td class="mono dim" title="${esc(p.root_path)}">${esc(p.root_path||"")}</td>
+    <td>${(p.languages||[]).map(l=>`<span class="tag acc">${esc(l)}</span>`).join(" ")}</td>
+    <td>${(p.agent_ids||[]).map(a=>`<span class="tag">${esc(a)}</span>`).join(" ")}</td>
+    <td>${p.origin==="manual"?'<span class="tag manual">manual</span>':'<span class="tag">auto</span>'}</td>
+    <td class="dim num">${tsCell(p.updated_at,"min")}</td></tr>`).join("")||`<tr><td colspan="6">${emptyState("No projects discovered yet",
+      "Projects are inferred from rule files and member fact paths of Matters")}</td></tr>`;
+}
+async function projectDetail(id){
+  let p;try{p=await api("GET","/admin/projects/"+encodeURIComponent(id));}
+  catch(e){toastMsg(e.message,"err");return;}
+  openDrawer(drawerShell(esc(p.name||id),
+    `${p.origin==="manual"?'<span class="tag manual">manual</span>':'<span class="tag">auto</span>'}`,
+    `${p.description?`<p style="margin:0 0 10px;line-height:1.6">${esc(p.description)}</p>`:""}
+     <div class="fields">
+       ${field("project id",p.project_id,1)}${field("root path",p.root_path,1)}
+       ${field("version",p.version)}${field("updated",fmtTs(p.updated_at))}
+     </div>
+     ${(p.languages||[]).length?`<div class="sect">Languages</div>
+       ${p.languages.map(l=>`<span class="tag acc">${esc(l)}</span>`).join(" ")}`:""}
+     ${(p.agent_ids||[]).length?`<div class="sect">Agents</div>
+       ${p.agent_ids.map(a=>`<span class="tag">${esc(a)}</span>`).join(" ")}`:""}
+     ${p.progress_note?`<div class="sect">Progress</div><p class="dim" style="line-height:1.6">${esc(p.progress_note)}</p>`:""}
+     <details style="margin-top:14px"><summary>Raw JSON</summary><pre>${esc(JSON.stringify(p,null,2))}</pre></details>`));
+}
+
+/* ═══════════════ Profiles（用户偏好 E7.3 + 工具习惯 E7.4）═══════════════ */
+let profileData=null;
+async function viewProfiles(){
+  const m=$("#main");m.innerHTML=skel(5,60);
+  let d;try{d=await api("GET","/admin/profiles");}
+  catch(e){if(e.auth)return authGate();m.innerHTML=errorCard(e.message,"viewProfiles()");return;}
+  profileData=d;
+  m.innerHTML=`
+    <div class="card"><h3>USER.md - user profile (recall reference frame)</h3>
+      ${d.user_md?`<pre style="max-height:320px">${esc(d.user_md)}</pre>`
+        :emptyState("USER.md not generated yet","The consolidator renders profile docs on idle passes once facts exist")}</div>
+    <div class="card"><h3>Agents (${d.agent_count})</h3>
+      <div class="tbl-wrap"><table><thead><tr>
+        <th>Agent</th><th>Habit doc</th><th>Rule files</th><th class="r">Tools tracked</th><th>Top tool</th>
+      </tr></thead><tbody>
+      ${(d.agents||[]).map((a,i)=>{
+        const top=(a.tools||[])[0];
+        return `<tr class="click" onclick="profileDetail(${i})">
+        <td><span class="tag acc">${esc(a.agent_base)}</span></td>
+        <td>${a.agent_md?'<span class="tag ok">generated</span>':'<span class="tag">none</span>'}</td>
+        <td>${(a.rule_files||[]).map(r=>`<span class="tag">${esc(r)}</span>`).join(" ")||'<span class="dim2">-</span>'}</td>
+        <td class="r num">${(a.tools||[]).length}</td>
+        <td>${top?`<span class="mono dim">${esc(top.name)}</span> <span class="dim2 num">(${top.calls??0} calls)</span>`:'<span class="dim2">-</span>'}</td>
+      </tr>`;}).join("")||`<tr><td colspan="5">${emptyState("No agent profiles yet",
+        "Per-agent habit docs, rule file copies and tool stats appear as traffic flows")}</td></tr>`}
+      </tbody></table></div></div>`;
+}
+function profileDetail(i){
+  const a=((profileData||{}).agents||[])[i];if(!a)return;
+  const tools=a.tools||[];
+  const maxCalls=Math.max(1,...tools.map(t=>t.calls||0));
+  openDrawer(drawerShell(`Agent <span class="tag acc">${esc(a.agent_base)}</span>`,"",
+    `<div class="tabs">
+       <button class="on" onclick="profTab(this,'md')">Habit doc</button>
+       <button onclick="profTab(this,'rules')">Rule files</button>
+       <button onclick="profTab(this,'tools')">Tool usage</button></div>
+     <div id="pt-md">
+       ${a.agent_md?`<pre style="max-height:460px">${esc(a.agent_md)}</pre>`
+         :emptyState("Habit doc not generated yet")}
+     </div>
+     <div id="pt-rules" hidden>
+       <p class="dim" style="margin-top:0">Rule file copies captured from this agent, refreshed when content hash changes.</p>
+       ${(a.rule_files||[]).map(r=>`<div class="kv">
+         <a class="link mono" onclick="ruleFileBody('${esc(a.agent_base)}','${esc(r)}')">${esc(r)}</a></div>`).join("")
+         ||emptyState("No rule files captured")}
+       <div id="rfbody"></div>
+     </div>
+     <div id="pt-tools" hidden>
+       ${tools.map(t=>{
+         const calls=t.calls||0,ok=t.ok||0,rate=calls?(ok/calls*100):0;
+         return `<div class="hbar"><span class="lbl mono" title="${esc(t.name)}">${esc(t.name)}</span>
+           <span class="track"><span class="fill" style="width:${(calls/maxCalls*100).toFixed(1)}%;background:${rate<50?"var(--err)":rate<80?"var(--warn)":"var(--ok)"}"></span></span>
+           <span class="cnt">${calls} &middot; ${rate.toFixed(0)}%</span></div>
+           ${t.last_err_class?`<div class="dim2" style="margin:-2px 0 4px 140px;font-size:11px">last error: ${esc(t.last_err_class)}</div>`:""}`;
+       }).join("")||emptyState("No tool calls recorded")}
+       ${tools.length?'<p class="dim2" style="margin-bottom:0">Bar length = call count, color = success rate. Agents are isolated from each other.</p>':""}
+     </div>`));
+}
+function profTab(btn,id){
+  btn.closest(".tabs").querySelectorAll("button").forEach(b=>b.classList.toggle("on",b===btn));
+  for(const s of ["md","rules","tools"])$("#pt-"+s).hidden=(s!==id);
+}
+async function ruleFileBody(base,name){
+  const box=$("#rfbody");box.innerHTML=skel(3);
+  try{const r=await api("GET",`/admin/profiles/${encodeURIComponent(base)}/rulefiles/${encodeURIComponent(name)}`);
+    box.innerHTML=`<div class="sect">${esc(name)} <span class="dim2">(updated ${esc(fmtTs(r.updated_at))})</span></div>
+      <pre style="max-height:380px">${esc(r.content||"")}</pre>`;
+  }catch(e){box.innerHTML="";toastMsg(e.message,"err");}
+}
+
+/* ═══════════════ 启动 ═══════════════ */
+
+/* ── Agents（G11.11）──────────────────────────────────────────────────────
+   未识别的客户端各自落一个 `unknown-<hash>` 桶（宁分勿合）。认领 = 给它起名字，
+   可选同时写一条识别规则回 config/agent_rules.toml，下次直接被认出来。
+   认领走 AGENT_CLAIM 管理事件，历史数据在下次重建时改归属；日志不追改。 */
+async function viewAgents(){
+  const m=$("#main");m.innerHTML=skel(3,60);
+  let d;try{d=await api("GET","/admin/agents");}
+  catch(e){if(e.auth)return authGate();m.innerHTML=errorCard(e.message,"viewAgents()");return;}
+  const unknown=d.unknown_buckets||[],known=d.known_agents||[],claims=d.claims||[];
+  m.innerHTML=`
+    <div class="card"><h3>Unrecognised clients (${unknown.length})</h3>
+      <p class="dim">Each unknown client gets its own bucket rather than sharing one
+        <span class="mono">unknown</span> namespace — merging unrelated agents into one
+        memory namespace is mis-merging under another name. Claim one to name it.
+        The list is derived from the Memory Hub, so it survives proxy restarts and
+        also covers clients seen before this run.</p>
+      ${unknown.length?`<div class="tbl-wrap"><table><thead><tr>
+        <th style="width:20%">Bucket</th><th style="width:24%">User-Agent</th>
+        <th>Bucketing basis / drift evidence</th><th class="r" style="width:70px">Turns</th>
+        <th style="width:70px"></th>
+      </tr></thead><tbody>${unknown.map(b=>{
+        const dr=b.drift||{}, looks=dr.looks_like||"";
+        const ev=[]; if(dr.transport_overlap)ev.push("transport overlap");
+        if(dr.succession)ev.push("took over (old agent stopped)");
+        if(dr.session_continuation)ev.push("session continues");
+        return `<tr>
+        <td><a class="link mono" onclick="agentDetail('${esc(b.bucket_id)}')">${esc(b.bucket_id)}</a>
+          ${looks?`<div><span class="tag acc">looks like ${esc(looks)}</span></div>`:""}</td>
+        <td class="mono dim">${esc((b.headers||{})["user-agent"]||"-")}</td>
+        <td class="mono dim">${esc(b.basis||"-")}
+          ${looks?`<div class="dim" style="margin-top:4px">Likely <b>${esc(looks)}</b> after a
+            version upgrade &mdash; its content signals stopped matching.
+            Evidence (${dr.score||0}/3): ${esc(ev.join(" · ")||"-")}.</div>`:""}</td>
+        <td class="r">${b.hub_turns||b.count||0}</td>
+        <td><button class="btn btn-sm${looks?" btn-acc":""}"
+          onclick="agentClaim('${esc(b.bucket_id)}',${JSON.stringify(dr).replace(/"/g,"&quot;")})">${looks?"Merge / Claim":"Claim"}</button></td>
+      </tr>`;}).join("")}</tbody></table></div>`
+        :emptyState("No unrecognised clients seen yet")}
+      <p class="dim" style="margin-bottom:0"><b>looks like &lt;agent&gt;</b> means this is
+        probably a known agent whose recognition signals drifted (usually a version upgrade),
+        not a new client. The discriminator is <b>took over</b> vs <b>coexists</b>: an agent
+        that stopped when this bucket appeared was most likely upgraded &mdash; one that is
+        still running alongside is more likely a sub-agent, and merging those would be
+        mis-attribution. Evidence is shown, not acted on: claiming stays your decision.</p></div>
+    <div class="card"><h3>Known agents (${known.length})</h3>
+      ${known.length?`<div class="tbl-wrap"><table><thead><tr>
+        <th style="width:20%">Agent</th><th style="width:140px">Status</th>
+        <th>Profiles</th><th class="r" style="width:70px">Turns</th>
+        <th style="width:80px"></th>
+      </tr></thead><tbody>${known.map(a=>`<tr>
+        <td><a class="link mono" onclick="agentDetail('${esc(a.agent_id)}')">${esc(a.agent_id)}</a></td>
+        <td>${a.has_rule?'<span class="tag">rule</span>'
+          :a.claimed?'<span class="tag acc">claimed, no rule</span>'
+          :'<span class="tag">seen only</span>'}</td>
+        <td class="mono dim">${(a.profiles||[]).length?esc((a.profiles||[]).join(", ")):"-"}</td>
+        <td class="r">${a.turns||0}</td>
+        <td><button class="btn btn-sm" onclick="agentRename('${esc(a.agent_id)}')">Rename</button></td>
+      </tr>`).join("")}</tbody></table></div>`
+        :emptyState("No agents yet")}
+      <p class="dim" style="margin-bottom:0">Recognition rules live in
+        <span class="mono">config/agent_rules.toml</span>; presets ship with the package.
+        <b>claimed, no rule</b> means past turns were re-attributed, but the next request
+        from that client will land in a new unrecognised bucket &mdash; open it and save a
+        rule to make recognition stick. <b>seen only</b> means the id appears in the Memory
+        Hub but no rule or claim backs it &mdash; usually legacy or test traffic.
+        Profile variants (<span class="mono">hermes:accept</span>) are folded into their
+        base agent, which is where rules live.</p></div>
+    <div class="card"><h3>Claim history (${claims.length})</h3>
+      ${claims.length?`<div class="tbl-wrap"><table><thead><tr>
+        <th style="width:32%">From</th><th style="width:20%">To</th>
+        <th style="width:100px">Kind</th><th>When</th>
+      </tr></thead><tbody>${claims.map(c=>`<tr>
+        <td class="mono">${esc((c.from||[]).join(", "))}</td>
+        <td class="mono">${esc(c.to)}</td>
+        <td>${c.merge?'<span class="tag acc">merge</span>':'<span class="tag">rename</span>'}</td>
+        <td class="dim">${fmtTs(c.ts)}</td>
+      </tr>`).join("")}</tbody></table></div>`:emptyState("No claims yet")}</div>`;
+}
+
+/* agent 详情抽屉（G11.11 增补，2026-08-19）：列表页只有 bucket_id + 判据串，
+   多个未识别 agent 摆一起分不出谁是谁。认领要求先认出这是什么客户端，
+   那就得把判断依据摆出来——按辨识度排序：system prompt > 工具 > header > 干了什么。*/
+async function agentDetail(id){
+  let d;
+  try{d=await api("GET","/admin/agents/"+encodeURIComponent(id)+"/detail");}
+  catch(e){toastMsg(e.message,"err");return;}
+  const hdrs=Object.entries(d.headers||{});
+  const body=`
+    <div class="fields">
+      ${field("Turns in ledger",d.turns)}
+      ${field("Sessions",d.sessions)}
+      ${field("First seen",fmtTs(d.first_seen))}
+      ${field("Last seen",fmtTs(d.last_seen))}
+      ${field("Bucketing basis",d.basis,true)}
+      ${field("Models",(d.models||[]).join(", "))}
+    </div>
+    <div class="sect">System prompt (start)</div>
+    ${d.system_excerpt?`<pre>${esc(d.system_excerpt)}</pre>`
+      :emptyState("No system prompt in the sampled turns")}
+    <div class="sect">Tools seen (${(d.tools||[]).length})</div>
+    ${(d.tools||[]).length?`<div class="mono dim">${(d.tools||[]).map(esc).join(", ")}</div>`
+      :emptyState("No tool calls in the sampled turns")}
+    <div class="sect">Request headers (${hdrs.length})</div>
+    <div class="mono dim" style="font-size:11px">${
+      hdrs.map(([k,v])=>esc(k)+": "+esc(v)).join("<br>")||"-"}</div>
+    <div class="sect">Recognition rule</div>
+    ${(d.current_rules||[]).length
+      ? (d.current_rules||[]).map(r=>`<div class="kv"><span class="mono">${esc(r.name)}</span>
+          <span class="dim">${esc([(r.system_prompt_keywords||[]).join(" / "),
+            (r.tool_signatures||[]).join(", ")].filter(Boolean).join(" &middot; ")||"header only")}</span>
+          <button class="btn btn-sm" onclick="agentRuleEdit('${esc(id)}','${esc(r.name)}')">Edit</button></div>`).join("")
+      : `<div class="kv"><span class="dim">No rule &mdash; this client will not be recognised
+           automatically next time.</span>
+         <button class="btn btn-sm" onclick="agentRuleEdit('${esc(id)}','')">Add rule</button></div>`}
+    <div class="sect">Recent user messages</div>
+    ${(d.recent_user_messages||[]).map(m=>
+      `<div class="kv"><span class="dim">${fmtTs(m.ts)}</span></div>
+       <pre>${esc(m.text)}</pre>`).join("")
+      ||emptyState("No user messages in the sampled turns")}`;
+  const foot=d.recognized?"":`<button class="btn btn-primary"
+    onclick="closeDrawer();agentClaim('${esc(id)}')">Claim this agent</button>`;
+  openDrawer(drawerShell(esc(id),
+    `<span class="tag">${d.recognized?"recognised":"unrecognised"}</span>`, body, foot));
+}
+
+/* 规则编辑（G11.11 增补，2026-08-19）：改已知 agent 的规则不该逼用户去编 TOML。
+   预填**现有规则**而不是从流量重推——否则一改就丢掉用户手工调过的部分。 */
+async function agentRuleEdit(agentId, ruleName){
+  let d;
+  try{d=await api("GET","/admin/agents/"+encodeURIComponent(agentId)+"/detail");}
+  catch(e){toastMsg(e.message,"err");return;}
+  const cur=(d.current_rules||[]).find(r=>r.name===ruleName)||d.suggested_rule||{};
+  const v=await ask({title:ruleName?`Edit rule ${ruleName}`:`Add rule for ${agentId}`,ok:"Save",
+    body:"Any one signal matching identifies the agent. Leave a field empty to drop that signal. Saved to config/agent_rules.toml; a rule with the same name replaces the preset.",
+    fields:[
+      {name:"name",label:"Rule name (same name replaces an existing rule)",value:cur.name||agentId},
+      {name:"agent_id",label:"Agent id written into memory",value:cur.agent_id||agentId},
+      {name:"keywords",label:"System-prompt keywords, comma separated",
+       value:(cur.system_prompt_keywords||[]).join(", ")},
+      {name:"tools",label:"Tool names, comma separated",value:(cur.tool_signatures||[]).join(", ")},
+      {name:"min_tool_match",label:"How many tools must match",value:String(cur.min_tool_match||1)},
+    ]});
+  if(!v||!v.agent_id)return;
+  const split=x=>(x||"").split(",").map(s=>s.trim()).filter(Boolean);
+  const rule={name:(v.name||v.agent_id).trim(),agent_id:v.agent_id.trim()};
+  const kw=split(v.keywords), tl=split(v.tools);
+  if(kw.length)rule.system_prompt_keywords=kw;
+  if(tl.length){rule.tool_signatures=tl;rule.min_tool_match=parseInt(v.min_tool_match,10)||1;}
+  if(cur.header_patterns)rule.header_patterns=cur.header_patterns;
+  if(cur.profile_aware)rule.profile_aware=true;
+  if(cur.auxiliary)rule.auxiliary=true;
+  try{const r=await api("POST","/admin/agents/rules",{rule});
+    toastMsg("Rule saved to "+r.path);closeDrawer();viewAgents();
+  }catch(e){toastMsg(e.message,"err");}
+}
+/* 🔴 两个操作**语义不同，界面必须分开**（Jason 2026-08-26 指出）：
+
+   - 未识别桶 -> **Claim**：给它一个身份。可能是合并进某个已知 agent（升级漂移），
+     也可能是新建。**合并目标要选不要打** —— 自由文本里打错一个字不会报错，
+     它会被当成一个新 agent 名：那是身份分裂、悄无声息，还顺带绕过了
+     "目标已存在 => 二次确认"那道红线（目标"不存在"所以判不出是合并）。
+   - 已知 agent -> **Rename**：改名。这里列"合并进 XX"文不对题——
+     用户点 Rename 是要改名字，不是要挑一个合并目标。
+
+   两者共用同一个提交路径（AGENT_CLAIM 本就是"认领/改名/合并"一套语义），
+   但**对话框各是各的**。第一版把下拉加在了共用的那一层，Rename 里也冒出
+   "Merge into XX"，操作逻辑不通。 */
+async function agentClaim(from,drift){ return _agentNameDialog(from,drift,"claim"); }
+async function agentRename(from){ return _agentNameDialog(from,null,"rename"); }
+
+async function _agentNameDialog(from,drift,mode){
+  const isClaim=mode==="claim";
+  /* 规则由系统从**已抓到的会话内容**提议（system prompt / 工具 / UA），
+     用户只需确认或改 —— 不该让用户凭空手写（Jason 2026-08-19）。 */
+  let sug={};
+  try{sug=(await api("GET","/admin/agents/"+encodeURIComponent(from)+"/detail")).suggested_rule||{};}
+  // 详情取不到不挡操作，只是没得预填
+  catch(e){}
+  const looks=(drift||{}).looks_like||"";
+  const sugKw=(sug.system_prompt_keywords||[])[0]||"";
+  const sugTools=(sug.tool_signatures||[]).join(", ");
+  /* 🔴 规则字段**只在"新建 agent"时出现**（Jason 2026-08-26）。
+
+     `suggest_rule` 是从**这个桶自己的流量**里采的。合并进一个已知 agent 时，
+     那份采样属于**来源**、不属于**目标**——实测：guardian 子代理桶采出来的
+     keyword 是 "You are judging one planned coding-agent action"，
+     把它写成 `codex` 的规则，既匹配不上 codex 主路径，又给一个本来工作正常的
+     agent 加了一条噪声规则（识别是"任一命中"，多一条错的就多一片误命中面）。
+
+     两种情形的规则语义本来就不同：
+       新建 —— 目标没有规则，**必须从零引导**，内容维是主力。
+       合并 —— 目标已有规则（正因如此它才被识别出来）。此时唯一值得补的是
+               **A/B 档 header 规则**：漂移（升级）恰恰是内容维失效、
+               而 header 仍然稳定，补它才让"下次自动认出来"成立。
+
+     单个对话框没法随下拉动态切字段，所以拆两步，每步语义自洽。 */
+  const ruleFields=[{name:"keyword",label:"System-prompt keyword (recognition rule)",value:sugKw},
+                    {name:"tools",label:"Distinctive tool names, comma separated",value:sugTools}];
+  let v,target,ruleMode="none",hdrRule=null;
+  if(isClaim){
+    let knownList=[];
+    try{knownList=((await api("GET","/admin/agents")).known_agents||[])
+          .map(a=>a.agent_id).filter(a=>a&&a!==from);}
+    catch(e){}
+    const opts=[{value:"__new__",label:"\u2014 New agent (type a name below) \u2014"}]
+      .concat(knownList.map(a=>({value:a,label:"Merge into "+a})));
+    const pre=(looks&&knownList.includes(looks))?looks:"__new__";
+    const step1=await ask({title:`Claim ${from}`,ok:"Continue",
+      body:(looks
+        ? `Evidence suggests this is <b>${esc(looks)}</b> after a version upgrade. Merging is reversible \u2014 a reverse claim undoes it.`
+        : "Give this client an identity: merge it into an agent you already know, or create a new one."),
+      fields:[{name:"target",label:"Merge into an existing agent, or create a new one",
+               type:"select",options:opts,value:pre},
+              {name:"to",label:"New agent name",
+               enableWhen:{field:"target",equals:"__new__"},
+               value:pre==="__new__"?(sug.agent_id||looks||""):""}]});
+    if(!step1)return;
+    target=(step1.target&&step1.target!=="__new__")?step1.target:(step1.to||"").trim();
+    if(!target){toastMsg("Pick an agent to merge into, or type a new name","err");return;}
+    const merging=step1.target&&step1.target!=="__new__";
+    if(!merging){
+      ruleMode="full";
+      v=await ask({title:`Recognition rule for ${target}`,ok:"Claim",
+        body:"So this client is recognised automatically next time. Suggested from its captured traffic \u2014 edit, or clear both fields to claim without a rule.",
+        fields:ruleFields});
+      if(!v)return;
+    }else{
+      /* 🔴 合并时**不让用户动规则**（Jason 2026-08-26）：他的决定是"这个桶是
+         <target>"，规则长什么样系统比他清楚——让他编辑一条正则，是让他做系统
+         该做的事。`suggest_rule` 现在会自证（产出的模式必须匹配它采样的那条 UA，
+         匹配不上就不给），所以这里直接采用。
+         唯一的披露点是紧接着的合并二次确认——那一屏会把"要合并"和"要加这条规则"
+         两件事一起说清（见下面 catch 里的 Confirm merge）。 */
+      hdrRule=(sug.header_patterns||[])[0]||null;
+      ruleMode=hdrRule?"header":"none";
+      v={};
+    }
+  }else{
+    v=await ask({title:`Rename ${from}`,ok:"Rename",
+      body:"Past turns follow the new name. Memory Hub keys and logs are append-only and are never rewritten. Renaming onto a name that already exists is a merge, and asks for confirmation.",
+      fields:[{name:"to",label:"New name",value:from}]});
+    if(!v)return;
+    target=(v.to||"").trim();
+    if(!target){toastMsg("Name cannot be empty","err");return;}
+    if(target===from){toastMsg("Name unchanged");return;}
+  }
+  v.to=target;
+  const payload={from_agent_ids:[from],to_agent_id:target};
+  /* 规则按 ruleMode 组装 —— 见上面那段立论。
+     full   新建：内容维为主，附带 header 维（有则更好）
+     header 合并：**只**补 header 维，绝不把来源桶的内容维写到目标身上
+     none   不带规则（改名，或合并且没有 header 建议） */
+  if(ruleMode==="full"){
+    const kw=(v.keyword||"").trim();
+    const tl=(v.tools||"").split(",").map(x=>x.trim()).filter(Boolean);
+    if(kw||tl.length){
+      payload.rule={name:target,agent_id:target};
+      if(kw)payload.rule.system_prompt_keywords=[kw];
+      if(tl.length){payload.rule.tool_signatures=tl;payload.rule.min_tool_match=1;}
+      if(sug.header_patterns)payload.rule.header_patterns=sug.header_patterns;
+    }
+  }else if(ruleMode==="header"&&hdrRule){
+    payload.rule={name:target,agent_id:target,header_patterns:[hdrRule]};
+  }
+  let r;
+  try{r=await api("POST","/admin/agents/claim",payload);}
+  catch(e){
+    /* 红线：合并需二次确认。端点返回 confirm_required，这里再问一次而不是直接放行。
+       🔴 判据用**结构化的 `status` 字段**，不再对错误文案做正则猜测——
+       文案会改、会翻译，判据不该挂在它上面（2026-08-26 就是这么断的）。 */
+    if(e.status==="confirm_required"||/confirm/i.test(e.message||"")){
+      const ok=await ask({title:"Confirm merge",ok:"Merge",
+        body:`<b>${esc(target)}</b> already exists, so this joins two memory namespaces. Reversible \u2014 a reverse claim undoes it, and Memory Hub keys are never rewritten.`
+          +(hdrRule?` <br><br>Its content signals stopped matching (that is why this bucket appeared), so a header rule will be added so recognition sticks across future upgrades:<br><span class="mono">${esc(hdrRule.name)} ~ ${esc(hdrRule.pattern)}</span>`
+                   :` <br><br>No recognition rule is added \u2014 this client's User-Agent is a generic SDK name, which cannot identify an agent.`),
+        fields:[]});
+      if(!ok)return;
+      payload.confirm_merge=true;
+      try{r=await api("POST","/admin/agents/claim",payload);}
+      catch(e2){toastMsg(e2.message,"err");return;}
+    }else{toastMsg(e.message,"err");return;}
+  }
+  toastMsg(r.rule_path?"Claimed; rule saved":"Claimed");
+  /* 🔴 认领只让**新流量**归位。存量 Fact 与 Matter 卡的 agent_id 是创建时写死的，
+     而增量重建会把"内容相同、只有归属该改"的纠正版当重复丢掉
+     （novelty verdict=vector_kill）—— 不做这一步，用户会以为改完了。 */
+  const go=await ask({title:"Re-attribute existing memories?",ok:"Re-attribute",
+    body:"New traffic is attributed immediately. Memories already in the index still carry the old agent id — including Matter card participants, which are injected whole every turn. This only rewrites the attribution field: no re-distillation, no LLM cost, seconds not hours.",
+    fields:[]});
+  if(go){
+    try{const j=await api("POST","/admin/agents/reattribute",{});
+        toastMsg("Re-attribution queued ("+(j.job_id||"job")+")");}
+    catch(e){toastMsg("Claim saved, but re-attribution could not be queued: "+e.message,"err");}
+  }
+  viewAgents();
+}
+const VIEWS={overview:viewOverview,ledgers:viewLedgers,facts:viewFacts,
+             matters:viewMatters,
+             files:viewFiles,projects:viewProjects,profiles:viewProfiles,
+             graph:viewGraph,sessions:viewSessions,agents:viewAgents,
+             config:viewConfig};
+window.addEventListener("hashchange",route);
+(function initTz(){
+  const t=tzLabel(),el=$("#tz");
+  el.textContent=t.short;
+  if(t.zone)el.title=`Timestamps are shown in ${t.zone} (${t.short}); hover a value for the server original (UTC)`;
+})();
+route();
+</script>
+</body>
+</html>

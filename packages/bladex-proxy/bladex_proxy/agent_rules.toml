@@ -1,0 +1,200 @@
+# BladeX agent 识别规则样本库（预置，随包发布）— 执行卡 G11.10 / 台账 MQ-A1
+#
+# 🔴 不要在这里改你自己的规则。用户规则放部署根的 `config/agent_rules.toml`，
+#    它会被**前置**到本表之前（先匹配、可覆盖预置）。本文件随包升级会被覆盖。
+#
+# ── 三条设计约束（改规则前必读）────────────────────────────────────────────
+#
+# ① 规则是**多信号**的，不是纯 header 正则。
+#    Hermes 的 chat 主路径走 OpenAI SDK，User-Agent 是 SDK 默认值
+#    （它自己的 `hermes-cli/<ver>` 只用在 `/v1/models` 与 pricing catalog 上）。
+#    纯 header 规则**永远匹配不上它**。system prompt 关键词与 tool 签名是内容派生
+#    信号，不随对方 UA 配置和版本漂移，仍是主力。
+#
+# ② header 维**分两类，稳定性差一个量级**（2026-08-26 五 agent 普查修订，
+#    调研卡 docs/research/agent-header-survey-20260826.md §3）。
+#    原文写的是"header 维只用来确认、不单独兜底命名"，那句话对 **UA** 成立，
+#    对**专有自报名 / 专有命名空间**不成立，而 Codex 那次"升级即失联"正是
+#    因为把这两类混在一档、并且整档都没在规则里声明：
+#
+#      A 专有自报名     `originator: Codex Desktop`、UA `claude-cli/…`、
+#                       `deepseek-harness/…`   —— **最稳**，跨版本不变（实测）
+#      B 专有命名空间   `x-codex-*`、`x-claude-code-*`、`anthropic-beta`
+#                       —— 很稳，只有那家会发
+#      C 内容维         system prompt 措辞、工具名 —— **最脆**，每次发版都可能变
+#      D 通用 SDK/运行时 `OpenAI/Python`、`x-stainless-*`、`sec-fetch-mode`
+#                       —— 无区分度，**原文那四条实证说的是这一档**，仍然成立
+#
+#    所以：**A/B 可以单独定名**（它们是 agent 在协议里自报的身份）；
+#    **D 永远不可以**。C 仍是主力——Hermes 与 Pi 的 A/B 两档为空、只能靠它，
+#    所以不是"用 A/B 取代 C"，是四档分开、各按稳定性排序。
+#
+#    🔴 与凭证的界限（2026-08-26 Jason 拍板）：**API key 的 label 不是 agent 身份**。
+#    多个 agent 共用一把 key 很正常，label 只是用户给钥匙起的名字——
+#    A/B 随 agent 走，label 随钥匙走，后者必错。
+#
+# ③ 单个通用 tool 名不足以定 agent。
+#    `session_search` 既在 Hermes 也在 deepseek-harness 的工具表里 —— 靠它
+#    `min_tool_match = 1` 会把 dsh 误判成 hermes（台账 MQ-A6）。通用叫法要么提高
+#    `min_tool_match`，要么换成对方独有的名字。
+#
+# ── 字段 ────────────────────────────────────────────────────────────────
+#   agent_id                规范 agent 名（命中后写进记忆命名空间，改它 = 改历史归属）
+#   system_prompt_keywords  出现在 system 消息里即命中（大小写不敏感，子串匹配）
+#   tool_signatures         工具名集合，命中数 >= min_tool_match 才算
+#   min_tool_match          默认 1
+#   header_patterns         [{ name, pattern }]，pattern 是 Python 正则（对 header 值）
+#   subagent_headers        子代理声明 header 名；命中 → `base:<值>` 且标记为子代理
+#                           （有身份、有记忆价值，但**不是任务账本的作者**）
+#   profile_aware           从 agent 自带声明提取 profile → `base:profile`
+#   auxiliary               agent 内部辅助调用（跳蒸馏；是否降档另见
+#                           identity.DISTILL_ONLY_AUX_RULES）
+#
+# 匹配顺序 = 表内顺序。auxiliary 规则必须排在同 agent 的 base 规则之前
+# （它们 system prompt 更特征鲜明，先匹配才不会被 base 规则吃掉）。
+
+# ── Hermes MoA reference 调用（advisor system prompt + 无 tools）──
+[[rules]]
+name = "hermes-moa-reference"
+agent_id = "hermes"
+system_prompt_keywords = ["reference advisor in a mixture of agents"]
+tool_signatures = []
+min_tool_match = 1
+auxiliary = true
+
+# ── Hermes 上下文压缩 / 任务列表压缩内部子请求 ──
+# 真实流量复盘发现这类曾被复杂度路由送到最贵的模型。归 base agent hermes + auxiliary。
+[[rules]]
+name = "hermes-compaction"
+agent_id = "hermes"
+system_prompt_keywords = [
+    "summarization agent creating a context checkpoint",
+    "task list was preserved across context compression",
+]
+tool_signatures = []
+min_tool_match = 1
+auxiliary = true
+
+# ── Hermes 会话标题生成子请求（2026-08-20 真实流量发现）──
+#
+# 形态：system = "You name chat sessions..."、user = 用户真实提问原文、**无 tools**。
+# 三条识别信号里 system prompt 关键词与 tool 签名都落空（它不带 Hermes 的技能族工具），
+# UA 又是 OpenAI SDK 默认值 —— 只能靠同源继承兜。
+#
+# 🔴 但同源继承有**冷启动窗口**：proxy 重启后若第一条请求恰好是它，注册表还是空的，
+# 无处可继承 → 落 `unknown-<hash>` 桶。实测 2026-08-20 12:18:29 就是这个形态
+# （子请求与主请求同一秒到达，子请求先）。加本规则后它直接被识别成 hermes，
+# 不再依赖继承，冷启动窗口对它失效。
+#
+# auxiliary=true：零记忆价值（内容就是"给这段对话起个标题"），跳蒸馏 + 可降档。
+# 与 classify_auxiliary 的 `_AUX_SYSTEM_KEYWORDS` 保持同一条关键词——两处都要有：
+# 这里管**识别时初判**，那里管 **rebuild 重判**（consolidation 不信任冻结的
+# turn.auxiliary，见 identity.classify_auxiliary docstring）。
+[[rules]]
+name = "hermes-title-generation"
+agent_id = "hermes"
+system_prompt_keywords = ["you name chat sessions"]
+tool_signatures = []
+min_tool_match = 1
+auxiliary = true
+
+# ── Hermes 本体 ──
+[[rules]]
+name = "hermes"
+agent_id = "hermes"
+system_prompt_keywords = ["hermes agent", "nous research"]
+# 🔴 `session_search` 已移出本表（台账 MQ-A6）：deepseek-harness 也有同名工具，
+#    留着会把 dsh 误判成 hermes，而且 agent_source=fingerprint 看起来像正常识别，
+#    比 sticky 误粘更难发现。
+#
+#    治的是**那个通用名**，不是门槛 —— 曾试过把 min_tool_match 提到 2，但那会误伤
+#    `skill_manage` 这类 Hermes 真正独有的工具（单个命中本就该认出来），
+#    实测打挂三条既有识别用例。剩下的四个是 Hermes 技能族专名，保持单命中即可。
+tool_signatures = [
+    "skill_manage", "skills_list", "skill_view", "web_extract",
+]
+min_tool_match = 1
+# Hermes 不同配置文件（accept/default/...）核心指令不同，
+# 从 agent 自带的 "Active Hermes profile: xxx" 声明提取 → 区分配置文件。
+profile_aware = true
+
+# ── Claude Code ──
+[[rules]]
+name = "claude-code"
+agent_id = "claude-code"
+system_prompt_keywords = ["claude code", "you are claude"]
+# 工具名用 PascalCase，与其它 agent 不重叠
+tool_signatures = [
+    "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+    "WebFetch", "NotebookEdit", "Task",
+]
+min_tool_match = 2
+# A/B 档（2026-08-26 普查）：`x-claude-code-session-id` 是专有命名空间，
+# 728 轮实测每轮都发；`anthropic-beta` 里的 `claude-code-*` 同理。
+# 内容维（措辞/工具名）随版本变，这两条不变。
+header_patterns = [
+    { name = "x-claude-code-session-id", pattern = "." },
+    { name = "anthropic-beta", pattern = "(?i)claude-code-" },
+]
+
+# ── OpenAI Codex ──
+# 🔴 2026-08-26 事故：Codex 升级（0.147 → 0.149）后 **system prompt 措辞与工具集
+# 同时变了**，两条内容维一起失效 ⇒ 落 `unknown-9d9bdd3e`，12 轮、10 条 fact 写进
+# 幻影命名空间。而它**一直在自报家门**：`originator: Codex Desktop` 跨这两个版本
+# 一字未动，`x-codex-*` 命名空间也没变——信号在手里，只是规则里没声明。
+# 普查见 docs/research/agent-header-survey-20260826.md §3。
+[[rules]]
+name = "codex"
+agent_id = "codex"
+system_prompt_keywords = ["you are codex", "codex, a coding agent"]
+tool_signatures = ["shell", "apply_patch", "update_plan"]
+min_tool_match = 1
+header_patterns = [
+    # A 档：agent 自报名。`originator` 是 Codex 独有的 header，值就是产品名。
+    { name = "originator", pattern = "(?i)^codex" },
+    # B 档：专有命名空间。窗口 id 每轮都发，任何 Codex 形态（主/子）都有。
+    { name = "x-codex-window-id", pattern = "." },
+]
+# ② 子代理：Codex 自己声明 `x-openai-subagent: guardian` ⇒ `codex:guardian`。
+# 12 轮实测每轮都带；主路径不发这个 header。
+subagent_headers = ["x-openai-subagent"]
+
+# ── Cursor ──
+[[rules]]
+name = "cursor"
+agent_id = "cursor"
+system_prompt_keywords = ["you are cursor", "cursor ide"]
+tool_signatures = ["codebase_search", "grep_search", "read_file", "edit_file"]
+min_tool_match = 2
+
+# ── OpenClaw ──
+[[rules]]
+name = "openclaw"
+agent_id = "openclaw"
+system_prompt_keywords = ["openclaw"]
+tool_signatures = []
+min_tool_match = 1
+
+# ── deepseek-harness（dsh）──
+# 2026-08-18 接入时暴露了整条接入域缺陷链（台账 MQ-A1–A6）。
+# 它是**目前唯一**既发稳定 UA、又发厂商前缀 header 的 agent：
+#   user-agent: deepseek-harness/<ver> (+https://github.com/deepseek-ai/deepseek-harness)
+#   x-deepseek-harness-{user-id,session-id,compact}
+# 其 attribution 模块注明 "nothing can suppress attribution entirely"（不可关闭），
+# 故这里的 header 维是可靠的。仍配 system prompt 与独有工具两道，符合约束 ①。
+[[rules]]
+name = "deepseek-harness"
+agent_id = "dsh"
+system_prompt_keywords = ["powered by deepseek harness"]
+# `cordis_*` / `ralph` 是它独有的；不用 `bash`/`read`/`grep` 这类通用名（约束 ③）。
+tool_signatures = [
+    "cordis_define", "cordis_run", "cordis_inspect_self", "cordis_undefine",
+    "ralph", "terminal_open", "terminal_send",
+]
+min_tool_match = 1
+header_patterns = [
+    { name = "user-agent", pattern = "(?i)^deepseek-harness/" },
+    # header **名字**匹配用 `name` + 空 pattern 即可（值不参与）。
+    # session-id 每会话都变，绝不能拿值来判定。
+    { name = "x-deepseek-harness-session-id", pattern = "" },
+]

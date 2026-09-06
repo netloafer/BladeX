@@ -1,0 +1,69 @@
+# 用户 agent 识别规则（可选）— 复制成 `config/agent_rules.toml` 后生效
+#
+# 预置规则随包发布（`bladex_proxy/agent_rules.toml`），认识 hermes / claude-code /
+# codex / cursor / openclaw / deepseek-harness。本文件用来**增补**你自己的 agent，
+# 或**覆盖**预置里判得不对的那条。
+#
+# 优先级：本文件的规则**先匹配**（CLAUDE.md 刚性原则 9——配置压过推断；
+# 预置表本质上是我们替你做的推断）。`name` 与预置相同 = 覆盖那一条，不是叠加。
+#
+# 改完不必重启：dashboard 的 agent 管理页写回本文件时会刷新缓存；手工改则需重启
+# proxy（规则表进程内缓存一次）。
+#
+# ── 怎么知道该写什么 ───────────────────────────────────────────────────────
+# 新 agent 第一次接进来会落一个 `unknown-<hash>` 桶，并在日志里留一条
+# `agent_unrecognized`，带**脱敏后的完整 header 快照**：
+#
+#   grep agent_unrecognized logs/proxy-*.log | tail -1
+#
+# 照着那份快照挑判据。也可以直接在 dashboard 的 agent 管理页认领，它会替你生成
+# 本文件里的规则条目。
+#
+# ── 判据怎么挑（三条经验，都是踩出来的）────────────────────────────────────
+#
+# ① **优先用 system prompt 关键词或独有工具名**，别只写 header。
+#    很多 agent 走官方 SDK，User-Agent 是 SDK 的名字而不是它自己的
+#    （Hermes 的 chat 主路径就是 `OpenAI/Python x.y`）——纯 header 规则匹配不上。
+#
+# ② **别用通用工具名**。`session_search` / `bash` / `read` 这种多家都有，
+#    会把别人误判成你（真出过事：dsh 因为也有 `session_search` 差点被判成 hermes）。
+#    挑对方独有的，比如 `cordis_run`、`skill_manage`。
+#
+# ③ **header 的值每轮会变时，只判存在、不判值**：`pattern = ""` 即可。
+#    拿 session-id 的值做判据 = 每轮换一个身份。
+#
+# ── 字段 ──────────────────────────────────────────────────────────────────
+#   agent_id                规范 agent 名。🔴 它会进记忆命名空间，改名等于改历史归属
+#                           （请走 dashboard 认领，它会写管理事件并重放历史数据）
+#   name                    规则名，同名覆盖预置
+#   system_prompt_keywords  system 消息里出现即命中（大小写不敏感，子串）
+#   tool_signatures         工具名，命中数 >= min_tool_match
+#   min_tool_match          默认 1
+#   header_patterns         [{ name = "...", pattern = "正则或空串" }]
+#   profile_aware           从 agent 自带声明提取 profile → `base:profile`
+#   auxiliary               agent 内部辅助调用（跳蒸馏）
+
+# ── 例 1：增补一个新 agent ──
+# [[rules]]
+# name = "my-agent"
+# agent_id = "my-agent"
+# system_prompt_keywords = ["you are my custom agent"]
+# tool_signatures = ["my_special_tool"]
+# min_tool_match = 1
+
+# ── 例 2：覆盖预置（同 name 即覆盖）──
+# [[rules]]
+# name = "claude-code"
+# agent_id = "cc-work"
+# system_prompt_keywords = ["claude code"]
+# tool_signatures = ["Read", "Write", "Edit", "Bash"]
+# min_tool_match = 2
+
+# ── 例 3：自报家门且形态稳定的 agent，可以走 header ──
+# [[rules]]
+# name = "vendor-agent"
+# agent_id = "vendor-agent"
+# header_patterns = [
+#     { name = "user-agent", pattern = "(?i)^vendor-agent/" },
+#     { name = "x-vendor-agent-session-id", pattern = "" },   # 只判存在
+# ]

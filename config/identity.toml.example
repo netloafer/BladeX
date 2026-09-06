@@ -1,0 +1,95 @@
+# BladeX 身份两体系配置（ADR-0021 §2）-- 不入 git（已在 .gitignore）。
+# 复制为 config/identity.toml 按需编辑。文件不存在 = 个人模式现状回落（user_id = key hash8）。
+#
+# 两套独立配置，唯一交点是 principal：
+#   体系 A（[[keys]]）：多 key -> 一 principal（凭证生命周期）
+#   体系 B（[[orgs]]/[[teams]]）：org -> 多级 team 树 -> principal 挂载（可选，企业才配）
+# 三级回落：无文件=现状 | key 未声明=隐式 principal(hash8)+warning | principal 无 teams=仅 personal
+#
+# 生成新 key：python3 -c "import secrets; print('bladex-' + secrets.token_urlsafe(24))"
+
+# ════════════════════════════════════════════════════════════════════
+# 示例一：个人极简（两 key 一 principal -- 修复多设备记忆分裂）
+# ════════════════════════════════════════════════════════════════════
+# 同一人多设备多 key（jason-macbook / jason-codex）归一到 principal "jason"，
+# 记忆跨设备合并、Memory Index 检索互见。不配体系 B = 可见集合只有 personal。
+
+[[keys]]
+key = "bladex-REPLACE-ME-macbook"
+label = "jason-macbook"
+principal = "jason"
+
+[[keys]]
+key = "bladex-REPLACE-ME-codex"
+label = "jason-codex"
+principal = "jason"
+
+[[principals]]
+id = "jason"
+name = "Jason Ye"
+# legacy_ids: 存量 user_id(hash8) 归并声明。升级到本配置前各 key 产生的记忆
+# 按 hash8 分散存储；声明后 Memory Index 重建读侧映射到本 principal，历史记忆归并。
+# 在 Memory Hub 里查历史 user_id：grep 旧日志的 identity_resolved user_id 字段。
+legacy_ids = []
+# teams 省略 = 个人模式（可见集合只有 personal:jason）
+
+
+# ════════════════════════════════════════════════════════════════════
+# 示例二：企业完整（org / 多级 team / 敏感标签 -- 取消注释按需改）
+# ════════════════════════════════════════════════════════════════════
+# 凭证独立轮换（吊销 key 不动身份），组织独立调整（调 team 不动凭证）。
+# 敏感标签（§3.1）：agent 维挂 routing.toml [strategies.sensitivity.agents]；
+#                  principal/team 维挂此处（体系 B 的自然属性）。
+# 模型路由（§3.1 修订 team>principal>agent）：principal.id / team.id 即
+#                  routing.toml [strategies.principal].map / [strategies.team].map 的键。
+# 例：下文 team "legal" 的请求可被 routing.toml [strategies.team].map["legal"] 路由到本地 ollama。
+#
+# [[keys]]
+# key = "bladex-REPLACE-ME-alice"
+# label = "alice-laptop"
+# principal = "alice"
+#
+# [[keys]]
+# key = "bladex-REPLACE-ME-bob"
+# label = "bob-laptop"
+# principal = "bob"
+#
+# [[principals]]
+# id = "alice"
+# name = "Alice"
+# teams = ["rd-backend"]          # 挂载团队
+# # sensitivity = "internal"      # 可选：principal 维敏感等级
+#
+# [[principals]]
+# id = "bob"
+# name = "Bob (Legal)"
+# teams = ["legal"]
+# sensitivity = "sensitive"       # 法务团队全员敏感
+#
+# [[orgs]]
+# id = "acme"
+# name = "Acme Corp"
+#
+# [[teams]]
+# id = "rd"
+# org = "acme"
+#
+# [[teams]]
+# id = "rd-backend"
+# org = "acme"
+# parent = "rd"                   # 多级嵌套（可见集合含祖先链 team:rd）
+#
+# [[teams]]
+# id = "legal"
+# org = "acme"
+# sensitivity = "sensitive"       # team 维敏感（成员继承）
+#
+# # 对应 routing.toml 需配 [strategies.sensitivity]：
+# # [strategies.sensitivity]
+# # enabled = true
+# # default_level = "normal"
+# # [strategies.sensitivity.levels]
+# # normal = "public"
+# # internal = "private"
+# # sensitive = "local"
+# # 并在 [[models]] 标 exposure（local=自建 vLLM / private=租赁裸卡 / public=公网 API）。

@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # PyPI trusted publishing (OIDC)
+      contents: write   # GitHub Release 草稿
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Build distributions
+        run: uv build --all-packages
+
+      # PyPI trusted publishing：PyPI 项目侧需配置 GitHub trusted publisher（无 API token）。
+      # 首次发布前先在 TestPyPI 走一遍（beta T24）。
+      - name: Publish to PyPI
+        run: uv publish
+
+      - name: GitHub Release (draft)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* \
+            --draft --generate-notes --title "${{ github.ref_name }}"

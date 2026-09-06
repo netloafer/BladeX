@@ -1,0 +1,56 @@
+[project]
+name = "bladex"
+version = "0.1.0"
+description = "BladeX — memory-first LLM proxy middleware: a self-hosted personal memory layer any agent or model can adopt with near-zero changes."
+requires-python = ">=3.11"
+# Workspace root: no runtime deps; actual packages live in packages/*.
+# v4 定位见 项目 ADR：0008（架构）/ 0009（存储）；公开发布三件套 = bladex-core / bladex-proxy / bladex-mcp。
+dependencies = []
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+bladex-core = { workspace = true }
+bladex-proxy = { workspace = true }
+bladex-mcp = { workspace = true }
+
+[dependency-groups]
+dev = [
+    # workspace 包（editable 安装）-- 让 `uv sync && pytest` 无需 PYTHONPATH 即可 import
+    "bladex-core",
+    "bladex-proxy",
+    "bladex-mcp",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "structlog>=24.0",
+    "pyyaml>=6.0",
+    # Token counting for benchmark runner. Tiktoken handles OpenAI/most tokenizers.
+    "tiktoken>=0.7",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+ignore = ["E501", "UP042"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["packages/*/tests", "tests"]
+addopts = "-ra -q --import-mode=importlib"
+
+[tool.pytest-asyncio]
+mode = "auto"
