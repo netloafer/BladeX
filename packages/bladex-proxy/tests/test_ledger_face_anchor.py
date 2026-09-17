@@ -33,7 +33,7 @@ import pathlib
 
 from bladex_proxy.models import Turn
 
-from _source_probe import source_of
+from _source_probe import package_source, source_of
 
 #: 包源码目录。**按路径读文本，不 import** —— `memory_index` 需要 rocksdict、
 #: `server` 需要 fastapi/litellm，而本组测的全是**源码写法**，不该被 native
@@ -134,10 +134,17 @@ def test_enqueue_turn_reads_it_without_defaulting_to_false() -> None:
 
     与 ① 同一条理由：取不到 ≠ 明确没给。这里单独钉，是因为
     `getattr(x, 'y', False)` 是极顺手的写法，而它会静默毁掉历史锚定。
+
+    🔴 F1.3 / MQ-A49：取值处从 `_ag.last_ledger_face`（进程级"最近一次"，
+    await 之后读 ⇒ 并发串台）改成 `request.state.bladex_ledger_face`
+    （请求作用域，由 `_apply_agency_surfaces` 在同步链里停下）。
+    **三态语义与本条的判据一字未动**——变的是从哪儿取，不是取不到时写什么。
     """
-    src = _src("server.py")
-    assert 'getattr(_ag, "last_ledger_face", None)' in src, (
+    src = package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
+    assert '"bladex_ledger_face", None)' in src, (
         "兜底值不是 None —— 见本条 docstring")
+    assert 'request.state.bladex_ledger_face = getattr(agency, "last_ledger_face", None)' \
+        in src, "生产侧的停放点没了 —— 那样 request.state 上恒为 None（静默退化）"
     assert "ledger_face=_ledger_face" in src, "没传进 Turn"
 
 

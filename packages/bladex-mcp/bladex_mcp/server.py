@@ -169,8 +169,6 @@ def matter_get(matter_id: str) -> str:
     lines = [f"{m.get('matter_id')} [{m.get('status')}] {m.get('title')}"]
     if m.get("summary"):
         lines.append(f"Summary: {m['summary']}")
-    if m.get("open_issues"):
-        lines.append("Open issues: " + "; ".join(m["open_issues"]))
     if m.get("participants"):
         ags = ", ".join(p.get("agent_id", "?") for p in m["participants"])
         lines.append(f"Participants: {ags}")

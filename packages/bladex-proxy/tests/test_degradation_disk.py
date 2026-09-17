@@ -223,7 +223,8 @@ def test_degradation_banner_tolerates_missing_field(capsys):
 
 
 def _dashboard_text() -> str:
-    return (Path(cli.__file__).parent / "dashboard.html").read_text(encoding="utf-8")
+    import bladex_proxy as _pkg
+    return (Path(_pkg.__file__).parent / "dashboard.html").read_text(encoding="utf-8")   # F0.1 拆包：cli 成了子包，按包根定位
 
 
 def test_dashboard_renders_degradation_and_disk():
@@ -284,7 +285,8 @@ def test_consolidator_status_reports_not_running(monkeypatch, capsys, tmp_path):
     for k in list(os.environ):
         if k.startswith("BLADEX_"):
             monkeypatch.delenv(k, raising=False)
-    monkeypatch.setattr(cli, "_consolidator_pid", lambda: None)
+    from bladex_proxy.cli import lifecycle as _lc   # F0.1 拆包：消费方在 cli/lifecycle.py
+    monkeypatch.setattr(_lc, "_consolidator_pid", lambda: None)
     rc = cli.consolidator("status")
     assert rc == 1
     out = capsys.readouterr().out

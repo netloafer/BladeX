@@ -99,6 +99,10 @@ def test_all_memory_flags_and_defaults():
         # 针对的是新增判定；本闸只做**排除**，最坏=漏挂可补，零误合并风险
         # （与 LANE_HARD_SPLIT 同一方向的论证）。开关保留是为了当 A/B 仪器。
         "BLADEX_LEDGER_GATE": True,
+        # G16.2（MQ-A56，2026-09-09）：首步指令按用户面/工具面两档注。
+        # 默认开 = 生产形态；关掉逐字回到 09-09 之前（每请求都注完整原文），
+        # 兼作回滚通道——codex / Pi 的 face 分布仍是 NO-DATA。
+        "BLADEX_LEDGER_FACE_SPLIT": True,
     }
     assert "BLADEX_KEYWORD_CHANNEL" not in MEMORY_FLAG_DEFAULTS
     # 2026-09-03 S4：四个退役开关连代码一起删，表里不得再出现（僵尸回归断言）。
@@ -120,6 +124,8 @@ def test_numeric_defaults_table():
         "BLADEX_FLASH_PROJECTS_PER_AGENT": 10,
         "BLADEX_FLASH_PROJECT_ACTIVE_DAYS": 30,
         "BLADEX_FLASH_AGENT_RETIRE_DAYS": 90,
+        # MQ-L50（2026-09-07）：flash daemon 等 proxy /health 的上限（秒）。
+        "BLADEX_FLASH_WAIT_PROXY_S": 20,
         # M0-8（复核 G3）：三时钟落地前不做重要性驱逐 —— 门槛回 0。
         "BLADEX_MIN_IMPORTANCE": 0.0,
         "BLADEX_LIFECYCLE_INTERVAL_S": 21600.0,
@@ -166,6 +172,8 @@ def test_numeric_defaults_table():
         # （800ms − 410ms 固定底 − 22ms ≈ 368ms 余量 ÷ 3.63ms/碎片 ≈ 100），
         # 所以 BLADEX_HOTPATH_BUDGET_MS 改了它要跟着重算。
         "BLADEX_INDEX_MAX_FRAGMENTS": 100.0,
+        # MQ-I15 ②（2026-09-18）：LanceDB 三表版本数上限（磁盘轴）；0=关。
+        "BLADEX_INDEX_MAX_VERSIONS": 64.0,
         # MQ-S9 / G12.2-pre（2026-08-20 拍板 4h）：fp: 会话桶时间窗切分；0=关。
         "BLADEX_SESSION_FP_WINDOW_S": 14400.0,
         # 2026-08-22：写入侧蒸馏并发。收进本表的理由不是"它是记忆机制"（它不是），

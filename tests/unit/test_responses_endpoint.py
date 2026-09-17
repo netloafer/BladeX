@@ -63,8 +63,9 @@ def _make_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_response=
     embedding 后端可选化后 server 经 build_embedder 构建（不再直接引用
     FastEmbedAdapter）——改 patch build_embedder。
     """
+    from bladex_proxy.server import app_factory as _app_mod   # F0.1 拆包：消费方 lifespan 在 server/app_factory.py
     monkeypatch.setattr(
-        server_module, "build_embedder",
+        _app_mod, "build_embedder",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disabled in test")),
     )
 
@@ -73,7 +74,8 @@ def _make_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_response=
             return _fake_async_iter(mock_chunks or _fake_text_chunks(["hi", " there"]))
         return mock_response or _fake_text_response()
 
-    monkeypatch.setattr(server_module, "call_model", fake_call_model)
+    from bladex_proxy.server import endpoints_responses as _resp_mod   # F0.1 拆包：消费方
+    monkeypatch.setattr(_resp_mod, "call_model", fake_call_model)
 
     cfg = ProxyConfig(
         auth_enabled=False,
@@ -165,8 +167,9 @@ def test_responses_stateful_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 def test_responses_auth_required_when_enabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """auth_enabled=true 时错误 key 回 401。"""
+    from bladex_proxy.server import app_factory as _app_mod   # F0.1 拆包：消费方 lifespan 在 server/app_factory.py
     monkeypatch.setattr(
-        server_module, "build_embedder",
+        _app_mod, "build_embedder",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disabled in test")),
     )
     cfg = ProxyConfig(

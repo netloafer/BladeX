@@ -112,6 +112,10 @@ def test_preset_preserves_hermes_profile_awareness() -> None:
         ("You are cursor, running in Cursor IDE.", "cursor"),
         ("This is openclaw speaking.", "openclaw"),
         ("You are an AI agent powered by DeepSeek Harness.", "dsh"),
+        # MQ-A68：opencode 首次连 BladeX 即落 unknown-e0ca7fa5（兜底分桶从 UA
+        # 读出了 "opencode" 这个名字，规则库里却没有它）。live wire 原文照抄。
+        ("You are opencode, an interactive CLI tool that helps users with "
+         "software engineering tasks.", "opencode"),
     ],
 )
 def test_system_prompt_recognition_unchanged(system_text: str, expected: str) -> None:
@@ -455,3 +459,32 @@ def test_dsh_now_recognized_by_preset_rules() -> None:
     )
     identity, _ = resolve_identity(headers, req)
     assert identity.agent_id == "dsh"
+
+
+def test_opencode_recognised_by_ua_alone() -> None:
+    """🔴 MQ-A68：opencode 三个维度都专有，**任一维单独在场都要认得出**。
+
+    2026-09-11 首次连接时它落 `unknown-e0ca7fa5`，而 `agent_trigger` 是
+    `bucket:ua:opencode` —— **兜底分桶已经从 UA 里读出了名字，规则库里却没有**。
+    "看得见却认不出"是接入域最贵的一类：`agent_source=fallback` 在日志里
+    不刺眼，记忆与账本却已经挂到一个 unknown 命名空间上了。
+
+    live wire 原文（Hub `local/unknown-e0ca7fa5/1789103464821-0`）：
+        user-agent: opencode/1.18.30 ai-sdk/provider-utils/4.0.23 runtime/node.js/24
+    """
+    agent_id, trigger, _ = _fingerprint_agent(
+        [], None, {"user-agent": "opencode/1.18.30 ai-sdk/provider-utils/4.0.23 "
+                                 "runtime/node.js/24"})
+    assert agent_id == "opencode", f"UA 单独在场应识别，实得 {agent_id} ({trigger})"
+
+
+def test_opencode_rule_claims_no_generic_tool_names() -> None:
+    """🔴 约束 ③ 的守卫：opencode 用的是 `bash`/`read`/`edit`/`glob`/`grep`
+    这类**通用工具名**（live 实测），收进 `tool_signatures` 会把别的 agent
+    误判成 opencode —— 那正是 MQ-A6「min_tool_match=1 把 dsh 误判成 hermes」
+    的形态。它的 UA 与 system 自报名已经足够专有，工具维留空。
+    """
+    from bladex_proxy.agent_rules import load_agent_rules
+    rule = next(r for r in load_agent_rules() if r.agent_id == "opencode")
+    assert rule.tool_signatures == [], \
+        "opencode 的工具名是通用名，不得进 tool_signatures"

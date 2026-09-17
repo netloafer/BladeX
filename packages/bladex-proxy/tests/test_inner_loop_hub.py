@@ -35,6 +35,9 @@ from bladex_proxy.models import Identity, Turn
 _PKG = os.path.dirname(inspect.getsourcefile(run_inner_loop))
 
 
+from _source_probe import package_source
+
+
 def _src(name: str) -> str:
     with open(os.path.join(_PKG, name), encoding="utf-8") as f:
         return f.read()
@@ -209,7 +212,7 @@ class TestModuleOff:
 
     def test_enqueue_turn_gates_drain_on_interception(self):
         """`_enqueue_turn` 只在 `interception_on` 时 drain（与 splice 同门）。"""
-        src = _src("server.py")
+        src = package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
         i = src.find("_ag.loop_ledger.drain(")
         assert i > 0, "找不到 drain 接线"
         gate = src.rfind('getattr(_ag, "interception_on", False)', 0, i)
@@ -230,7 +233,7 @@ class TestProductionWiring:
         assert "agency.loop_ledger.record(session_prefix, result)" in ps
 
     def test_enqueue_turn_drains_and_enqueues(self):
-        src = _src("server.py")
+        src = package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
         head = src.find("async def _enqueue_turn(")
         tail = src.find("\nasync def ", head + 10)
         body = src[head:tail if tail > 0 else None]
@@ -245,7 +248,7 @@ class TestProductionWiring:
     def test_every_loop_llm_attaches_usage(self):
         """五处 `_loop_llm` 都必须经 `_loop_reply`——直接 `message.model_dump()`
         就是 usage 恒空的老形态。"""
-        src = _src("server.py")
+        src = package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
         n_defs = src.count("async def _loop_llm(")
         assert n_defs >= 5, f"调用点数变了（{n_defs}），核对本守卫"
         assert src.count("return _loop_reply(r2)") == n_defs

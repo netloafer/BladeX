@@ -198,3 +198,25 @@ header_patterns = [
     # session-id 每会话都变，绝不能拿值来判定。
     { name = "x-deepseek-harness-session-id", pattern = "" },
 ]
+
+# ── opencode ──
+# 2026-09-11 首次连接 BladeX 即落 `unknown-e0ca7fa5`（`agent_source=fallback`，
+# `agent_trigger=bucket:ua:opencode`）—— **兜底分桶已经从 UA 里读出了 "opencode"
+# 这个名字，只是规则库里没有它**。台账 MQ-A68。
+# live wire 原文（Hub `local/unknown-e0ca7fa5/1789103464821-0`）：
+#   user-agent:  opencode/1.18.30 ai-sdk/provider-utils/4.0.23 runtime/node.js/24
+#   x-session-id / x-session-affinity: ses_f711fb335ffe…（自带会话 id，不必指纹推断）
+#   system:      "You are opencode, an interactive CLI tool that helps users with
+#                 software engineering tasks."
+# 🔴 **`x-session-id` 只匹配名字不匹配值**（值每会话都变，同 dsh 那条的教训）。
+# 🔴 工具名一律不收：实测它用 `bash`/`read`/`edit`/`glob`/`grep` 这类**通用名**，
+#    按约束 ③ 收进来会把别的 agent 误判成 opencode。三个维度里两个已经足够专有。
+[[rules]]
+name = "opencode"
+agent_id = "opencode"
+system_prompt_keywords = ["you are opencode"]
+tool_signatures = []
+min_tool_match = 1
+header_patterns = [
+    { name = "user-agent", pattern = "(?i)^opencode/" },
+]

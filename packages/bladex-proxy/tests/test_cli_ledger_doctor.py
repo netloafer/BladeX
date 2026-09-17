@@ -73,7 +73,9 @@ class _Rec:
 
 
 def _run(monkeypatch, rec, argv=("ledger", "doctor")):
-    monkeypatch.setattr(cli, "_admin_call", rec)
+    from _source_probe import consumer_module
+    _ldg = consumer_module("bladex_proxy.cli.ledger_cmds", "bladex_proxy.cli")   # F0.1 拆包：消费方在 cli/ledger_cmds.py
+    monkeypatch.setattr(_ldg, "_admin_call", rec)
     return cli.main(list(argv))
 
 
@@ -92,8 +94,8 @@ def test_fixture_keys_match_the_real_endpoint():
     # 本测试做的是源码级对账，import 只会拖进 rocksdict / litellm 这些
     # native 依赖 —— 那会让它在缺依赖的环境里根本跑不起来，
     # 而这条恰恰是本文件里最该处处都跑的一条（其余测试的前提）。
-    src = (pathlib.Path(__file__).resolve().parents[1]
-           / "bladex_proxy" / "server.py").read_text(encoding="utf-8")
+    from _source_probe import package_source   # 只读文件，不 import 生产模块
+    src = package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
     i = src.index("rows.append({")
     block = src[i:src.index("})", i)]
     endpoint_keys = set(re.findall(r'"(\w+)":', block))

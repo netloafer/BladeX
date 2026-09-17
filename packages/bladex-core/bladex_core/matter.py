@@ -48,8 +48,9 @@ class EdgeTargetType(str, Enum):
 
     SESSION = "session"  # matter ↔ session
     FACT = "fact"        # matter ↔ fact
-    MATTER = "matter"    # matter ↔ matter（Matter↔Matter 关系，如 FOLLOWS/PART_OF）
-    UNIT = "unit"        # matter ↔ TaskUnit（L0 的落点）
+    MATTER = "matter"    # matter ↔ matter（Matter↔Matter 关系，如 PART_OF）
+    # UNIT（matter ↔ TaskUnit，「L0 的落点」）已于 2026-09-06 F0.3 删：L0 经 `Fact.unit_key` 分组落地，
+    # 从未产出 unit 型边；存量 Index 4,475 条边 target_type 全为 fact（H1 销账，扫过再删）。
 
 
 class EdgeRelation(str, Enum):
@@ -59,9 +60,9 @@ class EdgeRelation(str, Enum):
     """
 
     BELONGS = "belongs"        # 现有语义（Matter→Fact/Session）
-    SUPERSEDES = "supersedes"  # Fact→Fact：新事实取代旧（consistency + 取代键落点，U5.2）
-    ELABORATES = "elaborates"  # Fact→Fact：同主题展开/细化
-    FOLLOWS = "follows"        # Matter→Matter：时间/因果后继
+    # SUPERSEDES / ELABORATES / FOLLOWS 已于 2026-09-06 F0.3 删（H1 销账）：三个取值从未被写成边
+    # （取代经 `Fact.superseded_by` + `t_invalid` 落地，adjudication 注释里的"写 SUPERSEDES 边"
+    # 从来没有对应的写边点）；存量 Index 4,475 条边 relation 全为 belongs，删枚举不炸反序列化。
     PART_OF = "part_of"        # Matter→Matter：子事归属大事（Project 脉络）
 
 
@@ -142,11 +143,11 @@ class Matter(BaseModel):
     # ── ADR-0026 §4.1 / U4：Matter 卡扩展（全部确定性可从 Memory Hub 重算）──
     # participants: 「谁做过这卡」（交接原语，注入②平面 + dashboard 消费）。
     # lifecycle: 「卡经历了什么/卡在哪」（会话事件折叠于此，封顶 _MAX_MATTER_LIFECYCLE）。
-    # open_issues: 当前卡点（T12 落点）。
+    # （open_issues「当前卡点，T12 落点」已于 2026-09-06 F0.3 删：T12 从未落、零生产者一个月，
+    #   账本 Open 段是它的替代——H1 销账。）
     # version: 每次归属写入 +1（一致性三规则 + changed-since 交接，U7 消费）。
     participants: list[MatterParticipant] = Field(default_factory=list)
     lifecycle: list[MatterLifecycleEvent] = Field(default_factory=list)
-    open_issues: list[str] = Field(default_factory=list)
     version: int = 0
     # M0-10（复核 H2②）：已折叠事件的内容指纹，**随卡持久化**。
     # 去重此前只在单次进程内生效，于是 rebuild 每重放一次同一段 Memory Hub，

@@ -160,6 +160,7 @@ class _Runtime:
     def __init__(self, about: str) -> None:
         self.about = about
         self.agents_roster = ""   # V-F3：生产 __init__ 恒有此属性，桩跟上形态
+        self.ledger_on = True     # MQ-L77：`ledger_face=None` 时回落到模块门
 
     insert_system_notes = None  # 由下面 __init_subclass__ 之外的赋值补上
 
@@ -305,3 +306,62 @@ def test_shipped_notes_state_the_three_red_lines() -> None:
     assert "goal" in low and "user" in low, "没说清 Goal 属于用户"
     assert "cannot run code" in low or "only touch memory" in low, "没说清工具边界"
     assert "changes nothing" in low or "stays out of your way" in low, "没说清零差异"
+
+
+# ── ⑤ MQ-L77：账本段随账本面装卸（2026-09-18）─────────────────────────────────
+
+def _shipped(name: str) -> str:
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[3]
+    return (root / "config" / "system" / name).read_text(encoding="utf-8")
+
+
+def test_ledger_face_off_strips_every_ledger_mention_from_shipped_notes() -> None:
+    """🔴 核心守卫：账本面不注 ⇒ 注入正文里**一个** `bladex_ledger_` 都不许有。
+
+    阴性对照：去掉 `insert_system_notes` 里的 `render_system_notes(..., ledger=_ledger)`
+    （直接用 `self.about`）⇒ 本用例红。
+    """
+    from bladex_proxy.agency.notes import LEDGER_SECTION_OPEN
+    about = "\n\n---\n\n".join(_shipped(n) for n in ("AGENT.md", "TOOLS.md", "SKILLS.md"))
+    assert LEDGER_SECTION_OPEN in about, "仓库文件必须用标记包住账本段，否则本守卫测的是空气"
+    out = _rt(about).insert_system_notes(
+        [{"role": "user", "content": "hi"}], toolface_injected=True, ledger_face=False)
+    body = out[0]["content"]
+    assert "bladex_ledger_" not in body, "模块/档位关了仍在教账本工具（MQ-L77）"
+    assert "<!-- bladex:ledger" not in body and "<!-- /bladex:ledger" not in body
+    assert "bladex_memory_search" in body, "记忆族说明不许被顺手剥掉"
+
+
+def test_ledger_face_on_keeps_ledger_sections_but_never_the_markers() -> None:
+    about = "\n\n---\n\n".join(_shipped(n) for n in ("AGENT.md", "TOOLS.md"))
+    out = _rt(about).insert_system_notes(
+        [{"role": "user", "content": "hi"}], toolface_injected=True, ledger_face=True)
+    body = out[0]["content"]
+    assert "bladex_ledger_switch" in body and "bladex_ledger_update" in body
+    assert "<!-- bladex:ledger" not in body and "<!-- /bladex:ledger" not in body
+
+
+def test_ledger_face_defaults_to_module_gate() -> None:
+    from bladex_proxy.agency.notes import LEDGER_SECTION_CLOSE, LEDGER_SECTION_OPEN
+    about = f"keep\n{LEDGER_SECTION_OPEN}\ncall bladex_ledger_switch\n{LEDGER_SECTION_CLOSE}\ntail"
+    rt = _rt(about)
+    rt.ledger_on = False
+    body = rt.insert_system_notes([{"role": "user", "content": "x"}], toolface_injected=True)[0]["content"]
+    assert "bladex_ledger_switch" not in body and "keep" in body and "tail" in body
+
+
+def test_render_leaves_unclosed_marker_visible() -> None:
+    """写错标记宁可可见，不静默吞半篇。"""
+    from bladex_proxy.agency.notes import LEDGER_SECTION_OPEN, render_system_notes
+    text = f"a\n{LEDGER_SECTION_OPEN}\nb"
+    assert "b" in render_system_notes(text, ledger=False)
+
+
+def test_orchestration_passes_ledger_face_to_notes() -> None:
+    """接线守卫：server 侧必须把账本面传给自我介绍，否则默认回落模块门就把
+    「档位不在集合」这一档漏了（那正是 live n4 的形态：模块开、档位关）。"""
+    from _source_probe import package_source
+    src = package_source("server")
+    i = src.index("agency.insert_system_notes(")
+    assert "ledger_face=" in src[i:i + 300]

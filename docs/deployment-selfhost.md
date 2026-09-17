@@ -31,7 +31,7 @@ curl http://127.0.0.1:38080/health          # 冒烟
 | 端点 | 鉴权 | 暴露内容 |
 |---|---|---|
 | `/v1/chat/completions`、`/v1/messages`、`/v1/models`、`/v1/models/{model}` | `BLADEX_AUTH_ENABLED=true` 时验 client key；`false` 时放行。`/v1/chat/completions` 读 `Authorization: Bearer`；`/v1/messages` 兼容 `x-api-key`（Claude Code 默认发此头）与 `Authorization: Bearer` | 上游模型调用入口（转发 + 记忆注入）；`/v1/models{,/{model}}` 按 `anthropic-version` header 分流 OpenAI/Anthropic 形态 |
-| `/v1/embeddings` | 同上（`Authorization: Bearer`） | 本地 e5 嵌入（exposure=local，输入不出境；`model` 字段恒走本地 e5）；与 P2 fact 向量同源 |
+| `/v1/embeddings` | 同上（`Authorization: Bearer`） | 嵌入服务，走 `[embedding] backend` 所配后端（`local`/`ipc` 本地推理、输入不出境；**`api` 档转发给线上 embedding 供应商、输入出境**）；`model` 字段被忽略、恒用 BladeX 配置的模型；与 Memory Index fact 向量同源 |
 | `/v1/messages/count_tokens` | 同 `/v1/messages`（`x-api-key` / `Bearer`） | 本地近似 input_tokens 计数（Claude Code 每轮请求前调用；不引重依赖，标注 approximate） |
 | `/admin/*` | 同 client key 体系（bearer，`require_admin_key` 复用 `auth_check`）；`false` 时**同样放行** | 记忆管理写操作（turn 墓碑 / Matter assign/merge/detach/split/close/rename / scope promote）；`/admin/status` 全景只读（T9，待实现） |
 | `/metrics` | **无鉴权** | Prometheus 文本指标（请求计数/延迟 by agent·sensitivity、路由 source 分布、P1 水位、注入过滤命中） |
@@ -46,7 +46,7 @@ curl http://127.0.0.1:38080/health          # 冒烟
 - `/metrics`、`/health`、`/ready` 不带鉴权，便于反代/监控探针直连。**绑非回环时**这些端点会向任何能到达者暴露运行数据（`/metrics` 最多：请求量、路由分布、队列水位；`/health` 次之：溢出/spill 计数；`/ready` 最少：仅布尔位）。公网部署务必：反代 + 网络层 ACL 限制 `/metrics`、`/health`、`/ready` 仅内网/监控网可达，或在反代层加 basic-auth 网关保护。
 - `/health`（liveness：进程活即 200）与 `/ready`（readiness：子系统就绪才 200）分层--`/ready` 探 Redis 连通 / P3 / P2 / 上游熔断缓存标记；P2 与上游为 informational 不 gate（fresh install 或单模型熔断仍有 failover 时不致 503），`ready = redis ∧ p3`（写路径必需）。
 - `/admin/*` 持 client key，但 key 一旦泄漏则记忆可被改写/删除。`.env` 里设强随机 `BLADEX_CLIENT_KEYS`，勿入仓（`.env` 已 gitignore）。
-- e5 嵌入推理**全本地**（fastembed，无外呼）；`/v1/embeddings` 与 P2 内部 e5 同源、输入不出境；上游模型调用才出境--数据流向见 README「数据流向诚实义务」。
+- 嵌入是否出境**由 `[embedding] backend` 决定**：默认 `local`（及 `ipc`）为 fastembed 本地推理、无外呼，`/v1/embeddings` 与 Memory Index 内部嵌入同源、输入不出境；配 `backend = "api"` 时**全部记忆内容（每条 fact + 每轮 query）外发给 embedding 供应商**，启动日志打 `EMBED_API_PRIVACY`，且 ADR-0021 敏感层启用时被强制回 `local`（`BLADEX_ROUTE_STRICT=true` 则拒启动）。上游模型调用另计--数据流向见 README「数据流向诚实义务」。
 
 #### base_url 怎么填（两协议不同，别照抄接口路径）
 

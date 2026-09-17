@@ -52,7 +52,8 @@ class _Recorder:
 @pytest.fixture
 def rec(monkeypatch):
     r = _Recorder()
-    monkeypatch.setattr(cli, "_admin_call", r)
+    from bladex_proxy.cli import ledger_cmds as _ldg   # F0.1 拆包：消费方在 cli/ledger_cmds.py
+    monkeypatch.setattr(_ldg, "_admin_call", r)
     return r
 
 
@@ -340,7 +341,8 @@ def live_endpoint(monkeypatch):
                 payload = {}
             return r.status_code, payload
 
-        monkeypatch.setattr(cli, "_admin_call", transport)
+        from bladex_proxy.cli import ledger_cmds as _ldg   # F0.1 拆包：消费方在 cli/ledger_cmds.py
+        monkeypatch.setattr(_ldg, "_admin_call", transport)
         yield c, transport
 
 

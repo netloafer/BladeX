@@ -9,13 +9,11 @@ from bladex_core.matter import EdgeRelation, EdgeTargetType, MatterEdge
 
 
 def test_edge_target_type_extended() -> None:
-    assert [t.value for t in EdgeTargetType] == ["session", "fact", "matter", "unit"]
+    assert [t.value for t in EdgeTargetType] == ["session", "fact", "matter"]   # unit 已删（F0.3 H1）
 
 
 def test_edge_relation_values() -> None:
-    assert [r.value for r in EdgeRelation] == [
-        "belongs", "supersedes", "elaborates", "follows", "part_of",
-    ]
+    assert [r.value for r in EdgeRelation] == ["belongs", "part_of"]   # 三个孤儿取值已删（F0.3 H1）
 
 
 def test_edge_default_relation_belongs() -> None:
@@ -33,12 +31,7 @@ def test_old_edge_deserializes_to_belongs() -> None:
 
 
 def test_typed_relation_edge() -> None:
-    e = MatterEdge(
-        matter_id="m1", target_type=EdgeTargetType.FACT, target_key="f2",
-        relation=EdgeRelation.SUPERSEDES,
-    )
-    assert e.relation == EdgeRelation.SUPERSEDES
-    # Matter↔Matter 关系边
+    # Matter↔Matter 关系边（Fact→Fact 的 SUPERSEDES 取值已删：取代经 `Fact.superseded_by` 落地）
     e2 = MatterEdge(
         matter_id="m1", target_type=EdgeTargetType.MATTER, target_key="m2",
         relation=EdgeRelation.PART_OF,

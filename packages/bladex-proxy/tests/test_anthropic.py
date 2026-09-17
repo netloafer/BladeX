@@ -191,7 +191,9 @@ async def test_anthropic_stream_capture():
     result = CaptureResult()
 
     events = []
-    async for sse_bytes in anthropic_stream_generator(stream, result, "claude-3"):
+    async for sse_bytes in anthropic_stream_generator(
+        stream, result, "claude-3", input_tokens_estimate=11
+    ):
         events.append(sse_bytes.decode())
 
     # 验证事件序列
@@ -234,7 +236,9 @@ async def test_anthropic_stream_tool_use():
     result = CaptureResult()
 
     events = []
-    async for sse_bytes in anthropic_stream_generator(stream, result, "claude-3"):
+    async for sse_bytes in anthropic_stream_generator(
+        stream, result, "claude-3", input_tokens_estimate=11
+    ):
         events.append(sse_bytes.decode())
 
     assert result.full_text == "Let me search"

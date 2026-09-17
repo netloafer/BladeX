@@ -92,7 +92,7 @@ def test_force_overwrites(tmp_path: pathlib.Path):
 def test_missing_source_is_reported_not_silently_skipped(tmp_path, monkeypatch):
     """源不在 = wheel 打包漏了。**必须响亮报出**——静默跳过正是本条缺陷的成因
     （misconfiguration fails loud）。"""
-    monkeypatch.setattr("bladex_proxy.cli.assets_dir", lambda: tmp_path / "nope")
+    monkeypatch.setattr("bladex_proxy.cli.lifecycle.assets_dir", lambda: tmp_path / "nope")   # F0.1 拆包：消费方在 cli/lifecycle.py
     lines = _install_model_facing_assets(tmp_path)
     assert lines and all("missing from the package" in ln for ln in lines), lines
 
@@ -101,8 +101,8 @@ def test_missing_source_is_reported_not_silently_skipped(tmp_path, monkeypatch):
 
 def test_doctor_checks_model_facing_assets():
     """没有这条，同型缺陷下次还是只能靠人读启动日志的 warning 发现。"""
-    src = (_REPO / "packages" / "bladex-proxy" / "bladex_proxy" / "cli.py"
-           ).read_text(encoding="utf-8")
+    src = (_REPO / "packages" / "bladex-proxy" / "bladex_proxy" / "cli" / "lifecycle.py"
+           ).read_text(encoding="utf-8")   # F0.1 拆包：消费方在 cli/lifecycle.py（doctor + _ASSET_TARGETS）
     assert '_check("Model-facing assets"' in src, "doctor 没有把模型面资产列为检查项"
     assert "_ASSET_TARGETS" in src.split('_check("Model-facing assets"')[0], \
         "检查项要复用 _ASSET_TARGETS，别再写第二份清单"

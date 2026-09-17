@@ -13,7 +13,8 @@ from bladex_core.routing import (
     MultimodalStrategyData,
     RequestStrategyData,
 )
-from bladex_proxy.routing_config import RoutingConfig
+import pytest
+from bladex_proxy.routing_config import RoutingConfig, RoutingConfigError
 
 _SAMPLE_TOML = """
 [[models]]
@@ -218,8 +219,19 @@ models = ["m1"]
     assert cfg.models[0].api_key == ""
 
 
-def test_agent_unknown_model_warns(tmp_path, monkeypatch):
-    """agent 引用了模型池里没有的模型名 → warning 并跳过该名（不崩）。"""
+def test_agent_unknown_model_refuses_startup(tmp_path, monkeypatch):
+    """agent 引用了模型池里没有的模型名 ⇒ **拒绝启动**（MQ-L58，2026-09-08 改）。
+
+    🔴 **本条推翻了它自己的旧版**（原名 `test_agent_unknown_model_warns`，
+    断言的是"warning 并跳过该名，map 保留原样"）。旧行为在 live 上的代价：
+    `"codex" = ["anthropic/glm-5.3-flash"]` 写错一个字，启动打了一条结构化 warning
+    之后**请求照常成功** —— 静态策略整个不命中、退回 sticky 到 weak 档、账本族被 gate，
+    一次剧本③ 全程作废，而那条 warning 在 10 个以上历史日志里连打了好几天没人看。
+
+    缺的不是告警是**严重性**：自包含的配置错误应当在**加载期**响亮失败
+    （同仓先例：`IdentityRegistry.from_toml` 的 dangling ref 就是拒启动）。
+    完整用例见 `tests/unit/test_routing_dangling_model_ref.py`。
+    """
     monkeypatch.setenv("K", "v")
     toml = """
 [[models]]
@@ -235,10 +247,9 @@ enabled = true
 [strategies.agent.map]
 hermes = ["m1", "does-not-exist"]
 """
-    cfg = RoutingConfig.from_toml(_write_toml(tmp_path, toml))
-    agent = cfg.agent_strategy()
-    # map 保留原样（校验只 warning 不删，resolve 时跳过）
-    assert "does-not-exist" in agent.map["hermes"]
+    with pytest.raises(RoutingConfigError) as e:
+        RoutingConfig.from_toml(_write_toml(tmp_path, toml))
+    assert "does-not-exist" in str(e.value) and "strategies.agent.map" in str(e.value)
 
 
 def test_capability_validation(tmp_path, monkeypatch):

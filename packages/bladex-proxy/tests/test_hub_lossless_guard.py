@@ -92,8 +92,8 @@ class TestLayer2SingleProducerSite:
     """元数据生产必须走三协议共享的 _prepare_round（MQ-A18/P7 族防复发）。"""
 
     def _server_src(self) -> str:
-        with open(os.path.join(_PKG, "server.py"), encoding="utf-8") as f:
-            return f.read()
+        from _source_probe import package_source
+        return package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
 
     def test_identity_resolution_single_call_site(self):
         src = self._server_src()

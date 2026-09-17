@@ -78,8 +78,8 @@ def _process(ag: AgencyRuntime, lid: str, n_turns: int, *, turn_index: int = 0,
 # ── ① 单实现点 ────────────────────────────────────────────────────────────
 
 def test_tool_context_is_the_only_ctx_builder():
-    src = (pathlib.Path(__file__).resolve().parents[1] / "bladex_proxy" / "agency.py"
-           ).read_text(encoding="utf-8")
+    from _source_probe import package_source
+    src = package_source("agency")   # F0.1 拆包：tool_context 在 runtime.py，三个调用点分布 runtime/streams
     assert src.count('"user_query": _last_user_text(') == 1, \
         "工具上下文又长出第二份字面量了——漏传 turn_index 就是这么来的（三处各写一份，两处漏）"
     assert src.count("ctx = tool_context(") == 3, "三条拦截路径都要走 tool_context"
@@ -107,7 +107,7 @@ def test_identity_and_tool_context_share_the_single_formula():
     root = pathlib.Path(__file__).resolve().parents[1] / "bladex_proxy"
     # 只抓**代码形态**（赋值/返回里的公式），docstring 里的"修前 len(messages)//2"是历史记录。
     pat = re.compile(r"(=|return)\s*(max\(0,\s*)?len\((request\.)?(upstream_)?messages( or \[\])?\)\s*//\s*2")
-    hits = [f.name for f in (root / "identity.py", root / "agency.py")
+    hits = [f.name for f in (root / "identity.py", *sorted((root / "agency").glob("*.py")))   # F0.1 拆包
             if pat.search(f.read_text(encoding="utf-8"))]
     assert hits == [], f"轮次公式又长出第二份：{hits}（应调 ledger_runtime.user_turn_index）"
 
@@ -173,7 +173,7 @@ def test_old_behaviour_turn_index_zero_debounces_forever(monkeypatch):
     ag = AgencyRuntime()
     _seed(ag)
     scope = ag.scope_of("hermes:default")
-    import bladex_proxy.agency as agency_mod
+    import bladex_proxy.agency.runtime as agency_mod   # F0.1 拆包：消费方 process_message 在 runtime.py
     real = agency_mod.tool_context
     monkeypatch.setattr(agency_mod, "tool_context",
                         lambda **kw: {**real(**kw), "turn_index": 0})

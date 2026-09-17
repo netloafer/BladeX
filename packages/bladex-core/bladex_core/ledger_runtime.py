@@ -29,6 +29,7 @@ from .ledger import (
     ACTOR_MODEL,
     ENTRY_SOURCE_MODEL,
     ENTRY_SOURCE_TOOL,
+    SECTION_GOAL,
     Ledger,
     LedgerEntry,
     LedgerError,
@@ -297,47 +298,357 @@ class ActivationTable:
 # ── L3 · 工具更新通道 ───────────────────────────────────────────────────────
 
 
+#: 条目改动的 op 闭集。**单一定义**——schema 的 enum 与本模块的分支由
+#: `test_f_b_batch_update.py::test_schema_ops_match_runtime` 对账（枚举闭集要从
+#: 定义读，feedback_closed_set_from_definition）。
+UPDATE_OPS: tuple[str, ...] = ("add", "remove")
+
+#: `match` 报歧义时列出的候选条数上限。多了对模型没用——它要的是"再写长一点"
+#: 这个信号，不是一份清单（每个字都花注意力预算，ADR-0029）。
+_MATCH_CANDIDATES_SHOWN = 3
+
+
+def resolve_match(entries: list[LedgerEntry], match: str) -> int:
+    """`match`（条目全文或唯一前缀）→ 段内下标。MQ-L49 ②。
+
+    🔴 **为什么要有它**：`index` 要求模型先数一遍注入块里的条目位置，而它读到的
+    那份可能已经被另一个 agent 改过（rev 锁挡住的正是这一刀）。按内容删则与位置
+    无关——"删掉我刚写完的那条 Next"这件事，模型说得出内容，说不准位置。
+
+    🔴 **两种歧义分开报**：多条**全文相等** ⇒ 让模型改用 index（列文本没有信息量，
+    它们一模一样）；多条**前缀命中** ⇒ 列前 3 条文本，模型据此把 match 写长。
+    零命中也是错误、不是无操作——静默不删会让模型以为删掉了，下一步就把它
+    写进 Verified（MQ-L29 同族形态）。
+    """
+    key = (match or "").strip()
+    if not key:
+        raise LedgerError("match must be non-empty")
+    exact = [i for i, e in enumerate(entries) if e.text.strip() == key]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise LedgerError(
+            f"match {key!r} is not unique: entries {exact} have identical text; "
+            "pass index to say which one")
+    pref = [i for i, e in enumerate(entries) if e.text.strip().startswith(key)]
+    if len(pref) == 1:
+        return pref[0]
+    if not pref:
+        raise LedgerError(
+            f"no entry matching {key!r}; match takes the exact text of the entry "
+            "you mean, or a unique prefix of it")
+    shown = ", ".join(repr(entries[i].text[:60])
+                      for i in pref[:_MATCH_CANDIDATES_SHOWN])
+    raise LedgerError(
+        f"match {key!r} matches {len(pref)} entries ({shown}); "
+        "make it longer, or pass index")
+
+
+def _match_sections(ledger: Ledger, match: str) -> list[tuple[str, list[int]]]:
+    """`match` 在**哪些段**里有候选（MQ-L53：`remove` 不给 `section` 时用）。
+
+    段内精确优先于前缀，是 `resolve_match` 的既有规则；跨段**沿用同一条**——
+    某段有精确命中时，只前缀命中的段一律出局。规则一份，不是两份。
+
+    🔴 **跳过 `goal`**：Goal 仅用户可改（ADR-0032 三红线之一）。段级 enum 里本来
+    就没有 goal，全账本搜索是新开的一条路，得把同一道门再关一次。
+    """
+    key = (match or "").strip()
+    exact: list[tuple[str, list[int]]] = []
+    prefix: list[tuple[str, list[int]]] = []
+    for sec in ledger.section_order:
+        if sec == SECTION_GOAL:
+            continue
+        entries = ledger.entries(sec)
+        hit = [i for i, e in enumerate(entries) if e.text.strip() == key]
+        if hit:
+            exact.append((sec, hit))
+            continue
+        hit = [i for i, e in enumerate(entries) if e.text.strip().startswith(key)]
+        if hit:
+            prefix.append((sec, hit))
+    return exact or prefix
+
+
+def _resolve_section_for_match(ledger: Ledger, match: str) -> str:
+    """`remove` 没给 `section` 时，定位到唯一那一段（MQ-L53）。
+
+    三种结果，与 `resolve_match` 的三种失败**同族**（都要么删对、要么说清楚为什么
+    删不了；静默不删是最坏的一种——模型会以为删掉了，下一步就把它写进 Verified）：
+
+    - 恰好一段命中 ⇒ 返回段名，段**内**的歧义交回 `resolve_match`（它的三条报错
+      一字不动）；
+    - 跨段命中多条 ⇒ 报错带**段名 + 候选文本**（模型要的是"再写长一点或补 section"
+      这个信号）；
+    - 零命中 ⇒ 报错。
+    """
+    key = (match or "").strip()
+    if not key:
+        raise LedgerError("match must be non-empty")
+    hits = _match_sections(ledger, key)
+    if len(hits) == 1:
+        return hits[0][0]
+    if not hits:
+        raise LedgerError(
+            f"no entry matching {key!r} in any section; match takes the exact "
+            "text of the entry you mean, or a unique prefix of it")
+    shown = ", ".join(
+        f"{sec}: {ledger.entries(sec)[idxs[0]].text[:60]!r}"
+        for sec, idxs in hits[:_MATCH_CANDIDATES_SHOWN])
+    raise LedgerError(
+        f"match {key!r} matches entries in {len(hits)} sections ({shown}); "
+        "pass section to say which one, or make match longer")
+
+
+def _apply_one(ledger: Ledger, spec: dict, *, updated_at: str,
+               writer: str = "") -> tuple[Ledger, str]:
+    """一条条目改动 → (新账本, 确认文本)。**单条形态与批量共用这一个实现点**
+    （两份实现改一处忘一处，是本仓反复付过学费的形状）。
+
+    纯变换：不落盘、不发事件、失败以 `LedgerError` 上抛，调用方据此整批回滚
+    （返回的是新对象，抛错时调用方手上那份原封不动）。
+    """
+    section = str(spec.get("section", "")).strip().lower()
+    op = str(spec.get("op", "")).strip().lower()
+    if op == "add":
+        text = str(spec.get("text", "")).strip()
+        if not text:
+            raise LedgerError("add requires non-empty text")
+        ref = str(spec.get("ref", "")).strip()
+        entry = LedgerEntry(text=text,
+                            source=ENTRY_SOURCE_TOOL if ref else ENTRY_SOURCE_MODEL,
+                            ref=ref, writer=writer)
+        new = add_entry(ledger, section, entry, actor=ACTOR_MODEL,
+                        updated_at=updated_at)
+        return new, f"added to {section}: {text}"
+    if op == "remove":
+        match = str(spec.get("match", "")).strip()
+        if match:
+            # MQ-L53：没给 `section` ⇒ 全账本按 `match` 搜（goal 除外）。
+            # `match` 的契约本就是"全文或唯一前缀"，段名是冗余——两个互不相干的
+            # agent 各自漏掉它，那是接口的问题（刚性原则 10）。
+            if not section:
+                section = _resolve_section_for_match(ledger, match)
+            idx = resolve_match(ledger.entries(section), match)
+        else:
+            idx = spec.get("index")
+            if not isinstance(idx, int):
+                raise LedgerError(
+                    "remove requires match (the entry text or a unique prefix "
+                    f"of it) or an integer index — got keys {sorted(spec) or '(none)'}")
+            if not section:
+                # `index` 是**段内**位置，没有段就没有意义 —— 这一条不放宽。
+                raise LedgerError(
+                    "remove by index requires section (index is a position "
+                    "within one section); or pass match instead")
+        new, removed = remove_entry(ledger, section, idx, updated_at=updated_at)
+        return new, f"removed from {section}: {removed.text}"
+    raise LedgerError(f"unknown op {op!r} ({'|'.join(UPDATE_OPS)})")
+
+
+#: 模型最可能写错的键名 → 我们认的那个。**只用来给提示，不做自动纠正**——
+#: 替模型改参数就是替它做决定（三红线：BladeX 不做作者），而且静默纠正会让
+#: 同一个错在下一个 agent 上再犯一次、永远不被发现。
+_KEY_ALIASES: dict[str, str] = {
+    "sec": "section", "segment": "section", "field": "section",
+    "operation": "op", "action": "op", "type": "op",
+    "content": "text", "value": "text", "entry": "text",
+    "evidence": "ref", "source": "ref",
+}
+
+
+def _missing_hint(spec: dict) -> str:
+    """给"缺 section/op"的报错补一句**可操作**的提示。
+
+    两种最常见的写错法各给一句：① 键名近似（`operation` / `Section` 大小写）；
+    ② 整条为空（模型用 `{}` 表示"就这些了"）。认不出就不猜——多说一句错的
+    比不说更糟（它会照着错提示改第二遍）。
+    """
+    if not spec:
+        return ". This entry is empty — drop it from the list instead of sending {}"
+    lower = {str(k).lower(): k for k in spec}
+    hints: list[str] = []
+    for want in ("section", "op"):
+        if want in spec:
+            continue
+        if want in lower:
+            hints.append(f"you wrote {lower[want]!r}, it must be {want!r} (lowercase)")
+            continue
+        for alias, target in _KEY_ALIASES.items():
+            if target == want and alias in lower:
+                hints.append(f"{lower[alias]!r} is not {want!r}")
+                break
+    return (". " + "; ".join(hints)) if hints else ""
+
+
+def _validate_spec(pos: int, spec: dict, ledger: Ledger) -> None:
+    """批量里一条的**与账本状态无关**的校验（段名 / op / 必填字段）。
+
+    先跑一遍再动手，让"第 4 条写错段名"在第 1 条落地之前就报出来。
+    与状态有关的校验（index 范围、match 唯一命中）留给 `_apply_one`——它们要看
+    的是**这一条执行时**的账本，而不是批次开始时的（批内先 add 后按 match 删
+    同一条是合法形态）。两者都抛 `LedgerError`，整批语义相同。
+    """
+    where = f"entries[{pos}]"
+    if not isinstance(spec, dict):
+        raise LedgerError(
+            f"{where} must be an object with section and op, got {type(spec).__name__}")
+    section = str(spec.get("section", "")).strip().lower()
+    op = str(spec.get("op", "")).strip().lower()
+    # 🔴 MQ-L53（2026-09-08）：`section` 只在**推不出**它的时候才是必填。
+    # `op=remove` + `match` 已经唯一确定条目（match 的契约就是"全文或唯一前缀"），
+    # 再要一个段名是我们强加的冗余——两个互不相干的 agent 各自写出逐字相同的
+    # `{op:"remove", match:"…"}`，那是接口的问题不是模型的问题（刚性原则 10）。
+    match_given = bool(str(spec.get("match", "")).strip())
+    section_optional = (op == "remove" and match_given)
+    if not op or (not section and not section_optional):
+        # 🔴 **回显收到了什么**（2026-09-08 事故驱动，MQ-L52）：原文只说"缺 section
+        # 和 op"，模型看不出它写的与 BladeX 读到的差在哪 ⇒ 原样重发。live 实测
+        # 连撞 6 次、rounds 撞上限、62 万 token、零写入。键名足以暴露真实病因
+        # （大小写 / 拼写 / 整条为空），而**只回显键名不回显值**——值可能很长，
+        # 且错误文本本身也是注入（ADR-0032 §3.2-7）。
+        raise LedgerError(
+            f"{where} needs both section and op — got keys {sorted(spec) or '(none)'}"
+            f"{_missing_hint(spec)}")
+    if op not in UPDATE_OPS:
+        raise LedgerError(f"{where}: unknown op {op!r} ({'|'.join(UPDATE_OPS)})")
+    if section and section not in ledger.section_order:
+        raise LedgerError(
+            f"{where}: unknown section {section!r}; "
+            f"this ledger has {', '.join(ledger.section_order)}")
+    if op == "add" and not str(spec.get("text", "")).strip():
+        raise LedgerError(f"{where}: add requires non-empty text")
+    if op == "remove" and not match_given and not isinstance(spec.get("index"), int):
+        # 🔴 **第二类也回显 keys**（MQ-L53 第二半）：第一类之所以能被判成"schema 错"，
+        # 正是因为报错回显了键名；这一类此前没有回显 ⇒ 模型当时写了什么键
+        # （很可能是 `text`——remove 语境下"删这条文本"是最自然的写法，而
+        # `_KEY_ALIASES` 里 `content/value/entry → text` 已在、独缺 `text → match`）
+        # 在日志里**不可判定**。同一条判据不能只用在一半上。
+        # **只回显不纠正**：把 `text` 当 `match` 用 = 替模型改参数（三红线：
+        # BladeX 不做作者），而且静默纠正会让同一个错在下一个 agent 上再犯一次。
+        raise LedgerError(
+            f"{where}: remove requires match or index — got keys "
+            f"{sorted(spec) or '(none)'}")
+
+
+def update_edit_ops(args: dict) -> list[str]:
+    """本次 `bladex_ledger_update` 调用的 op 序列（观测口径**单一定义**）。
+
+    goal 调用 ⇒ `["goal"]`；批量 ⇒ 逐条 op；单条 ⇒ 一项。认不出的形态给
+    `["?"]`——空列表会让"没读到"与"零改动"在读数里长成一样（分母纪律）。
+    消费者：`agency_ledger_update_applied` 的 `n_edits=` / `ops=`（F-B1 判据）。
+    """
+    if str(args.get("goal", "")).strip():
+        return ["goal"]
+    raw = args.get("entries")
+    if isinstance(raw, list) and raw:
+        return [str(e.get("op", "?")).strip().lower() if isinstance(e, dict) else "?"
+                for e in raw]
+    op = str(args.get("op", "")).strip().lower()
+    return [op or "?"]
+
+
+def update_is_add_only(args: dict) -> bool:
+    """这次调用是不是**只有 add**（F-B2 的 rev 判据，MQ-L49 ③）。
+
+    🔴 立论：**add 可交换**。两个 agent 各加一条，谁先谁后结果都是两条都在——
+    没有"基于旧视图错删"可言，而那正是乐观锁存在的理由（`remove` 按旧 index/
+    内容删错东西；`goal` 是用户所有物）。live 读数：8 次 `agency_ledger_rev_conflict`
+    **8/8 是同一个 agent 自撞**（并行 tool_calls 各带同一个 rev），跨 agent 真冲突 0
+    ——被拦下的全是本该放行的 add。
+    保守方向：认不出的形态返回 False（= 照旧判 rev）。
+    """
+    if str(args.get("goal", "")).strip():
+        return False
+    ops = update_edit_ops(args)
+    return bool(ops) and all(op == "add" for op in ops)
+
+
 def apply_tool_update(ledger: Ledger, args: dict, *, updated_at: str = "",
-                      user_text: str = "") -> tuple[Ledger, str]:
+                      user_text: str = "",
+                      writer: str = "") -> tuple[Ledger, str]:
     """toolface `bladex_ledger_update` 参数 → 账本变换。返回 (新账本, 给模型的确认文本)。
 
     条目段的 actor 恒 `model`；`goal` **不是条目段**，走 `revise_goal` 的锚定门
     （必须给出本轮用户原话中的依据）。`section` enum 里没有 goal，这里是第二道门
     ——两道门覆盖"模型伪造参数绕 schema"的形态。
     失败以 LedgerError 上抛，toolface.dispatch 的容错壳会把它变成给模型的 Error 文本。
+
+    # 三种形态（MQ-L49 ①，2026-09-07）
+
+    - `goal` + `goal_change_quote` —— Goal 改动，与条目改动互斥。
+    - `entries: [{section, op, text|match|ref|index}, …]` —— **批量**，一次调用多条。
+    - `section` + `op` + … —— 单条老形态，**逐字不动**（0.1.0 五 agent 的 live
+      记录全是它；批量是新增参数不是替换）。
+
+    `writer` = 写这一批条目的 agent 完整 id（F-B3，轴 C 数据面）。缺省空 ⇒ 条目
+    不带写者标记，与历史形态逐字相同——调用方漏传只丢观测，不改账本语义。
+
+    🔴 **批量是原子的**：任一条失败 ⇒ 整批不落、确认文本不产出、`rev` 不动
+    （调用方在本函数返回后才写池，抛错时它手上那份原封不动）。半本账本比不落
+    更糟——模型看不出哪几条成功了，只能重发，于是第二次把成功的那几条又写一遍。
     """
     goal_text = str(args.get("goal", "")).strip()
+    raw_entries = args.get("entries")
     if goal_text:
         # Goal 改动与条目改动是两件事，一次调用只做一件——混在一起时
         # "哪一半成功了"会说不清，而 Goal 改动必须可审计。
+        if isinstance(raw_entries, list) and raw_entries:
+            # 🔴 响亮失败，不静默丢：老形态下 section/op 被 goal 悄悄忽略是既有
+            # 行为（不改），但 entries 是这次新加的面，静默吞掉一整批条目
+            # = 原则 13 的反面（丢数据要么不丢，要么留显式标记）。
+            raise LedgerError(
+                "a goal change and entry edits must be separate calls; "
+                "send the entries in their own bladex_ledger_update call")
         new = revise_goal(ledger, goal_text,
                           quote=str(args.get("goal_change_quote", "")),
                           user_text=user_text, updated_at=updated_at)
         return new, f"goal updated (revision {new.goal_revisions}): {goal_text}"
+    if raw_entries is not None and not isinstance(raw_entries, list):
+        raise LedgerError("entries must be a list of {section, op, …} objects")
+    if isinstance(raw_entries, list) and raw_entries:
+        total = len(raw_entries)
+
+        def _fail(pos: int, err: Exception) -> LedgerError:
+            """整批失败的**统一包装**。
+
+            🔴 2026-09-08 事故（MQ-L52）：预校验那一路此前**直接抛原始消息**
+            （模型只看到 `entries[5] needs both section and op`），没有经过这层
+            ——于是它不知道**整批都没落**，也不知道该重发整批。live 后果：
+            hermes 连撞 6 次、`rounds=6 degraded=True`、62 万 token、零写入。
+            两条失败路径（预校验 / 应用）现在共用这一个出口，措辞不会再分叉。
+            """
+            return LedgerError(
+                f"edit {pos + 1} of {total} failed ({err}); NOTHING was written "
+                "— the other edits were fine. Resend the WHOLE batch with just "
+                "this one fixed, or drop it and resend the rest.")
+
+        for pos, spec in enumerate(raw_entries):
+            try:
+                _validate_spec(pos, spec, ledger)
+            except LedgerError as e:
+                raise _fail(pos, e) from e
+        new = ledger
+        notes: list[str] = []
+        for pos, spec in enumerate(raw_entries):
+            try:
+                new, note = _apply_one(new, spec, updated_at=updated_at,
+                                       writer=writer)
+            except LedgerError as e:
+                raise _fail(pos, e) from e
+            notes.append(note)
+        return new, "\n".join(notes)
     section = str(args.get("section", "")).strip().lower()
     op = str(args.get("op", "")).strip().lower()
-    if not section or not op:
+    # MQ-L53：单条形态与批量**同一条放宽**——`op=remove` + `match` 时 section 可选。
+    # 两条路各判各的就是两套契约，模型在哪条路上写对全靠运气（同族：MQ-A18/P7）。
+    section_optional = (op == "remove" and bool(str(args.get("match", "")).strip()))
+    if not op or (not section and not section_optional):
         raise LedgerError(
-            "give either section+op (to change an entry) or goal+goal_change_quote "
+            "give either section+op (to change an entry), entries (several at "
+            "once) or goal+goal_change_quote "
             "(only when the user changed the goal this turn)")
-    if op == "add":
-        text = str(args.get("text", "")).strip()
-        if not text:
-            raise LedgerError("add requires non-empty text")
-        ref = str(args.get("ref", "")).strip()
-        entry = LedgerEntry(text=text,
-                            source=ENTRY_SOURCE_TOOL if ref else ENTRY_SOURCE_MODEL,
-                            ref=ref)
-        new = add_entry(ledger, section, entry, actor=ACTOR_MODEL,
-                        updated_at=updated_at)
-        return new, f"added to {section}: {text}"
-    if op == "remove":
-        idx = args.get("index")
-        if not isinstance(idx, int):
-            raise LedgerError("remove requires integer index")
-        new, removed = remove_entry(ledger, section, idx, updated_at=updated_at)
-        return new, f"removed from {section}: {removed.text}"
-    raise LedgerError(f"unknown op {op!r} (add|remove)")
+    return _apply_one(ledger, args, updated_at=updated_at, writer=writer)
 
 
 # ── L4 · 陈旧兜底 ───────────────────────────────────────────────────────────
@@ -490,6 +801,82 @@ def candidate_units(text: str) -> set[str]:
 
 def _is_latin_unit(u: str) -> bool:
     return bool(u) and ord(u[0]) < 0x2E80
+
+
+# ── MQ-A51（2026-09-08）：路径类单元 ─────────────────────────────────────────
+#
+# 🔴 **为什么 df 解不了这件事**（A47 的前提翻了，复核实测 09-07）：稀有锚假设
+# "路径 token 是通用词、df 高"。但 31 份账本里 `df(documents)=1`、`df(hermes)=3`，
+# 阈值 `max(2, N//10)`≈3 ⇒ 它们**按 df 就是稀有的**，一条没被剔掉；被剔掉的反而是
+# 「报告/更新/结果/结论」这类真通用词。前提只在"池内多本谈不同项目"时成立，
+# 而本池主题高度集中。⇒ 底噪的本质是**类别**（文件路径的寻址片段），不是词频。
+#
+# 判据与 `scripts/probe_ledger_files.py` **同一个定义点**（`looks_like_path` 从那里
+# 下沉到这里，探针改 import）——两份判据迟早分叉，那是本仓反复付过学费的形状。
+
+#: 末段必须带扩展名。`/Users/jasonye` 与 `…/site-packages` 因此出局。
+#: 代价 = 无扩展名的真文件（`Makefile`）漏掉——与"宁可漏不可错"的既定口径一致：
+#: 假阳性污染判据，漏报只是少一条证据。`\w` 在 str 模式下含 CJK，故中文文件名照收。
+_LOOKS_LIKE_FILE = None
+#: 切片分隔符：**不含 `.` 与 `-`**（它们是文件名的一部分），含中英标点与空白。
+_PATH_SPLIT = None
+
+
+def looks_like_path(value: object) -> bool:
+    """值像不像一个**文件**路径（纯函数，判别力对照钉在单测里）。
+
+    🔴 2026-09-08 从 `scripts/probe_ledger_files.py` 下沉到本模块（MQ-A51）：
+    热路径的稀有锚要用同一把判据，而探针在 `scripts/` 下、生产不可 import。
+    复制第二份 = 两份判据迟早分叉（本仓反复付过学费的形状）。探针改 import 本函数。
+    """
+    global _LOOKS_LIKE_FILE
+    import re
+    if _LOOKS_LIKE_FILE is None:
+        _LOOKS_LIKE_FILE = re.compile(r"^[\w.~-]+\.[a-z0-9]{1,5}$")
+    if not isinstance(value, str):
+        return False
+    v = value.strip()
+    if not v or len(v) > 512 or "\n" in v or v.endswith("/"):
+        return False
+    return bool(_LOOKS_LIKE_FILE.match(v.rsplit("/", 1)[-1]))
+
+
+def path_like_units(text: str) -> frozenset[str]:
+    """原文里**由文件路径带进来**的词面单元（MQ-A51）。
+
+    两步，每一步都对着一个实测形态：
+
+    ① **哪些片段算路径**：含 `/` ∧ `looks_like_path`（末段带扩展名）∧
+       **至少有一个不带扩展名的路径段**。最后那一条不是修饰——
+       `detect_track.py/classic_hough.py/viz_trajectory.py`（模型用 `/` 连写的
+       文件名清单，live 病例里真实存在）前两条判据全过，而它一个目录都没有。
+       把它当路径 = 把 `classic_hough.py` 这种最有判别力的词当底噪剔掉，
+       比不剔更糟。
+
+    ② **片段里剔什么**：只剔**拉丁 token**（`documents` / `hermes` /
+       `20260907.md`），**保留 CJK 2-gram**。理由：ASCII 段是寻址
+       （目录树 + 命名习惯，同一个 agent 每轮都长一样），文件名里的中文是内容
+       （`台球视觉调研` 是这件事本身）。整片剔掉会把 `台球`/`调研` 一起剔走。
+
+    🔴 **已知代价，方向是保守的**：`packages/…/ledger_runtime.py` 这种确实有判别力
+    的路径，它的拉丁 token 也不再算锚。`hits_rare` 因此是**下界**——对"引用了待办"
+    这把代理尺来说，少算比多算诚实（多算 = 宣称了没发生的注意力）。
+    """
+    global _PATH_SPLIT
+    import re
+    if _PATH_SPLIT is None:
+        _PATH_SPLIT = re.compile(
+            r"[\s,;:()\[\]{}<>\"'`|，、；：（）【】《》「」“”‘’。…]+")
+    out: set[str] = set()
+    for frag in _PATH_SPLIT.split(text or ""):
+        frag = frag.strip()
+        if "/" not in frag or not looks_like_path(frag):
+            continue
+        segs = [s for s in frag.split("/") if s]
+        if all(looks_like_path(s) for s in segs):
+            continue    # 全是文件名 ⇒ 这是清单不是路径（见 ① 的 live 病例）
+        out.update(u for u in candidate_units(frag) if _is_latin_unit(u))
+    return frozenset(out)
 
 
 @dataclass(frozen=True)

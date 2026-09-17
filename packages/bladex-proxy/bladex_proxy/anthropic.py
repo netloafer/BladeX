@@ -21,7 +21,10 @@ from typing import Any
 
 import structlog
 
-from bladex_proxy.capture import CaptureResult
+from bladex_proxy.capture import (
+    CaptureResult, cache_read_tokens, extract_usage, record_first_chunk, warn_bare_reasoning,
+    warn_inline_think,
+)
 
 logger = structlog.get_logger()
 
@@ -336,62 +339,120 @@ def approx_count_tokens(messages: list[dict[str, Any]], tools: list[dict] | None
     return total
 
 
-def _cache_read_tokens(usage: Any) -> int | None:  # noqa: ANN401  上游 SDK 的 usage 对象
-    """上游 prompt cache 命中的 token 数；上游没报则 None（MQ-CA3）。
+# 🔴 MQ-P31（2026-09-10）：本体已搬到 `capture.py`，三条入站路径共用**单一实现点**。
+# 这里保留原名别名 —— 既有测试与 monkeypatch 目标（`anthropic._cache_read_tokens`）
+# 不动，且本文件内的调用点一行未改。V-C2b 仍靠这个字段判 L1 常开有没有在保 cache。
+_cache_read_tokens = cache_read_tokens
 
-    两家写法都认（BladeX 后面挂什么上游都可能）：
-      - OpenAI 兼容：`usage.prompt_tokens_details.cached_tokens`
-      - Anthropic 原生：`usage.cache_read_input_tokens`
 
-    🔴 **None 不是 0**。None = 这个上游根本不报；0 = 报了、本轮没命中。
-    把前者写成 0 会让"上游不支持"伪装成"cache 一直没命中"，
-    而 V-C2b 恰恰要靠这个字段判断 L1 常开有没有在保 cache。
+def _anthropic_usage(
+    prompt_tokens: int, output_tokens: int, cache_read: int | None
+) -> dict[str, int]:
+    """回给客户端的 `usage` 块 —— **`input_tokens` 按 Anthropic 语义 = 未缓存部分**（MQ-P27）。
+
+    ## 同一个名字，两个端点上语义相反（09-10 实测，差点据此得出错误结论）
+
+    | 上游 | `prompt_tokens` / `input_tokens` |
+    |---|---|
+    | Ark `/v3`（OpenAI 兼容，我们的上游） | **含缓存的总数**，`cached_tokens` 是它的子集 |
+    | Anthropic 原生（客户端按这个读） | **未缓存部分**，`cache_read_input_tokens` 是它之外的另一份 |
+
+    此前把上游的总数原样填进 `input_tokens` 且**不发** `cache_read_input_tokens`：
+    两个错互相抵消，`input + cache_read` 的总量恰好是对的（客户端加了个 0）——
+    所以 MQ-P20 的压缩阈值没被它污染（实测三跑 168,164 / 167,956 / 167,224）。
+    🔴 **但这是一颗引信**：谁日后补上 `cache_read_input_tokens` 而不动 `input_tokens`，
+    同一份 token 会被数两遍，上下文规模当场翻倍、压缩提前一半触发。
+    **两处必须同一次改**，就是这个函数存在的理由（单一实现点）。
+
+    **不变量（测试钉死）**：`input_tokens + cache_read_input_tokens == prompt_tokens`。
+    总量不变 ⇒ 已兑现的 P20 那一格不回退。
+
+    上游没报缓存（`cache_read is None`）⇒ 不发这个字段，行为与改动前逐字一致 ——
+    「上游不报」与「报了且零命中」是两件事（同 `_cache_read_tokens` 的 None ≠ 0）。
     """
-    def _get(obj: Any, key: str) -> Any:  # noqa: ANN401
-        """属性与 dict 两种载体一视同仁。
-
-        分开写过一版，dict 形态的**嵌套** `prompt_tokens_details` 直接漏掉了
-        （`getattr(dict, ...)` 恒为 None，而 dict 分支只查了顶层键）——
-        单测当场抓住。载体差异不该在每一层各判一次。
-        """
-        if isinstance(obj, dict):
-            return obj.get(key)
-        return getattr(obj, key, None)
-
-    if usage is None:
-        return None
-    direct = _get(usage, "cache_read_input_tokens")
-    if isinstance(direct, int):
-        return direct
-    details = _get(usage, "prompt_tokens_details")
-    if details is not None:
-        cached = _get(details, "cached_tokens")
-        if isinstance(cached, int):
-            return cached
-    cached_flat = _get(usage, "cached_tokens")
-    if isinstance(cached_flat, int):
-        return cached_flat
-    return None
+    if cache_read is None:
+        return {"input_tokens": prompt_tokens, "output_tokens": output_tokens}
+    # 防御：上游若把 cached 报得比总数还大（见过 usage 字段互相不自洽的上游），
+    # 宁可让 input_tokens 归零也不发负数 —— 负 token 会让客户端的算术整段崩掉。
+    uncached = prompt_tokens - cache_read
+    if uncached < 0:
+        logger.warning("anthropic_usage_cache_exceeds_prompt",
+                       prompt_tokens=prompt_tokens, cache_read=cache_read)
+        uncached = 0
+    return {
+        "input_tokens": uncached,
+        "cache_read_input_tokens": cache_read,
+        "output_tokens": output_tokens,
+    }
 
 
 async def anthropic_stream_generator(
     stream: Any,
     result: CaptureResult,
     model: str,
+    *,
+    input_tokens_estimate: int,
 ) -> AsyncIterator[bytes]:
     """迭代上游 stream，按 Anthropic SSE 格式回传 + 拼完整回复。
 
     事件序列：
       message_start → content_block_start/delta/stop (×N blocks) → message_delta → message_stop
+
+    ## `input_tokens_estimate`（MQ-P20，2026-09-09）
+
+    `message_start.usage.input_tokens` 此前**硬编码 0**，而 claude-code 只走流式
+    ⇒ 它拿不到输入用量 ⇒ **永不触发上下文压缩**（实证：同一份默认配置，裸跑第 20
+    分钟压缩并跑完，经 BladeX 全程零压缩、上下文涨到 39 万字符）。
+    同一文件的非流式路径（`format_anthropic_response`）一直填对着 —— 同一字段、
+    同一文件、两条路径一对一错（刚性原则 12）。
+
+    🔴 **关键字参数且无默认值**：本条缺陷的形状就是"这个数悄悄是 0"，
+    给个 `= 0` 的默认值等于把它原样保留给下一个忘记传的调用点
+    （原则 12：同一参数在两条调用路径上各有一个默认值 = 缺陷）。
+    调用方必须回答"这一轮的输入有多大"。
+
+    上游若在 chunk 里报了真值（`usage.prompt_tokens`），**以上游为准**覆盖估计值，
+    并在 `message_delta` 里回给客户端做校正；上游不报时估计值原样留着。
+    `usage` 块的 cache 拆分见 `_anthropic_usage`（**MQ-P27**）。
+
+    ## MQ-P28（2026-09-10）：工具块必须**严格串行**
+
+    Anthropic 流式协议里内容块不允许嵌套：`start(i)` → deltas → `stop(i)` → `start(i+1)`。
+    此前每来一个新的上游 tool index 就直接发 `content_block_start`、**不关上一个**，
+    全部 `stop` 堆在收尾 ⇒ 多工具轮的块整个嵌套。
+    实测（H4-P28，112 轮）：**多工具轮 25/112，块嵌套轮 25/112，两个集合逐轮重合**；
+    单工具 85 轮结构全对。用户侧症状 = `● Update(...)` 状态点**全轮保持绿色** ——
+    CC 按 `content_block_stop` 落定每个块的状态机，stop 拖到轮末它就一直认为块在流。
+
+    ### 三个候选与为什么选第三个
+
+    | 方案 | 问题 |
+    |---|---|
+    | ① 来新 index 就关上一个，全部工具都增量流式 | 上游**交错**发（OpenAI 语义允许按 index 并行）时，落在已关闭块上的 delta **无处可发** ⇒ 丢参数 ⇒ 工具 JSON 不完整。比原缺陷更糟 |
+    | ② 全部工具缓冲到收尾统一发 | 永远正确，但**76% 的单工具轮**也失去增量流式 —— 为少数形态改多数路径的行为 |
+    | **③ 第一个工具增量流式，其余缓冲到收尾按序发** | **选它** |
+
+    ③ 的性质：**按构造无损**（缓冲的参数一个不丢）、**对任何到达顺序都不嵌套**
+    （交错时后来的 delta 仍落在那个仍然开着的块上）、单工具轮行为**逐字不变**。
+    代价：多工具轮里第二个及以后的工具块在流末才出现 —— 而它们的参数本来也是那时才收齐。
+
+    ⚠️ 实测 `input_json_delta` 交错 **0/25**，所以 ① 在当前上游上也能work ——
+    **但那是上游的偶然行为，不是协议保证**（刚性原则 10 的反面：不能把观察到的
+    上游行为当契约）。③ 不依赖这个观察，所以换上游不会复发。
     """
     msg_id = f"msg_{uuid.uuid4().hex[:12]}"
     full_text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_calls_acc: dict[int, dict[str, Any]] = {}
     t0 = time.perf_counter()
     current_block_idx = -1
     text_block_open = False
+    thinking_block_open = False
+    # MQ-P28：正在增量流式的那个工具的**上游 index**（None = 还没开过工具块）。
+    tool_stream_idx: int | None = None
     stop_reason = "end_turn"
-    input_tokens = 0
+    # MQ-P20：起点是本地估计值，不是 0。上游报了真值就覆盖（见下面的 chunk_usage 分支）。
+    input_tokens = input_tokens_estimate
     output_tokens = 0
     # MQ-CA3：初值 None 而非 0 —— "上游没报"与"报了且零命中"是两件事，
     # 混成 0 会让 cache 读数在上游不支持时看起来像"一直没命中"。
@@ -408,20 +469,66 @@ async def anthropic_stream_generator(
             "model": model,
             "stop_reason": None,
             "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            # MQ-P20：此处曾是硬编码 0 —— claude-code 读的就是这一格。
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
         },
     })
 
     try:
         async for chunk in stream:
             result.chunk_count += 1
+            # MQ-P19：首字延迟。**这条路径此前没有这一行**，而 claude-code 只走它
+            # ⇒ 分不开"等在首字节"与"等在吐字慢"（`ms_first_chunk` 是 A59 / MQ-A57
+            # 那条"下行回传"判据的硬前置）。共用 `capture.record_first_chunk`。
+            record_first_chunk(result, t0)
             try:
                 choice = chunk.choices[0]
                 delta = choice.delta
 
+                # 🔴 MQ-P18/P26：结构化思考 → Anthropic `thinking` 块。
+                # **CC 自己要的就是这个**：live 请求体 113/152 带
+                # `thinking={"type":"adaptive"}` + `context_management.clear_thinking_*`，
+                # 而我们此前把 `delta.reasoning_content` 一行不读、整段丢弃。
+                # 上游默认就给它（直连实测：不带任何参数也有 144 字符 reasoning_content）。
+                # 块形态照抄 `agency/streams.py::_AnthropicNarrator`——那条路径 08-25 D7
+                # 已在真实 CC 上验证过（折叠成计时条）⇒ 不需要新的协议验证。
+                rc = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                if rc:
+                    rc_text = "".join(str(x) for x in rc) if isinstance(rc, list) else str(rc)
+                    reasoning_parts.append(rc_text)
+                    # thinking 必须排在 text/tool 之前（Anthropic 块序）；正文一开就不再补发。
+                    if not text_block_open and not tool_calls_acc:
+                        if not thinking_block_open:
+                            current_block_idx += 1
+                            thinking_block_open = True
+                            yield _sse_event("content_block_start", {
+                                "type": "content_block_start",
+                                "index": current_block_idx,
+                                "content_block": {"type": "thinking", "thinking": ""},
+                            })
+                        yield _sse_event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": current_block_idx,
+                            "delta": {"type": "thinking_delta", "thinking": rc_text},
+                        })
+
                 # 文本 delta
                 if delta.content:
+                    if thinking_block_open:
+                        yield _sse_event("content_block_stop", {
+                            "type": "content_block_stop",
+                            "index": current_block_idx,
+                        })
+                        thinking_block_open = False
                     if not text_block_open:
+                        # 🔴 未观测形态的具名守卫（MQ-P28 同族）：正文在工具块开着时到达
+                        # ⇒ 又会嵌套。112 轮真实流量里 0 例（上游发完 tool_calls 就
+                        # `finish_reason=tool_calls` 收尾），所以**不为它写推测性修法**，
+                        # 但也不让它静默 —— 真发生了要能 grep 到（原则 12/13）。
+                        if tool_stream_idx is not None:
+                            logger.warning("anthropic_text_after_tool_block",
+                                           tool_index=tool_stream_idx,
+                                           block_idx=current_block_idx)
                         current_block_idx += 1
                         text_block_open = True
                         yield _sse_event("content_block_start", {
@@ -438,6 +545,13 @@ async def anthropic_stream_generator(
 
                 # 工具调用 delta
                 if delta.tool_calls:
+                    # 纯工具回复：thinking 块开着就先关掉，再开 tool_use。
+                    if thinking_block_open:
+                        yield _sse_event("content_block_stop", {
+                            "type": "content_block_stop",
+                            "index": current_block_idx,
+                        })
+                        thinking_block_open = False
                     # 关闭当前文本 block（如果有）
                     if text_block_open:
                         yield _sse_event("content_block_stop", {
@@ -448,22 +562,28 @@ async def anthropic_stream_generator(
 
                     for tc in delta.tool_calls:
                         idx = tc.index if tc.index is not None else 0
-                        if idx not in tool_calls_acc:
-                            # 新工具调用 → content_block_start
-                            current_block_idx += 1
-                            tool_calls_acc[idx] = {
-                                "block_idx": current_block_idx,
+                        acc = tool_calls_acc.get(idx)
+                        if acc is None:
+                            acc = tool_calls_acc[idx] = {
+                                "block_idx": None,      # None = 尚未发过 content_block_start
                                 "id": "",
                                 "name": "",
                                 "arguments_parts": [],
                             }
-                            acc = tool_calls_acc[idx]
-                            if tc.id:
-                                acc["id"] = tc.id
-                            if tc.function and tc.function.name:
+                        if tc.id:
+                            acc["id"] = tc.id
+                        if tc.function:
+                            if tc.function.name:
                                 acc["name"] = tc.function.name
-                            if tc.function and tc.function.arguments:
+                            if tc.function.arguments:
                                 acc["arguments_parts"].append(tc.function.arguments)
+
+                        # 🔴 MQ-P28：**第一个**工具走增量流式，其余缓冲到收尾按序发。
+                        # 见函数 docstring「MQ-P28」一节的三个候选与取舍。
+                        if tool_stream_idx is None:
+                            tool_stream_idx = idx
+                            current_block_idx += 1
+                            acc["block_idx"] = current_block_idx
                             yield _sse_event("content_block_start", {
                                 "type": "content_block_start",
                                 "index": current_block_idx,
@@ -474,18 +594,8 @@ async def anthropic_stream_generator(
                                     "input": {},
                                 },
                             })
-                        else:
-                            acc = tool_calls_acc[idx]
-                            if tc.id:
-                                acc["id"] = tc.id
-                            if tc.function:
-                                if tc.function.name:
-                                    acc["name"] = tc.function.name
-                                if tc.function.arguments:
-                                    acc["arguments_parts"].append(tc.function.arguments)
-
-                        # 发 input_json_delta
-                        if tc.function and tc.function.arguments:
+                        if (idx == tool_stream_idx and tc.function
+                                and tc.function.arguments):
                             yield _sse_event("content_block_delta", {
                                 "type": "content_block_delta",
                                 "index": acc["block_idx"],
@@ -497,13 +607,28 @@ async def anthropic_stream_generator(
 
                 # finish_reason
                 if choice.finish_reason:
+                    # 🔴 MQ-P22：落**上游原值**（不是映射后的 Anthropic 词）——
+                    # `capture.OUTPUT_TRUNCATED_REASONS` 与 `_warn_if_output_truncated`
+                    # 认的是 `length`；此前这条路径根本没有生产者，
+                    # `response_meta.finish_reason` 在 claude-code 的流式轮上恒空
+                    # ⇒ MQ-A34 的截断告警对 CC 结构性失明。
+                    result.finish_reason = str(choice.finish_reason)
                     stop_reason = _STOP_REASON_MAP.get(choice.finish_reason, "end_turn")
 
                 # usage（某些 chunk 带 usage）
                 chunk_usage = getattr(chunk, "usage", None)
                 if chunk_usage:
-                    input_tokens = getattr(chunk_usage, "prompt_tokens", input_tokens)
-                    output_tokens = getattr(chunk_usage, "completion_tokens", output_tokens)
+                    # MQ-P20：上游真值优先，但**只在它真的是个正整数时**才覆盖估计值——
+                    # `getattr(obj, "prompt_tokens", 默认)` 在字段存在且为 None 时返回 None，
+                    # 会把估计值抹成 None ⇒ 又变回"客户端读不到用量"。
+                    _pt = getattr(chunk_usage, "prompt_tokens", None)
+                    if isinstance(_pt, int) and _pt > 0:
+                        input_tokens = _pt
+                    _ct = getattr(chunk_usage, "completion_tokens", None)
+                    if isinstance(_ct, int):
+                        output_tokens = _ct
+                    # MQ-P22：同上，此前这条路径不灌 `result.usage`。
+                    result.usage = extract_usage(chunk_usage)
                     _cr = _cache_read_tokens(chunk_usage)
                     if _cr is not None:
                         cache_read_tokens = _cr
@@ -517,6 +642,13 @@ async def anthropic_stream_generator(
         result.error = str(e)
         logger.error("anthropic_stream_interrupted", error=str(e), chunks=result.chunk_count)
 
+    # 关闭未关闭的 thinking block（纯思考、没有正文也没有工具调用的轮次）
+    if thinking_block_open:
+        yield _sse_event("content_block_stop", {
+            "type": "content_block_stop",
+            "index": current_block_idx,
+        })
+
     # 关闭未关闭的文本 block
     if text_block_open:
         yield _sse_event("content_block_stop", {
@@ -524,16 +656,45 @@ async def anthropic_stream_generator(
             "index": current_block_idx,
         })
 
-    # 关闭工具调用 blocks
-    for idx in sorted(tool_calls_acc.keys()):
-        acc = tool_calls_acc[idx]
+    # 🔴 MQ-P28：工具块**严格串行**——先关掉正在流式的那个，再把缓冲的逐个
+    # start → 一次 input_json_delta → stop。此前是"全部 start 先发、全部 stop
+    # 堆在这里"，产生嵌套块（实测多工具轮 25/112 全中，单工具轮 85 全对）。
+    if tool_stream_idx is not None:
         yield _sse_event("content_block_stop", {
             "type": "content_block_stop",
-            "index": acc["block_idx"],
+            "index": tool_calls_acc[tool_stream_idx]["block_idx"],
+        })
+    for idx in sorted(tool_calls_acc.keys()):
+        if idx == tool_stream_idx:
+            continue
+        acc = tool_calls_acc[idx]
+        current_block_idx += 1
+        acc["block_idx"] = current_block_idx
+        yield _sse_event("content_block_start", {
+            "type": "content_block_start",
+            "index": current_block_idx,
+            "content_block": {
+                "type": "tool_use",
+                "id": acc["id"],
+                "name": acc["name"],
+                "input": {},
+            },
+        })
+        _args = "".join(acc["arguments_parts"])
+        if _args:
+            yield _sse_event("content_block_delta", {
+                "type": "content_block_delta",
+                "index": current_block_idx,
+                "delta": {"type": "input_json_delta", "partial_json": _args},
+            })
+        yield _sse_event("content_block_stop", {
+            "type": "content_block_stop",
+            "index": current_block_idx,
         })
 
-    # 填充 result
+    # 填充 result（`full_text` = 客户端看到的正文；思考另存 `reasoning_text`）
     result.full_text = "".join(full_text_parts)
+    result.reasoning_text = "".join(reasoning_parts)
     result.ms = (time.perf_counter() - t0) * 1000
 
     for idx in sorted(tool_calls_acc.keys()):
@@ -554,6 +715,13 @@ async def anthropic_stream_generator(
         text_len=len(result.full_text),
         tool_events=len(result.tool_events),
         elapsed_ms=round(result.ms, 2),
+        # MQ-P19：与 `capture_done` 同名同义，跨三条路径可比（`elapsed_ms − ms_first_chunk`
+        # 才是"吐字段"，两者处置相反 —— MQ-V23）。
+        ms_first_chunk=round(result.ms_first_chunk, 2),
+        # MQ-P20 的读数对：估计值 vs 上游真值。两个都记，才能判"我们报给 CC 的那个数
+        # 离真值有多远"——以及上游到底报不报（相等 ⇒ 上游没报，用的是估计值）。
+        input_tokens_estimate=input_tokens_estimate,
+        input_tokens_reported=input_tokens,
         done=result.done,
         error=result.error,
         # MQ-CA3：上游 prompt cache 命中读数。ADR-0019 的核心论证之一是
@@ -563,13 +731,25 @@ async def anthropic_stream_generator(
         # "L1 常开是为了保 cache" 既无法证实也无法证伪。
         # 🔴 None ≠ 0：None = 上游没报这个字段；0 = 报了且没命中。两者不可混。
         cache_read_tokens=cache_read_tokens,
+        # 🔴 MQ-P29 的**第一步仪器**（09-10）：没有这一格就分不开两件事——
+        # ① 上游本来就把推理放进 `content`（模型行为）；② 上游放在
+        # `reasoning_content` 但**在正文之后才到**，被上面那个
+        # "正文一开就不再补发" 的分支吞了（只进 `reasoning_parts`，不上线）。
+        # 两种情况**屏幕上和日志里此前长得一模一样**，而修法方向相反。
+        # 判读：`text_len` 大 + `thinking_len` 为 0 ⇒ ①；两者都非零 ⇒ ②。
+        reasoning_len=len(result.reasoning_text),
     )
+    warn_inline_think(result.full_text, "messages")
+    # MQ-P29 第二步（批 L）：标记守卫对裸散文推理失明，判据换成行为（正文长 ∧ 同轮 reasoning 为 0）。
+    warn_bare_reasoning(result.full_text, len(result.reasoning_text), "messages")
 
     # message_delta
+    # MQ-P20：`message_delta` 带上 `input_tokens` 做**校正**——上游报了真值就是真值，
+    # 没报就是 `message_start` 里那个估计值（两处必须一致，否则客户端两次读数打架）。
     yield _sse_event("message_delta", {
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": {"output_tokens": output_tokens},
+        "usage": _anthropic_usage(input_tokens, output_tokens, cache_read_tokens),
     })
 
     # message_stop

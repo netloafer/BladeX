@@ -269,9 +269,9 @@ def test_default_precedence_is_env(monkeypatch, tmp_path):
 
 def test_secrets_are_masked_in_reports():
     """冲突报告会进日志和终端 —— API key 不能原样吐出来。"""
-    assert deployment.mask("BLADEX_UPSTREAM_API_KEY", "sk-abcdef123456") == "sk-a***(15 chars)"
+    assert deployment.mask("BLADEX_UPSTREAM_API_KEY", "sk-abcdef123456") == "sk-a***(15 chars)"  # gitleaks:allow 脱敏夹具
     assert deployment.mask("BLADEX_CLIENT_KEYS", "short") == "***(5 chars)"
-    assert deployment.mask("BLADEX_ADMIN_TOKEN", "tok-1234567890") == "tok-***(14 chars)"
+    assert deployment.mask("BLADEX_ADMIN_TOKEN", "tok-1234567890") == "tok-***(14 chars)"  # gitleaks:allow 脱敏夹具
     # 非密钥原样显示，否则报告没法用来核对
     assert deployment.mask("BLADEX_PORT", "38080") == "38080"
     assert deployment.mask("BLADEX_UPSTREAM_API_BASE", "https://x/v1") == "https://x/v1"
@@ -323,9 +323,11 @@ def test_no_module_reimplements_env_parsing():
         return " ".join(out)
 
     pkg = Path(__file__).resolve().parents[1] / "bladex_proxy"
-    for name in ("cli.py", "consolidator.py", "admin_read.py"):
-        src = (pkg / name).read_text(encoding="utf-8")
-        code = code_only(pkg / name)
+    # F0.1 拆包：cli.py → cli/ 包，按包内全部文件对账（`deployment` 的薄封装在 cli/__init__.py）
+    for name in ("cli", "consolidator.py", "admin_read.py"):
+        files = sorted((pkg / name).glob("*.py")) if (pkg / name).is_dir() else [pkg / name]
+        src = "\n".join(p.read_text(encoding="utf-8") for p in files)
+        code = " ".join(code_only(p) for p in files)
         assert "from bladex_proxy import deployment" in src, f"{name} 没走 deployment.py"
         # 自己按行 partition 解析 .env 的老实现（三份漂移的形状）。
         # 🔴 判据收紧到 `.partition(`（2026-08-25）：裸 "partition" 会误伤任何

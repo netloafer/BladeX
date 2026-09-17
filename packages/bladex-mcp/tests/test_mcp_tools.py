@@ -47,7 +47,6 @@ def test_matter_tools(monkeypatch):
                                  "title": "Beta 发布", "summary": "s"}]}
         return {"matter": {"matter_id": "m1", "status": "active",
                            "title": "Beta 发布", "summary": "s",
-                           "open_issues": ["T22 冷验证"],
                            "participants": [{"agent_id": "hermes"}]},
                 "facts": [{"id": "f1", "kind": "event", "content": "x"}],
                 "session_keys": ["u1/hermes/s1/"]}
@@ -55,7 +54,7 @@ def test_matter_tools(monkeypatch):
     monkeypatch.setattr(srv, "_http_json", fake)
     assert "Beta 发布" in srv.matter_list()
     detail = srv.matter_get("m1")
-    assert "T22 冷验证" in detail and "hermes" in detail and "u1/hermes/s1/" in detail
+    assert "hermes" in detail and "u1/hermes/s1/" in detail   # open_issues 已删（F0.3 H1 销账）
 
 
 def test_hard_rules_and_session_recall(monkeypatch):

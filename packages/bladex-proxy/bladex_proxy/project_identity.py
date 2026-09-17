@@ -50,14 +50,78 @@ logger = structlog.get_logger()
 #: 收紧是顺带减假阳性）。
 _CWD_PATTERNS = (
     re.compile(r"<cwd>([^<\n]+)</cwd>"),
-    re.compile(r"^[ \t\-*>]*(?:primary\s+)?working\s+directory\s*:\s*(\S.*?)\s*$",
+    # 🔴 前缀词放开（2026-09-11，MQ-A67）：原来只认 `primary`（claude-code 的写法），
+    #    而 hermes 写的是 `Current working directory: /Users/you`
+    #    —— 只差一个前缀词，整条通路是坏的。今天 hermes 的值恰好是纯家目录、
+    #    第三档本来就判 Global，所以**结果对而通路坏**：它在某个仓库里跑的那天
+    #    才会暴露，而且同样静默。放开成"任意一个单词前缀"，`^` 锚与冒号都保留。
+    re.compile(r"^[ \t\-*>]*(?:\w+\s+)?working\s+directory\s*:\s*(\S.*?)\s*$",
                re.IGNORECASE | re.MULTILINE),
     # codex desktop 形态（2026-08-29 live 实证）：无 <environment_context>，
     # 路径载体是 AGENTS.md 指令头（fp:6103d775f46f「在线吗」轮）。
     re.compile(r"^# AGENTS\.md instructions for (\S+)", re.MULTILINE),
+    # ── 以下三条：2026-09-11 live 实证（MQ-A67）。立卡读数：
+    #    `probe_turn_field_coverage --since-hours 336` 显示 **4 个 agent 的
+    #    `project_id` 恒 0%**（hermes:default 840 轮 / dsh 345 / Pi 215 /
+    #    hermes:accept 169，合计 1,569 轮），而上面三条只覆盖 claude-code 与 codex。
+    #    ⇒ 缺陷不是"少了 dsh 一条"，是**模式表只覆盖了 6 个在产流量 agent 中的 2 个**。
+    # dsh：运行时快照里的 workspace 声明。
+    #     under the session workspace: "/Users/you/dev/bladex-bench/w3-dsh"
+    # 路径带引号、可含空格 ⇒ 取引号内整段（上面三条都是 `\S+`，照抄会在空格处截断）。
+    re.compile(r'session workspace:\s*"([^"]+)"'),
+    # 🔴 **Pi 的 `<project_instructions path=…>` pattern 已删除（2026-09-11 当天加、当天删）**。
+    #    删它的理由是**它是多余的**：Pi 自己每轮都声明
+    #    `Current working directory: …`（system/developer 消息**最后一行**，
+    #    实测 @8,139 与 @15,397 两种位置），上面第二条正则 + system/developer
+    #    全文扫已经完整覆盖。`<project_instructions path>` 指向的是**指令文件**，
+    #    与 cwd 是两回事，用它当 cwd 是拿相邻信号冒充判据。
+    #
+    #    ⚠️ **删它时我给的理由是错的，记在这里不遮掩**：当时看到全量重放里
+    #    246/309 轮解析成 `/Users/you/.pi`，判定为"假阳性、那是 Pi 的配置目录"。
+    #    **Jason 当场指出：`.pi` 就是他有时启动 Pi 的目录**，那 243 轮是**正确读数**。
+    #    ⇒ 我把"没见过的值"读成了"错的值"。`/Users/you/Documents/Code/pi`
+    #    是他分析 Pi 源码的目录，两个都真实存在、都该各自成项目。
+    #    教训与 MQ-A66 同族：**错误的理由写进代码，比没有理由更贵** ——
+    #    下一个人会照着这条假理由做决定。
+    # 🔴 **这里曾加过第三条给 hermes，2026-09-11 当天撤回**（Jason 当场指出）。
+    #    加的依据是**一条**样本里的 `Your working directory is /…/deepseek-harness`，
+    #    据此推了 1,009 轮。全量复核：该串 **4/3,102 轮 = 0.13%**，
+    #    且那 4 轮里 2 轮是"用 hermes 安装 dsh"那次会话的散文 —— 偶发句子，不是载体。
+    #    hermes 的真实载体是 `Current working directory: /Users/you`
+    #    （200/200 条标准 system prompt 都有）。它是**两件事**，当天我先后说错两次：
+    #      ① 第二条正则**原本抓不到**（前缀词白名单只有 `primary`）—— 已放开；
+    #      ② 就算抓到，值是纯家目录 ⇒ 第三档正确判 Global。
+    #    ⇒ hermes 今天的 0% **结果对而通路坏**，它在某个仓库里跑的那天才会暴露。
+    #    教训两条：probe 末尾那句判读纪律（"0% 是断线还是本不该有值，按字段语义判"）
+    #    必须真的执行一遍；以及 n=1 推 n=1009 是"单个病例给不出规模"。
 )
 #: 只看前几条消息的头部——env 块永远在会话开头（越界扫描是热路径浪费）。
-_SCAN_MESSAGES = 3
+#:
+#: 🔴 **3 → 4（2026-09-11，MQ-A67）**。dsh 的载体落在 `messages[3]`：
+#: 首轮 `roles=['system','user','user','user']`，运行时快照是第 4 条 ——
+#: **差一条，于是 `project_id` 恒空、全落 Global**（两跑 159 轮无一例外）。
+#: 与 MQ-L30（claude-code 同样恒空）同形态，只是那次错在写法、这次错在窗口。
+#:
+#: ⚠️ **为什么是 4 而不是"扫到末尾"**：dsh 每轮重发快照，但 90 轮里只有 1 轮
+#: 它在末条（87 轮末条是 `tool`）—— 它插在中间，**从尾部找同样够不着**。
+#: 依据是**追加式会话**：轮 1 的 `messages[3]` 在轮 50 仍是 `messages[3]`。
+#: 🔴 **这条依据尚未验证**（录音只留 `roles` 尾 12 条与 `last_message`，
+#: 中段读不到），判据 = 下一跑 dsh 的 `project_resolved source` 不再恒为 global。
+#: 不满足则不是窗口问题，另查——**不要顺手再放大窗口**（MQ-A25 已否掉那条路：
+#: tool 结果转引我们自己的文档时三个串同现，放大窗口 = 往中毒源上扫）。
+#:
+#: 🔴 **本窗口自 2026-09-11（MQ-A70）起只约束 `user` / `tool`**，
+#: `system` / `developer` 两个角色整条豁免。理由是一条实测推翻的因果：
+#: CC 的 x5-codex-flash 跑里 50 个主轮 `project_id` 为空，**载体一条都没丢** ——
+#: 全部 50 轮都还在消息里，只是被压缩摘要挤到了 `messages[4]`，窗口扫 [0..3]。
+#: ⇒ 缺陷不是"载体在会话中途消失"（我最初写的根因，**错的**），
+#: 而是**窗口锚在"头部第几条"这件事本身**：任何往会话头部插消息的行为
+#: （压缩摘要、前置提醒、多段 system）都会把载体推出去，与是哪个 agent 无关。
+#: 存量重放证实它不是 CC 特有：codex 同样有 10 轮被这条边界吃掉。
+#: 修法把依据从**位置**改挂到**角色**——这两个角色是 agent 对自己环境的声明，
+#: 数量天然极少且不随会话增长（实测热路径 0.354 → 0.355 ms/轮，六 agent 3,357 轮
+#: 零回归、64 轮救回）；user/tool 仍受窗口，MQ-A25 的中毒源全在那一侧。
+_SCAN_MESSAGES = 4
 _SCAN_CHARS = 8192
 
 #: 🔴 标签定位（MQ-A25，2026-09-02 Jason 拍板）：codex 的 `<cwd>` 在 **user**
@@ -71,7 +135,16 @@ _SCAN_CHARS = 8192
 #: 块优先于头部：标签块是 agent 声明的环境，AGENTS.md 头只是指令载体。
 #: 被否的"按角色分档（system/developer 全文扫）"：那两个角色里零非 env 命中
 #: （中毒风险 0），但 codex 的 cwd 根本不在那两个角色里——够不着，不是中毒。
-_ENV_BLOCK = re.compile(r"<environment_context>(.*?)</environment_context>", re.S)
+#: 🔴 **块名是闭集，2026-09-11 加入 `<env>`（MQ-A67 · opencode）**。
+#: opencode 的载体 `<env>\n  Working directory: …` 落在 system @8,696，
+#: 而 `_SCAN_CHARS=8192` —— **差 512 字节**。pattern 对、窗口条数对，
+#: 只是块名不认得：`_ENV_BLOCK` 原来只有 `<environment_context>` 一种写法。
+#: 走的正是 MQ-A25 既定的路（认确定性标签块、块内不限 offset），
+#: **`_SCAN_CHARS` 一个字节不动** —— 放大字符窗口才是往中毒源上扫。
+#: ⚠️ 加新块名前先确认它是 **agent 自己声明环境**的块，不是它转引的内容；
+#: 闭集要从 agent 的 wire 原文读，不从"看起来像"推（`feedback_closed_set_from_definition`）。
+_ENV_BLOCK = re.compile(
+    r"<(environment_context|env)>(.*?)</\1>", re.S)
 
 #: 解析缓存（cwd -> ProjectIdentity）。进程生命期内 cwd 集合极小，不设逐出。
 _cache: dict[str, "ProjectIdentity"] = {}
@@ -118,24 +191,60 @@ def _first_match(text: str) -> str:
 def extract_cwd(messages: list[dict]) -> str:
     """从请求消息里取 cwd 标记（确定性，零 LLM）。取不到返回空串。
 
-    扫描面 = 前 `_SCAN_MESSAGES` 条非空消息 × （`<environment_context>` 标签块
-    整段 ∪ 头部 `_SCAN_CHARS`）——见 `_ENV_BLOCK` 注释（MQ-A25）。
-    `_SCAN_MESSAGES` 一个字节不动：tool 结果转引文档那类中毒源全在前 3 条之外。
+    扫描面 = **全部 `system` / `developer` 消息（不限条数、不限 offset）**
+    ∪ 前 `_SCAN_MESSAGES` 条其余非空消息（**`tool` 角色占位不扫**）×
+    （`<environment_context>` 标签块整段 ∪ 头部 `_SCAN_CHARS`）——
+    见 `_ENV_BLOCK`（MQ-A25）与 `_SCAN_MESSAGES`（MQ-A67 / A70）注释。
+
+    🔴 原句"`_SCAN_MESSAGES` 一个字节不动：中毒源全在前 3 条之外"**已作废**
+    （2026-09-11）：窗口为够到 dsh 的 `messages[3]` 放宽到 4，那句话立刻不成立，
+    而它正是零误伤的唯一依据 —— 依据改挂在**角色分界**上（tool 是转引内容，
+    不是 agent 对自己环境的声明），与窗口大小解耦。
     """
     scanned = 0
     for m in messages:
-        if scanned >= _SCAN_MESSAGES:
-            break
+        role = m.get("role")
+        # 🔴 **`system` / `developer` 不占窗口、也不受条数限制**（2026-09-11，MQ-A70）。
+        # 见 `_SCAN_MESSAGES` 注释末段：窗口锚在"会话头部第几条"，而载体的位置
+        # 会被**任何往头部插消息的行为**推走。只有这两个角色豁免，user/tool 照旧
+        # 受窗口约束 —— 中毒源全在那一侧。
+        privileged = role in ("system", "developer")
+        if not privileged and scanned >= _SCAN_MESSAGES:
+            continue
         content = _text_of(m.get("content"))
         if not content:
             continue
-        scanned += 1
+        if not privileged:
+            scanned += 1
+        # 🔴 MQ-A67（2026-09-11）：**`tool` 角色占窗口但不扫**。
+        # 已知的中毒源是同一类：tool 结果转引我们自己的文档，把
+        # `<environment_context>` / `Working directory:` 原样带回来
+        # （codex 那轮 msg[32]/[86]/[130]，MQ-A25）。它是**转引的内容**，
+        # 不是 agent 对自己环境的声明 —— 两者在语义上本就不该同权。
+        # 🔴 **占位但不扫**（`continue` 在 `scanned += 1` 之后）：
+        # 窗口仍然锚在会话头部 4 条。若改成"不占位"，窗口会顺着 tool 结果
+        # 往会话深处滑，那才是真的放大扫描面。
+        if m.get("role") == "tool":
+            continue
         block = _ENV_BLOCK.search(content)
         if block:
-            found = _first_match(block.group(1))
+            # group(1) 是块名，正文在 group(2)（块名闭集化后的位移）。
+            found = _first_match(block.group(2))
             if found:
                 return found
-        found = _first_match(content[:_SCAN_CHARS])
+        # 🔴 `system` / `developer` 全文扫（2026-09-11，MQ-A67 · Pi）。
+        # MQ-A25 当年评估过这一档并**否掉了**，原话：
+        #   「那两个角色里零非 env 命中（**中毒风险 0**），但 codex 的 cwd
+        #     根本不在那两个角色里——**够不着，不是中毒**。」
+        # ⇒ 它被否是因为**对 codex 没用**，不是因为不安全。
+        # Pi 的载体恰好在 developer：`Current working directory: …` 在消息
+        # **最后一行**（@15397，消息长 15448），不在任何标签块里，头部窗口也够不着。
+        # 按他们自己的读数，这一档现在成立。
+        # ⚠️ 只给这两个角色。user 角色**不放开** —— codex 的中毒源就在 user 侧
+        # （tool 结果转引文档），而 tool 角色已在上面整条跳过。
+        scan = content if m.get("role") in ("system", "developer") \
+            else content[:_SCAN_CHARS]
+        found = _first_match(scan)
         if found:
             return found
     return ""

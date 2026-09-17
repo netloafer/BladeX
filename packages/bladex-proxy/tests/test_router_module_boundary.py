@@ -57,7 +57,8 @@ def test_model_health_only_imported_by_router_module():
 
 
 def test_server_does_not_import_core_routing_directly():
-    text = (_PROXY_SRC / "server.py").read_text(encoding="utf-8")
+    # F0.1 拆包：server.py → server/ 包，逐文件扫
+    text = "\n".join(p.read_text(encoding="utf-8") for p in sorted((_PROXY_SRC / "server").glob("*.py")))
     hits = [m.group(0) for m in _CORE_ROUTING_IMPORT.finditer(text)]
     assert not hits, (
         "server.py（编排面）只许经 route.py 门面用路由能力——"

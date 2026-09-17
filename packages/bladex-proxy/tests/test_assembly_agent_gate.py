@@ -111,3 +111,57 @@ def test_not_listed_agent_still_emits_assembly_done(monkeypatch):
     assert e["agent_id"] == "codex" and e["evidence_degraded"] == 0
     assert e["chars_before"] == e["chars_after"] > 0
     assert e.get("skipped") == "agent_not_enabled"
+
+
+# ── F0.4（2026-09-06）：理解层跟着装配门走 ─────────────────────────────────
+#
+# S1 后 `_understand` 的唯一消费者是 `_prune_if_cold`，而它只在 `assembly_enabled_for(agent_id)`
+# 之后才跑 ⇒ 非 CC 每轮白算一次理解层 + 一条 `query_understood`。判据收成单实现点
+# `_should_understand(inject_on, auxiliary, agent_id)`，同步/异步入口共用。
+
+def _run_do_inject(monkeypatch, agent_id: str, *, use_async: bool) -> int:
+    import asyncio
+
+    from bladex_proxy import inject as inj
+    from bladex_proxy.config import ProxyConfig
+
+    monkeypatch.delenv("BLADEX_ASSEMBLY_AGENTS", raising=False)
+    monkeypatch.delenv("BLADEX_MODULE_INJECT", raising=False)
+    calls: list[str] = []
+
+    def _fake_understand(messages, query, source, session_id):
+        calls.append(query)
+        return query
+
+    monkeypatch.setattr(inj, "_understand", _fake_understand)
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "这个怎么办"}]
+    cfg = ProxyConfig()
+    if use_async:
+        asyncio.run(inj.do_inject_async(msgs, "这个怎么办", cfg, session_id="s", agent_id=agent_id))
+    else:
+        inj.do_inject(msgs, "这个怎么办", cfg, session_id="s", agent_id=agent_id)
+    return len(calls)
+
+
+def test_understand_skipped_for_not_listed_agent(monkeypatch):
+    """非 CC 轮：同步 / 异步两个入口都不调 `_understand`（live 判据：`query_understood` 0 条）。"""
+    assert _run_do_inject(monkeypatch, "codex", use_async=False) == 0
+    assert _run_do_inject(monkeypatch, "hermes:default", use_async=True) == 0
+
+
+def test_understand_still_runs_for_listed_agent(monkeypatch):
+    """CC 轮不变：两个入口各调一次。"""
+    assert _run_do_inject(monkeypatch, "claude-code", use_async=False) == 1
+    assert _run_do_inject(monkeypatch, "claude-code", use_async=True) == 1
+
+
+def test_should_understand_is_the_single_gate():
+    """两处调用点逐字同判据（`_should_understand`），不许各写一份。"""
+    from bladex_proxy import inject as inj
+    src = Path(inj.__file__).read_text(encoding="utf-8")
+    assert src.count("if _should_understand(inject_on, auxiliary, agent_id):") == 2
+    assert src.count("query = _understand(") == 2
+    assert inj._should_understand(True, False, "claude-code") is True
+    assert inj._should_understand(True, False, "codex") is False
+    assert inj._should_understand(True, True, "claude-code") is False
+    assert inj._should_understand(False, False, "claude-code") is False

@@ -199,8 +199,8 @@ def test_global_switches_applied_on_import():
 
 def _server_src() -> str:
     import pathlib
-    return (pathlib.Path(__file__).resolve().parents[1] / "bladex_proxy" / "server.py"
-            ).read_text(encoding="utf-8")
+    from _source_probe import package_source
+    return package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
 
 
 def test_upstream_errors_never_reach_the_client_raw():

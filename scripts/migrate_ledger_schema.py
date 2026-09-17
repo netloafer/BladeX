@@ -3,7 +3,7 @@
 合并三来源 schema 变更为**一次**离线迁移：
   1. ADR-0026：key `user/agent/session/{entry_id}` → `principal/agent/session/{entry_id}`
      （个人模式 principal == user_id，key **字节一致**，语义零变化）；
-     Turn 追加 `api_key_id` / `org_id`（审计字段，历史默认空）。
+     （Turn 曾追加 `api_key_id` / `org_id` 审计字段，2026-09-06 F0.3 H1 销账已删）。
   2. ADR-0025 T1：Turn 追加 `reconstruction`（历史默认 None）。
   3. `request_messages` 语义不变（恒为原始）—— 🔴 U2 红线（I1/I5 schema 层保险）。
 
@@ -12,7 +12,7 @@
   - Memory Hub 里 Turn 存的是**去重后**形态（content 被 content_ref 占位，正文在 __msg__/ 池）。
     走 MemoryHub.put 会重跑 dedup + prefix 检测，改变去重结构、破坏重建等价性。
   - 新增字段全部**追加式带默认**，旧数据经 Pydantic `model_validate` 读出时自动
-    materialize（api_key_id="" / org_id="" / reconstruction=None）—— 无需物理改写正文。
+    materialize（reconstruction=None）—— 无需物理改写正文。
   - 故迁移 = **raw bytes 逐 key 拷贝**（保 dedup 结构 + 全部内部 key），
     个人模式 key 不变；企业模式经 --principal-map 重写 Turn key 首段（legacy→principal）。
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -142,7 +142,6 @@ def verify(src: str, dst: str, principal_map: dict[str, str], sample: int) -> No
             )
             turn = Turn.model_validate(dst_data)  # 新 schema 校验通过
             # 新字段 materialize（个人模式历史数据为默认空/None）
-            assert turn.api_key_id == "" or isinstance(turn.api_key_id, str)
             assert turn.reconstruction is None or bool(turn.reconstruction.layer)
             checked += 1
         print(

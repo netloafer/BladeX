@@ -819,6 +819,8 @@ class MemoryIndex:
         self._last_rebuild_backlog = False
         # MQ-R1：上次 facts 压缩的时刻（节流用，见 _COMPACT_MIN_INTERVAL_S）
         self._last_fact_compact_monotonic = 0.0
+        # MQ-I15 ②：上次版本 vacuum 的时刻（节流理由同上——清理窗口内判据仍超阈值）
+        self._last_version_vacuum_monotonic = 0.0
         if not read_only:
             self._path.mkdir(parents=True, exist_ok=True)
         self._embedder = embedder
@@ -1196,8 +1198,14 @@ class MemoryIndex:
             pass
 
     def _try_catch_up(self) -> None:
-        """secondary 模式下追新 consolidator 写入（秒级节流，不每次调）。"""
-        if self._meta_db is None:
+        """secondary 模式下追新 consolidator 写入（秒级节流，不每次调）。
+
+        🔴 MQ-I16：primary 实例（``read_only=False``，consolidator 主写端）**不得**调
+        ``try_catch_up_with_primary()``——RocksDB 对 primary 直接抛
+        ``Not implemented: Supported only by secondary instance``，此前每小时 ~1,400 条
+        ``index_catch_up_failed`` 全是这条假失败，把 proxy 侧真正的追新失败淹掉。
+        """
+        if self._meta_db is None or not self._read_only:
             return
         now = time.monotonic()
         if now - self._last_catchup_monotonic < self._catchup_throttle_s:
@@ -4099,6 +4107,82 @@ class MemoryIndex:
         except OSError:
             return -1
 
+    # ── MQ-I15 ②（2026-09-18）：LanceDB 版本 vacuum，三表统一 ───────────────────
+
+    #: 受版本 vacuum 管的三张 LanceDB 表（表名 = `<name>.lance` 目录名）
+    _LANCE_TABLES: tuple[str, ...] = ("facts", "files", "matters")
+
+    def lance_version_count(self, table: str) -> int:
+        """`<table>.lance/_versions/` 里的 manifest 数；目录不存在返回 -1。
+
+        与 `fact_vector_fragments` 同一口径：量的是**盘上**的东西——MQ-I15 的读数
+        （files 7,670 版本 / 242MB）就是这么量的，判据挂在被测对象上。
+        """
+        d = self._path / "lancedb" / f"{table}.lance" / "_versions"
+        try:
+            return len(os.listdir(d))
+        except OSError:
+            return -1
+
+    def maybe_vacuum_lance_versions(self) -> list[str]:
+        """任一表版本数 > `BLADEX_INDEX_MAX_VERSIONS` ⇒ 对**该表** optimize + 清旧版本。
+
+        🔴 MQ-I15 的机制侧：此前 `compact_fact_vectors` 只管 facts（且只在碎片超阈值时
+        触发），`compact_matter_vectors` 只按行冗余触发、且 drop+重建**不清版本**，
+        files 表没有任何维护 ⇒ 三表的旧版本永存，磁盘单调上涨（771MB 里 ~600MB 是
+        死版本；一次性清到 305MB 后 4 天 matters 又长回 827 版本）。
+
+        清理窗口 `_COMPACT_CLEANUP_S`（60s）与节流 `_COMPACT_MIN_INTERVAL_S` 同 facts
+        压缩：proxy 只读进程每次 search 前 `checkout_latest`，单次读持有版本以毫秒计。
+        返回本次 vacuum 过的表名（空 = 没到阈值 / 节流中 / 只读实例）。
+        """
+        from datetime import timedelta
+
+        if self._read_only or self._lancedb is None:
+            return []
+        max_versions = int(flag_number("BLADEX_INDEX_MAX_VERSIONS"))
+        if max_versions <= 0:
+            return []
+        over = {t: n for t in self._LANCE_TABLES
+                if (n := self.lance_version_count(t)) > max_versions}
+        if not over:
+            return []
+        elapsed = time.monotonic() - self._last_version_vacuum_monotonic
+        if elapsed < self._COMPACT_MIN_INTERVAL_S:
+            logger.debug("index_version_vacuum_throttled", tables=over,
+                         threshold=max_versions, elapsed_s=round(elapsed, 1))
+            return []
+        self._last_version_vacuum_monotonic = time.monotonic()
+        done: list[str] = []
+        for name, before in over.items():
+            try:
+                tbl = self._lancedb.open_table(name)
+            except Exception as e:  # noqa: BLE001 —— 表还没建（如 files 从未写过）
+                logger.debug("index_version_vacuum_open_failed", table=name, error=str(e))
+                continue
+            fn = getattr(tbl, "optimize", None)
+            if fn is None:
+                continue
+            try:
+                fn(cleanup_older_than=timedelta(seconds=self._COMPACT_CLEANUP_S))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("index_version_vacuum_failed", table=name, error=str(e))
+                continue
+            done.append(name)
+            logger.info("index_lance_versions_vacuumed", table=name,
+                        versions_before=before, versions_after=self.lance_version_count(name),
+                        threshold=max_versions)
+        # 表句柄跟着刷新——vacuum 后旧句柄仍指向被清理的版本
+        if "facts" in done:
+            self._table = None
+            self._lazy_open_facts_table()
+        if "matters" in done:
+            self._matter_table = None
+            self._lazy_open_matter_table()
+        if "files" in done:
+            self._files_tbl = None
+        return done
+
     def maybe_compact_fact_vectors(self) -> bool:
         """需要时压缩 facts 向量表（H6/G6 + MQ-R1）。
 
@@ -6561,6 +6645,11 @@ class MemoryIndex:
                 self.maybe_compact_fact_vectors()
             except Exception as e:  # noqa: BLE001
                 logger.warning("index_fact_compact_error", error=str(e))
+            # MQ-I15 ②：三表版本 vacuum（磁盘轴；碎片轴管不到 files/matters）
+            try:
+                self.maybe_vacuum_lance_versions()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("index_version_vacuum_error", error=str(e))
             # MS-8：库存健康度刷新（与卫生作业同址——都取决于库积累了多久）
             try:
                 self.publish_library_kpis()

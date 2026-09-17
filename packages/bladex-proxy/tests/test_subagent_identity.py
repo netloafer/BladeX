@@ -61,9 +61,8 @@ class TestWiring:
         里一份（原六处副本形态被守卫升级取代），三端点全部经它走
         （调用点数由 test_ledger_require_tools 的接线守卫钉住）。
         取源按路径读文本（MQ-V9）。"""
-        from pathlib import Path
-        src = (Path(__file__).resolve().parents[1]
-               / "bladex_proxy" / "server.py").read_text(encoding="utf-8")
+        from _source_probe import package_source
+        src = package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
         assert src.count("identity.subagent") == 1, (
             "账本域判据必须只有 _apply_agency_surfaces 里那一份；"
             "多出来 = 有人在端点里重新内联（分叉复活），少了 = 子代理能开账本")

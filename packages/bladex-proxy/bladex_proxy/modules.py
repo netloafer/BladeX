@@ -74,6 +74,15 @@ MODULE_SPECS: dict[str, ModuleSpec] = {s.name: s for s in (
                note="bladex_* 工具面（V-P1）；2026-09-02 翻默认开"),
     ModuleSpec("interception", default_enabled=True, depends=("toolface",),
                note="拦截协议：内循环/剥离-拼接（V-P2–P4）；2026-09-02 翻默认开"),
+    # ── V-A3（09-06 批 F0.2）：两个"边缘"模块补进注册表，默认全开 = 现状。
+    #    `mcp`（bladex-mcp 读写面）**没有**加：它与 proxy 进程零耦合点（proxy 代码不 import
+    #    bladex_mcp、也不为它登记任何路由），一个没有调用点的开关就是假开关。
+    ModuleSpec("export", default_enabled=True,
+               note="Obsidian/Postgres 连续导出 worker（consolidator 内）+ CLI connector/export/import；"
+                    "关=consolidator 不构造 worker、三组命令退出 2（sync_control 心跳不受影响）"),
+    ModuleSpec("admin_read", default_enabled=True,
+               note="只读 admin API（/admin/status /admin/matters …）+ /dashboard；"
+                    "关=只读面 404、写端点（/admin/ledgers/user-edit 等）照常"),
 )}
 
 

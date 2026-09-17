@@ -85,7 +85,7 @@ def test_no_match_renders_exactly_the_old_block(monkeypatch):
     new = ag.insert_ledger_block(msgs, "hermes:default", tier="medium",
                                  with_instruction=True)[-1]["content"]
     # 修前形态 = 相关性函数恒空时的渲染
-    import bladex_proxy.agency as agency_mod
+    import bladex_proxy.agency.runtime as agency_mod   # F0.1 拆包：消费方 ledger_injection_message 在 runtime.py
     monkeypatch.setattr(agency_mod, "relevant_ledgers", lambda *a, **k: [])
     old = ag.insert_ledger_block(msgs, "hermes:default", tier="medium",
                                  with_instruction=True)[-1]["content"]
@@ -126,6 +126,53 @@ def test_create_without_match_is_silent(monkeypatch):
     with structlog.testing.capture_logs() as cap:
         _switch(ag, "hermes:default")
     assert not [e for e in cap if e.get("event") == "ledger_created_despite_match"]
+
+
+# ── ③b 🔴 MQ-L69：告警必须说清"这一轮到底给没给模型看候选" ──────────────
+
+
+def test_warning_says_candidates_were_shown(monkeypatch):
+    """用户面轮渲染了候选 ⇒ `candidates_shown=True`，这才是"模型无视了提示"。"""
+    _on(monkeypatch)
+    ag = AgencyRuntime()
+    _seed(ag)
+    msgs = [_SYS, {"role": "user", "content": "小黑，梳理泰山啤酒破产重整最新进展"}]
+    ag.insert_ledger_block(msgs, "hermes:default", tier="medium", with_instruction=True)
+    with structlog.testing.capture_logs() as cap:
+        _switch(ag, "hermes:default")
+    rows = [e for e in cap if e.get("event") == "ledger_created_despite_match"]
+    assert rows and rows[0]["candidates_shown"] is True
+
+
+def test_stale_candidates_do_not_masquerade_as_shown(monkeypatch):
+    """🔴 本条钉的就是 L69 的缺陷本体：`_last_candidates` **跨轮残留**。
+
+    序列照抄 live：① 用户面轮算出候选并渲染 → ② 工具面轮（候选段只进用户面，
+    `with_instruction=False` 同理）→ ③ 模型在第 ② 轮里新建账本。
+
+    修前：告警照打，且与"看着候选仍新建"**在日志上一模一样** ——
+    09-11 CC 那次告警前 60 秒零条 `agency_ledger_candidates`，属于哪一种无法判定。
+    修后：`candidates_shown=False` 把它分出来。
+
+    ⚠️ 告警**本身不取消**（只记不拦，三红线），变的只是它可被复算。
+    """
+    _on(monkeypatch)
+    ag = AgencyRuntime()
+    _seed(ag)
+    msgs = [_SYS, {"role": "user", "content": "小黑，梳理泰山啤酒破产重整最新进展"}]
+    ag.insert_ledger_block(msgs, "hermes:default", tier="medium", with_instruction=True)
+    assert ag._last_candidates, "前置：第一轮必须真算出候选，否则本用例测了个空"
+
+    ag.insert_ledger_block([_SYS, {"role": "user", "content": "继续"}],
+                           "hermes:default", tier="medium", with_instruction=False)
+    assert ag._last_candidates, "候选确实残留下来了——这正是缺陷的成因，不是修它"
+
+    with structlog.testing.capture_logs() as cap:
+        _switch(ag, "hermes:default")
+    rows = [e for e in cap if e.get("event") == "ledger_created_despite_match"]
+    assert rows, "告警不取消：只记不拦"
+    assert rows[0]["candidates_shown"] is False, \
+        "这一轮没给模型看候选，不能算在模型头上"
 
 
 # ── ④ 旧账本 matter 回填 ────────────────────────────────────────────────────
@@ -183,7 +230,9 @@ def test_cli_doctor_bind_flag_calls_endpoint(monkeypatch, capsys, tmp_path, isol
         return 200, {"status": "dry_run" if (body or {}).get("dry_run", True) else "bound",
                      "checked": 3, "unbound": 1,
                      "ledgers": [{"ledger_id": "ldg-old", "matter_id": "m-abc", "title": "旧"}]}
-    monkeypatch.setattr(cli, "_admin_call", _rec)
+    from _source_probe import consumer_module
+    _ldg = consumer_module("bladex_proxy.cli.ledger_cmds", "bladex_proxy.cli")   # F0.1 拆包：消费方在 cli/ledger_cmds.py
+    monkeypatch.setattr(_ldg, "_admin_call", _rec)
     assert cli.main(["ledger", "doctor", "--bind-legacy-matters"]) == 0
     assert calls[-1][:2] == ("POST", "/admin/ledgers/bind-legacy-matters") and calls[-1][2]["dry_run"] is True
     assert "dry run" in capsys.readouterr().out

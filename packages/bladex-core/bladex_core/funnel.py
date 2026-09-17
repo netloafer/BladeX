@@ -57,11 +57,9 @@ FUNNEL_STORED = "bladex_memory_stored_total"
 # ── 读取侧（proxy 进程）──────────────────────────────────────────────────
 #
 # 2026-09-03 S1：`FUNNEL_RECALL` / `FUNNEL_INJECT` 随主动注入检索路径（唯一埋点
-# `InjectionSource.build_planes`）一起删除；读取侧现在只剩 HIT 一段，且它自 M4-2
-# 起就零埋点（H1 基线在案，G6 销账）。0.3.0 重建检索时读取侧三段一起重立。
-
-#: 注入命中回写（相关钟 / ref_count 的信号源）。label: target=fact|matter
-FUNNEL_HIT = "bladex_memory_hit_total"
+# `InjectionSource.build_planes`）一起删除。
+# 2026-09-06 F0.3（H1 销账）：`FUNNEL_HIT`（bladex_memory_hit_total）也删——它自 M4-2 起零埋点，
+# 命中记录本该随 S1 一起清（瘦身 F7 写了没清）。读取侧现在**零段**；0.3.0 重建检索时三段一起重立。
 
 # ── MS-8：库存健康度（gauge，consolidator 空闲轮刷新）─────────────────────
 
@@ -84,7 +82,6 @@ LIB_PROVENANCE = "bladex_memory_library_provenance"
 ALL_FUNNEL_METRICS: tuple[str, ...] = (
     FUNNEL_CANDIDATES, FUNNEL_DISTILL, FUNNEL_DEDUP,
     FUNNEL_ADJUDICATE, FUNNEL_STORED,
-    FUNNEL_HIT,
 )
 
 ALL_LIBRARY_METRICS: tuple[str, ...] = (
@@ -96,7 +93,6 @@ ALL_LIBRARY_METRICS: tuple[str, ...] = (
 FUNNEL_ORDER: tuple[str, ...] = (
     FUNNEL_CANDIDATES, FUNNEL_DISTILL, FUNNEL_DEDUP,
     FUNNEL_ADJUDICATE, FUNNEL_STORED,
-    FUNNEL_HIT,
 )
 
 

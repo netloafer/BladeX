@@ -35,7 +35,7 @@ class TestApiContract:
         import inspect
 
         from bladex_proxy import server
-        src = inspect.getsource(server.create_app)
+        src = inspect.getsource(server.admin_api)   # F0.1 拆包：admin 端点在 server/admin_api.py
         # 两处构造 bucket 字典，各自都得有 drift
         assert src.count('"drift"') >= 2, "有一个来源漏了 drift ⇒ 前端要分支判断"
 
@@ -43,7 +43,7 @@ class TestApiContract:
         import inspect
 
         from bladex_proxy import server
-        src = inspect.getsource(server.create_app)
+        src = inspect.getsource(server.admin_api)   # F0.1 拆包：admin 端点在 server/admin_api.py
         assert '"/admin/agents/reattribute"' in src
 
     def test_claim_hint_no_longer_promises_automatic_rebuild(self):
@@ -52,7 +52,7 @@ class TestApiContract:
         import inspect
 
         from bladex_proxy import server
-        src = inspect.getsource(server.create_app)
+        src = inspect.getsource(server.admin_api)   # F0.1 拆包：admin 端点在 server/admin_api.py
         assert "re-attributed on the next Memory Index rebuild" not in src
         assert "are NOT" in src and "reattribute" in src
 
@@ -223,7 +223,7 @@ class TestSubagentsHiddenFromUI:
         import inspect
 
         from bladex_proxy import server
-        src = inspect.getsource(server.create_app)
+        src = inspect.getsource(server.admin_api)   # F0.1 拆包：admin 端点在 server/admin_api.py
         assert "_subagent_bases" in src
         assert "base not in _subagent_bases" in src
 
@@ -232,7 +232,7 @@ class TestSubagentsHiddenFromUI:
         import inspect
 
         from bladex_proxy import server
-        src = inspect.getsource(server.create_app)
+        src = inspect.getsource(server.admin_api)   # F0.1 拆包：admin 端点在 server/admin_api.py
         i_turns = src.index('entry["turns"] += count')
         i_filter = src.index("base not in _subagent_bases")
         assert i_turns < i_filter, "轮次累加被挡在过滤之后 ⇒ 子代理流量凭空消失"
@@ -270,7 +270,7 @@ class TestAdminErrorShape:
         import inspect
 
         from bladex_proxy import server
-        src = inspect.getsource(server.create_app)
+        src = inspect.getsource(server.admin_api)   # F0.1 拆包：admin 端点在 server/admin_api.py
         assert '"confirm_required"' in src
 
     def test_admin_response_has_no_error_field(self):

@@ -50,13 +50,15 @@ def test_storage_key_uses_principal_when_set() -> None:
 def test_turn_new_fields_default_and_old_data_loads() -> None:
     idn = Identity(user_id="alice")
     t = Turn(identity=idn)
-    assert t.api_key_id == "" and t.org_id == "" and t.reconstruction is None
-    # 模拟旧 Memory Hub 数据（无新字段）经 model_validate 仍可读，新字段走默认
+    assert t.reconstruction is None
+    assert not hasattr(t, "api_key_id") and not hasattr(t, "org_id"), "F0.3 H1 销账：审计字段已删"
+    # 模拟旧 Memory Hub 数据（无新字段）经 model_validate 仍可读，新字段走默认；
+    # 带着已删字段的旧数据（api_key_id=""）经 extra="allow" 照读不炸
     old = t.model_dump(mode="json")
-    for f in ("api_key_id", "org_id", "reconstruction"):
-        old.pop(f, None)
+    old.pop("reconstruction", None)
     t2 = Turn.model_validate(old)
-    assert t2.api_key_id == "" and t2.org_id == "" and t2.reconstruction is None
+    assert t2.reconstruction is None
+    assert Turn.model_validate({**old, "api_key_id": "", "org_id": ""}).reconstruction is None
 
 
 def test_reconstruction_record_roundtrips_and_isolated() -> None:
@@ -125,7 +127,7 @@ def test_migration_personal_mode_byte_identical(tmp_path) -> None:
         assert bytes(sdb.get(k.encode())) == bytes(ddb.get(k.encode()))
         # 新库能按新 schema 读出 + 新字段 materialize
         t = Turn.model_validate(msgpack.unpackb(bytes(ddb.get(k.encode())), raw=False))
-        assert t.api_key_id == "" and t.reconstruction is None
+        assert t.reconstruction is None
         assert t.request_messages == [{"role": "user", "content": "msg 0"}]
     finally:
         sdb.close()

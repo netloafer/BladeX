@@ -468,40 +468,71 @@ class RoutingConfig(BaseModel):
             mm.map = {k: v for k, v in mm.map.items() if k in VALID_MODALITIES}
 
     def _validate_model_refs(self) -> None:
-        """策略里引用的模型名必须在 [[models]] 里存在；缺失 → warning 跳过。"""
+        """策略里引用的模型名必须在 [[models]] 里存在；**缺失即拒绝启动**。
+
+        🔴 **MQ-L58（2026-09-08，批 G 剧本③ 首次实跑当场撞到）：从 warning 改成拒启动。**
+
+        事故经过：`[strategies.agent.map]` 写着 `"codex" = ["anthropic/glm-5.3-flash"]`，
+        而 `[[models]]` 表里没有这个名字。启动时**这里确实打了**
+        `routing_agent_unknown_model agent=codex missing=[...] hint='dropped from agent policy'`
+        —— 结构化、带 agent、带 hint，一条不缺。**然后请求照常成功**：静态策略整个不命中，
+        路由退回 sticky ⇒ `doubao-seed-2.0-lite`（weak）⇒ 账本族被 gate ⇒ Codex 全程
+        拿不到账本块。剧本③ 的前提从头不成立，而现象是"跑起来了、只是效果不对"。
+
+        **这条悬空引用在 10 个以上的历史日志里连着打了好几天，没人看。**
+
+        ⇒ 缺的从来不是告警，是**严重性**。原则 12 的家族形态：**把缺陷写进日志 ≠ 处理了缺陷**；
+        而那句 `hint='dropped from agent policy'` 更是把静默旁路描述成了正常行为
+        （与"警告性 docstring 是缺陷的气味"同一条判据）。
+
+        **为什么是拒启动而不是运行时报错**：这是**自包含**的配置错误，加载期就能判定
+        （刚性原则：误配置失败要响亮，自包含者在加载期失败）。同仓已有先例——
+        `IdentityRegistry.from_toml` 对 dangling ref 就是 `ValueError` 拒启动
+        （见 `config.py::identity_registry` 的注释）。两个配置文件同类问题两种处置，
+        本身就是"同一条判据只用在一半上"。
+
+        **一次列全**：不是撞到第一条就抛——用户要能一遍改完。
+        """
         known = {m.name for m in self.models}
+        dangling: list[str] = []
 
-        # upstream
-        missing_up = [n for n in self.upstream.models if n not in known]
-        if missing_up:
-            logger.warning("routing_upstream_unknown_model", missing=missing_up)
-
-        # agent map
-        for agent_id, names in self.strategies.agent.map.items():
+        def _check(where: str, names) -> None:
             missing = [n for n in names if n not in known]
             if missing:
-                logger.warning(
-                    "routing_agent_unknown_model",
-                    agent=agent_id, missing=missing, hint="dropped from agent policy",
-                )
+                dangling.append(f"  {where}: {', '.join(repr(n) for n in missing)}")
 
-        # filter candidates
+        _check("[upstream] models", self.upstream.models)
+        # 🔴 三层静态策略一个都不许漏（team > principal > agent，ADR-0021）——
+        # 此前只查了 agent 一层，而三层是同一类判据。同一条判据只用在一部分上，
+        # 正是 MQ-L53 / MQ-A52 反复付过学费的形态。
+        for where, mapping in (
+            ("strategies.team.map", self.strategies.team.map),
+            ("strategies.principal.map", self.strategies.principal.map),
+            ("strategies.agent.map", self.strategies.agent.map),
+        ):
+            for key, names in mapping.items():
+                _check(f'[{where}] "{key}"', names)
         for tier, names in self.strategies.filter.candidates.items():
-            missing = [n for n in names if n not in known]
-            if missing:
-                logger.warning(
-                    "routing_filter_unknown_model",
-                    tier=tier, missing=missing, hint="dropped from filter candidates",
-                )
-
-        # multimodal map
+            _check(f'[strategies.filter.candidates] "{tier}"', names)
         for modality, names in self.strategies.multimodal.map.items():
-            missing = [n for n in names if n not in known]
-            if missing:
-                logger.warning(
-                    "routing_multimodal_unknown_model",
-                    modality=modality, missing=missing, hint="dropped from multimodal map",
-                )
+            _check(f'[strategies.multimodal.map] "{modality}"', names)
+
+        if not dangling:
+            return
+        # 🔴 报错文本是**产品面**：英文、自足、不引用仓库内部条款编号
+        # （2026-09-08 Jason 定的标准）。内部立论写在 docstring 里，不写进用户看到的字符串。
+        raise RoutingConfigError(
+            "routing.toml: strategy refers to model names that are not defined "
+            "in any [[models]] block.\n\n  Unresolved references:\n"
+            + "\n".join(dangling)
+            + "\n\n  Defined model names:\n    "
+            + "\n    ".join(sorted(known) or ["(none)"])
+            + "\n\n  Startup is refused instead of skipping the unknown names: skipping "
+            "makes the whole\n  static strategy miss, routing silently falls back to its "
+            "dynamic layer, and requests\n  keep succeeding on a different model than the "
+            "one configured.\n  Fix the name in routing.toml, or add the matching "
+            "[[models]] block."
+        )
 
     # ── 产 core 侧路由输入 ──────────────────────────────────────────────────
 

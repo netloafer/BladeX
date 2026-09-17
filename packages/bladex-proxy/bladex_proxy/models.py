@@ -256,6 +256,40 @@ class ReconstructionRecord(BaseModel):
     index_watermark: str = ""                        # 判定所依据的 Memory Index 时点（重放可定位）
 
 
+class LedgerAnchor(BaseModel):
+    """这一轮**模型实际看到的账本**：哪本、哪个 rev、各段各占多少字符（F-A1 / MQ-A35）。
+
+    ## 为什么必须落 Turn 而不是只打日志
+
+    日志答得了"上一轮注了什么"，答不了"**那一轮**注的是什么"——日志按时间滚、
+    按天切、还会被 grep 不到；而 handoff bench §4.2 与 MQ-A34 ①② 的裁剪判断要的是
+    "对这批 Turn 而言各段占比多少"，那是**按 Turn 聚合**的问题。字段落在 Turn 上，
+    分母（这一轮）与分子（这一段）才在同一条记录里（分母纪律，
+    feedback_instrument_reference_frame）。
+
+    ## 三个可重放的锚
+
+    - `(ledger_id, rev)`：拿这一对回 Hub 事件流重放，能得到逐字相同的那一版账本
+      ——读数因此**可被第三方复算**，不必信 proxy 当时的自述。
+    - `sections`：段级字符（键 = `agency.runtime.LEDGER_BLOCK_BUCKETS`，
+      **按 key 读不按位置读**：账本可增段，新段自动多一个键）。
+      `sum(sections) + about_chars + roster_chars` = 本函数加进正文的全部字符
+      （即 `bladex_added_chars`，在 `_apply_agency_surfaces` 之前无其它注入时逐字相等）。
+    - `added_hash`：注入后正文 − 原正文 的拼接文本 sha256 前 16 位。用途是
+      **对账**：两条记录 hash 相同 ⇒ 加进去的正文逐字相同，不必存全文。
+
+    🔴 `None` = 这一轮没有这个信息（历史 Turn / aux 轮 / 模块关）。缺数报缺数，
+    不造 0 —— 与 `Turn.ledger_face` 三态同一条纪律。
+    """
+
+    ledger_id: str = ""
+    rev: int = -1
+    sections: dict[str, int] = Field(default_factory=dict)
+    about_chars: int = 0
+    roster_chars: int = 0
+    added_hash: str = ""
+
+
 class Turn(BaseModel):
     """完整一轮对话（请求 + 回复 + 工具事件），进 Pipeline→Memory Hub。"""
 
@@ -328,6 +362,11 @@ class Turn(BaseModel):
     # 历史锚定一次性失效**（ADR-0012 §3.6）。缺数就报缺数，不假装成"明确没给"。
     ledger_face: bool | None = None
 
+    # ── F-A1 / MQ-A35（2026-09-07）：这一轮模型看到的是哪本账本的哪个 rev、各段多长 ──
+    # `None` = 没有这个信息（历史 Turn / aux 轮 / 账本模块关）。追加字段，
+    # 旧 Turn 反序列化照读（缺省 None，不触发任何重建行为变化）。
+    ledger_anchor: LedgerAnchor | None = None
+
     # ── Turn schema v3（ADR-0024 T2）：任务单元 ──
     # 热路径确定性识别一次，随 Turn 落 Memory Hub，Memory Index 直接消费——归属从"推断"变成"记录"。
     # 索引口径 = request_messages（即 agent 原始 messages）。
@@ -352,11 +391,8 @@ class Turn(BaseModel):
     # 空列表 = 本轮没有剥离（绝大多数轮次），Pydantic 默认值不占存储。
     splice_records: list[SpliceRecord] = Field(default_factory=list)
 
-    # ── ADR-0026 §2.3 / U2：审计字段（key 路径不含 key，多 key → 一 principal）──
-    # api_key_id: 本轮凭证标识（轮换/撤销/一人多把），User 画像卡聚合「几把 key/活跃度」。
-    # org_id: 组织标识（可空，企业形态）。二者随 Turn 入 Memory Hub，历史 Turn 默认空走 fallback。
-    api_key_id: str = ""
-    org_id: str = ""
+    # （ADR-0026 §2.3 / U2 审计字段 `api_key_id` / `org_id` 已于 2026-09-06 F0.3 删：
+    #   企业形态字段一个月零生产者——H1 销账。旧 Turn 里的空串键经 `extra="allow"` 忽略，schema 无 version bump。）
 
     # ── ADR-0025 §5 / U2：请求重构决策（标签：reconstructed）──
     # request_messages 恒为 agent 原始（标签：original，I1/I5 的 schema 层保险）；

@@ -285,7 +285,8 @@ def test_startup_state_reports_degraded_with_consequences(monkeypatch, capsys):
     """记忆管线的死亡必须出现在 console，且写明后果（不是一句 'degraded'）。"""
     from bladex_proxy import cli
 
-    monkeypatch.setattr(cli, "_probe_ready",
+    from bladex_proxy.cli import lifecycle as _lc   # F0.1 拆包：消费方在 cli/lifecycle.py
+    monkeypatch.setattr(_lc, "_probe_ready",
                         lambda *a, **k: {"ready": False,
                                          "checks": {"redis": False, "hub": True, "index": True}})
     rc = cli._report_startup_state("127.0.0.1", 38080, redis_ok=False,
@@ -302,7 +303,8 @@ def test_startup_state_reports_degraded_with_consequences(monkeypatch, capsys):
 def test_startup_state_reports_ready(monkeypatch, capsys):
     from bladex_proxy import cli
 
-    monkeypatch.setattr(cli, "_probe_ready",
+    from bladex_proxy.cli import lifecycle as _lc   # F0.1 拆包：消费方在 cli/lifecycle.py
+    monkeypatch.setattr(_lc, "_probe_ready",
                         lambda *a, **k: {"ready": True,
                                          "checks": {"redis": True, "hub": True, "index": True}})
     rc = cli._report_startup_state("127.0.0.1", 38080, True, True, timeout_s=1)
@@ -313,7 +315,8 @@ def test_startup_state_reports_ready(monkeypatch, capsys):
 def test_startup_state_reports_failed_when_no_response(monkeypatch, capsys):
     from bladex_proxy import cli
 
-    monkeypatch.setattr(cli, "_probe_ready", lambda *a, **k: None)
+    from bladex_proxy.cli import lifecycle as _lc   # F0.1 拆包：消费方在 cli/lifecycle.py
+    monkeypatch.setattr(_lc, "_probe_ready", lambda *a, **k: None)
     rc = cli._report_startup_state("127.0.0.1", 38080, True, True, timeout_s=0.1)
     assert rc == 1 and "failed" in capsys.readouterr().out
 
@@ -676,7 +679,8 @@ def test_probe_port_in_use_by_our_proxy_is_not_a_warning(monkeypatch):
     from bladex_proxy import cli
 
     _fake_connect(monkeypatch, 0)
-    monkeypatch.setattr(cli, "_probe_ready", lambda *a, **k: {"ready": True, "checks": {}})
+    from bladex_proxy.cli import lifecycle as _lc   # F0.1 拆包：消费方在 cli/lifecycle.py
+    monkeypatch.setattr(_lc, "_probe_ready", lambda *a, **k: {"ready": True, "checks": {}})
     state, detail = cli._probe_port("127.0.0.1", 38080)
     assert state == "ours"
     assert "serving this proxy" in detail
@@ -687,7 +691,8 @@ def test_probe_port_in_use_by_stranger_still_warns(monkeypatch):
     from bladex_proxy import cli
 
     _fake_connect(monkeypatch, 0)
-    monkeypatch.setattr(cli, "_probe_ready", lambda *a, **k: None)
+    from bladex_proxy.cli import lifecycle as _lc   # F0.1 拆包：消费方在 cli/lifecycle.py
+    monkeypatch.setattr(_lc, "_probe_ready", lambda *a, **k: None)
     state, detail = cli._probe_port("127.0.0.1", 38080)
     assert state == "foreign"
     assert "not a BladeX proxy" in detail and "BLADEX_PORT" in detail

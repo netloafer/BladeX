@@ -15,8 +15,11 @@
 - ~~weak 档模型不注（工具调用不可靠）~~ → **2026-08-30 拆除**：砍掉 Memory Index
   主动注入后，工具面成了取记忆的唯一通道，对 weak 关着 = 弱档彻底没有记忆。
   改为**按工具族**：记忆族无条件注入，账本族仍受 `BLADEX_LEDGER_TIERS` 管。
-- dsh 只有 `run_code` 可直呼 ⇒ 首版对 dsh 不注（`NO_TOOLFACE_AGENT_BASES`），
-  其专项注入形态另立卡。
+- ~~dsh 只有 `run_code` 可直呼 ⇒ 首版对 dsh 不注~~ → **2026-09-11 拆除**：
+  前提已被实测推翻。`deepseek-harness 0.1.5-alpha.2` 的 **27 个工具全部直接声明
+  在 `tools` 数组里**（`bash/read/edit/write/glob/grep/subagent/workflow/skill/
+  todo_write/create_goal/…`），**`run_code` 已不存在**。名单清空，`NO_TOOLFACE_AGENT_BASES`
+  机制保留备用。详见 MQ-A66。
 - 工具描述刻意短：注入的每个字都花注意力预算（ADR-0029），描述是给模型的不是文档。
 
 结果侧敏感度：执行结果也是注入（ADR-0032 §3.2-7），`dispatch` 强制传
@@ -36,8 +39,21 @@ logger = structlog.get_logger()
 
 BLADEX_TOOL_PREFIX = "bladex_"
 
-#: 首版不注工具面的 agent base（dsh：工具只能从 run_code 程序内调，直呼形态无效）。
-NO_TOOLFACE_AGENT_BASES: tuple[str, ...] = ("dsh",)
+#: 不注工具面的 agent base —— **按"这个 agent 的工具面机制接不住"排除，不是按偏好**。
+#:
+#: 🔴 **2026-09-11 清空（MQ-A66）**。原值 `("dsh",)`，依据是 2026-08-25 调研的
+#: 「dsh 只有 `run_code` 可直呼」。那份调研观测的是 dsh 的**首个预览版**，
+#: 09-10 凌晨升级后 27 个工具全部直接声明在 `tools` 数组、`run_code` 已不存在
+#: ⇒ 依据消失，而这行常量**没有任何机制会发现它过期**，继续生效了 17 天。
+#: 症状：09-11 08:35 的 dsh→BladeX 跑，逐轮 `reason=agent_excluded`、账本零活动——
+#: 而"零活动"看起来完全像"模型拿到工具不调用"（已知形态，3%），**假阴性极难自证**。
+#:
+#: 🔴 **再往里加 agent 之前，三件必须同时写下**（否则就是复刻这次的缺陷）：
+#:   ① 排除依据（那个 agent 的哪个机制接不住工具面）；
+#:   ② **观测到该依据时的 agent 版本号**（外部 agent 会升级，结论有保质期）；
+#:   ③ 复核判据（怎样算依据失效）。
+#: 机制保留，名单为空 —— 空名单不是"这段代码没用了"，是"当前没有 agent 需要排除"。
+NO_TOOLFACE_AGENT_BASES: tuple[str, ...] = ()
 
 #: 模型档位的闭集（与 `bladex_core.routing._TIER_ORDER` 同源，别在别处另抄一份）。
 LEDGER_TIER_NAMES: tuple[str, ...] = ("weak", "medium", "strong")
@@ -205,7 +221,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                            "next/open entry it resolves — an entry that is in "
                            "Verified does not belong in Next or Open. The Goal may "
                            "only be changed when the user asks for it in this turn "
-                           "— see goal / goal_change_quote.",
+                           "— see goal / goal_change_quote. "
+                           # 🔴 MQ-L49（2026-09-07）：一次调用一条 × 纯内循环每轮重发
+                           # 全上下文 ⇒ 46 次内循环里 4 次撞 6 轮上限，每次 44–78 万
+                           # token，全是 `bladex_ledger_update × 5-6`。批量是那条成本
+                           # 曲线的直接修法，所以这句写在**顶层描述**（模型决定"要不
+                           # 要调"的那一刻读的第一段），与 entries 参数描述互为两处。
+                           "Batch related edits into one call (entries); prefer "
+                           "match over index.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -225,8 +248,61 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                              "description": "entry text (for add)"},
                     "index": {"type": "integer",
                               "description": "entry position (for remove)"},
+                    "match": {"type": "string",
+                              "description": "exact text or unique prefix of "
+                                             "the entry to remove; use instead "
+                                             "of index"},
                     "ref": {"type": "string",
                             "description": "evidence ref (tool result / test id)"},
+                    # 🔴 批量形态（MQ-L49 ①）：**新增参数，不替换单条面**。
+                    # 单条 section+op 一字不动——0.1.0 五个 agent 的 live 记录全是它，
+                    # 换调用面等于把已验证的那条路一起改了（红线：老调用面不动）。
+                    "entries": {
+                        "type": "array",
+                        "description": "several edits in ONE call — e.g. add to "
+                                       "verified AND remove the next entry it "
+                                       "resolves. Use this instead of calling "
+                                       "this tool once per edit: each call is a "
+                                       "full model round. Either all of them "
+                                       "apply or none does. Overrides "
+                                       "section/op/text/index/match.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "section": {
+                                    "type": "string",
+                                    "enum": ["core", "verified", "open", "next"],
+                                },
+                                "op": {"type": "string",
+                                       "enum": ["add", "remove"]},
+                                "text": {"type": "string",
+                                         "description": "entry text (for add)"},
+                                "ref": {"type": "string",
+                                        "description": "evidence ref (for add)"},
+                                "match": {"type": "string",
+                                          "description": "exact text or unique "
+                                                         "prefix of the entry "
+                                                         "to remove — it "
+                                                         "identifies the entry "
+                                                         "by text, so section "
+                                                         "is then optional"},
+                                "index": {"type": "integer",
+                                          "description": "entry position "
+                                                         "(for remove)"},
+                            },
+                            # 🔴 MQ-L53（2026-09-08）：`section` 从 required 里拿掉。
+                            # 读数：四条批量拒绝里 **2 条**是两个互不相干的 agent
+                            # （hermes:default / Pi，不同厂商、不同 prompt）各自写出
+                            # **逐字相同**的 `{op:"remove", match:"…"}` —— 系统性，
+                            # 不是随机失误。**模型是对的、schema 是错的**：`match`
+                            # 的契约是"条目全文或唯一前缀"，既然唯一，再指定段就是
+                            # 冗余，模型推不出这个字段的必要性。刚性原则 10：
+                            # 适配 agent 行为，别要求 agent 改。
+                            # 二选一（add 要 section / remove 要 match|index）
+                            # schema 表达不了，校验与报错在 `_validate_spec`。
+                            "required": ["op"],
+                        },
+                    },
                     "rev": {"type": "integer",
                             "description": "the rev you last read (ledger "
                                            "header); include it — another agent "

@@ -263,6 +263,32 @@ memory — switching later requires a full re-embed:
 model = "intfloat/multilingual-e5-large"   # 2.24 GB, the model BladeX's thresholds are calibrated on
 ```
 
+### No local embedding model? Use an embedding API
+
+The embedding model runs locally by default. If your machine cannot host one (small VPS, no
+spare RAM), point BladeX at a hosted embedding API instead — the setting already exists:
+
+```toml
+# config/routing.toml
+[embedding]
+backend = "api"
+model = "openai/text-embedding-3-small"   # Router format: provider/model
+api_base = ""                              # optional; provider default when empty
+api_key_env = "OPENAI_API_KEY"             # name of the env var holding the key; the key itself never goes in this file
+```
+
+Two things to know before you switch:
+
+- **Privacy**: in `api` mode *every* distilled fact and *every* query is sent to the embedding
+  provider. BladeX logs `EMBED_API_PRIVACY` at startup to make this visible. Keep `local` if your
+  memory must stay on-device.
+- **Changing backend or model changes the vector space.** Do it before you build up memory, or
+  stop both processes and run `python scripts/reembed_index.py` first — otherwise the Memory Index
+  refuses to start on a model mismatch.
+
+The `api` backend does not use the optional embedding module (`BLADEX_MODULE_EMBED`); that module
+only exists to share a *local* model between processes.
+
 ## Where is my data stored?
 
 All data is stored locally on your machine, under `data/`:

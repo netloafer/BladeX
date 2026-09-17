@@ -163,7 +163,7 @@ def test_event_types_single_source():
     # ② 三处装载点都调它（**按源码断言**，不靠运行期覆盖）
     root = pathlib.Path(ledger_events.__file__).parent
     call_sites = {
-        "agency.py": root / "agency.py",
+        "agency/runtime.py": root / "agency" / "runtime.py",   # F0.1 拆包：_load_pool 在 runtime.py
         "flash_daemon.py": root / "flash_daemon.py",
         "storage/memory_index.py": root / "storage" / "memory_index.py",
     }

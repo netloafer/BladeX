@@ -476,15 +476,20 @@ def main() -> int:
 
     # ── 在线协同导出 worker（Beta T13/B3.2；无 config/export.toml = 关闭零回归）──
     export_worker = None
-    try:
-        from bladex_proxy.export_sync import build_worker_from_config
-        export_worker = build_worker_from_config(
-            index, ledger, "config/export.toml",
-            hard_rules=cfg.effective_hard_rules)
-        if export_worker is not None:
-            logger.info("export_sync_worker_ready")
-    except Exception as e:  # noqa: BLE001 —— 导出配置问题不拖垮 consolidator
-        logger.warning("export_sync_worker_init_failed", error=str(e))
+    from bladex_proxy.modules import module_enabled
+    if not module_enabled("export"):
+        # V-A3（F0.2）：模块门只挡 worker 构造；下面的 sync_control 心跳一行不动（B10 仪器消费）。
+        logger.info("export_module_disabled", hint="BLADEX_MODULE_EXPORT=0")
+    else:
+        try:
+            from bladex_proxy.export_sync import build_worker_from_config
+            export_worker = build_worker_from_config(
+                index, ledger, "config/export.toml",
+                hard_rules=cfg.effective_hard_rules)
+            if export_worker is not None:
+                logger.info("export_sync_worker_ready")
+        except Exception as e:  # noqa: BLE001 —— 导出配置问题不拖垮 consolidator
+            logger.warning("export_sync_worker_init_failed", error=str(e))
 
     def _run_manual(cmd: dict) -> None:
         """执行一条手工同步任务（CLI 下发），进度回写控制通道。"""

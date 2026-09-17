@@ -101,9 +101,8 @@ def test_server_passes_tier_and_session():
     import os
 
     import bladex_proxy as _pkg
-    with open(os.path.join(os.path.dirname(_pkg.__file__), "server.py"),
-              encoding="utf-8") as f:
-        src = f.read()
+    from _source_probe import package_source
+    src = package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
     assert src.count("insert_ledger_block(") == 1, "单调用点"
     seg = src[src.index("insert_ledger_block("):]
     seg = seg[:seg.index(")") + 1] if ")" in seg else seg
@@ -180,7 +179,8 @@ class TestSessionBoundGrantsLedgerTools:
         """
         import ast
         from pathlib import Path
-        src = Path(__file__).resolve().parents[1] / "bladex_proxy" / "agency.py"
+        # F0.1 拆包：两个消费点（augment_tools / insert_ledger_block）都在 agency/runtime.py
+        src = Path(__file__).resolve().parents[1] / "bladex_proxy" / "agency" / "runtime.py"
         tree = ast.parse(src.read_text(encoding="utf-8"))
         callers = [
             fn.name for fn in ast.walk(tree)

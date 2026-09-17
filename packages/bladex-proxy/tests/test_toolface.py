@@ -56,12 +56,23 @@ class TestInjectGating:
         assert not [n for n in names if n.startswith("bladex_ledger_")]  # 账本族：auto 排除 weak
 
 
-    def test_dsh_not_injected(self):
-        # D2 结论：dsh 只有 run_code 可直呼，直呼形态工具面无效
-        _, injected = inject_tools([], agent_id="dsh", auxiliary=False)
+    def test_excluded_agent_gets_nothing_and_profile_suffix_follows_base(self, monkeypatch):
+        """名单里的 agent 整个工具面都不注；`base:profile` 随 base 一起排除。
+
+        🔴 **2026-09-11 改写（MQ-A66）**：原来写死 `agent_id="dsh"`，依据是
+        「D2 结论：dsh 只有 run_code 可直呼」。dsh 升级后该依据失效、名单清空，
+        这条测试跟着红了 —— 而它守的东西（**按 base 排除、profile 后缀随 base**）
+        一个字都没变。**把机制测试绑在某个真实 agent 的能力判断上**，
+        就是让机制的守卫随那个 agent 的版本一起过期。
+
+        改用合成 agent + monkeypatch 名单：机制归机制，名单内容归配置。
+        """
+        import bladex_proxy.toolface as _tf
+        monkeypatch.setattr(_tf, "NO_TOOLFACE_AGENT_BASES", ("excluded-probe",))
+        _, injected = inject_tools([], agent_id="excluded-probe", auxiliary=False)
         assert not injected
-        _, injected2 = inject_tools([], agent_id="dsh:profile", auxiliary=False)
-        assert not injected2
+        _, injected2 = inject_tools([], agent_id="excluded-probe:profile", auxiliary=False)
+        assert not injected2, "profile 后缀必须随 base 一起排除"
 
     def test_idempotent(self):
         tools, _ = inject_tools(_AGENT_TOOLS, agent_id="codex", auxiliary=False)

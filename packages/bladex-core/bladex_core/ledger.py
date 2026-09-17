@@ -114,6 +114,15 @@ class LedgerEntry(BaseModel):
     text: str
     source: str = DEFAULT_ENTRY_SOURCE
     ref: str = ""
+    #: 写下这一条的 agent 完整 id（`claude-code` / `hermes:default` / …）。
+    #: 🔴 **缺省空 = 历史条目或用户直编**，不是"未知的某个 agent"——
+    #: 空与非空是两种语义，不许用占位符填平（分母纪律：缺数不当读数）。
+    #:
+    #: 为什么在**条目**这一级而不是账本级：账本级已经有 `last_writer`，它回答
+    #: "谁最后动过这本"；轴 C（跨 agent 交接）要问的是"**这一条**是谁写的"——
+    #: 一本账本上 CC 写的 Verified 与 Hermes 写的 Next 并存正是交接的常态形状，
+    #: 账本级那一个字段把它们压成了同一个答案。
+    writer: str = ""
 
 
 class Ledger(BaseModel):
@@ -368,8 +377,15 @@ _GOAL_NOTE = "<sub>(the Goal section is yours — agents cannot change it)</sub>
 
 
 def _render_entry(e: LedgerEntry) -> str:
+    """`- 正文  <sub>[source · ref · @writer]</sub>`。
+
+    `@` 前缀让写者在词面上与 `source`/`ref` 分得开，也让 `_ENTRY_RE` 不必靠位置
+    猜（老行只有两段，新行三段，中间那段可有可无）。writer 空则整段不渲染——
+    历史条目与用户直编的裸行逐字保持原样（往返等价的前提）。
+    """
     tail = f" · {e.ref}" if e.ref else ""
-    return f"- {e.text}  <sub>[{e.source}{tail}]</sub>"
+    who = f" · @{e.writer}" if e.writer else ""
+    return f"- {e.text}  <sub>[{e.source}{tail}{who}]</sub>"
 
 
 def render_ledger_md(ledger: Ledger) -> str:
@@ -455,7 +471,14 @@ def template_section_order(template_md: str) -> list[str]:
 
 _META_RE = re.compile(
     r"^- (ledger|status|matter|parent ledger|created|updated): `?([^`]*)`?\s*$")
-_ENTRY_RE = re.compile(r"^- (.*?)(?:\s+<sub>\[([a-z]+)(?: · (.*?))?\]</sub>)?\s*$")
+#: 条目行。四个捕获组：正文 / source / ref / writer。
+#: 🔴 **向后兼容是硬要求**：池里存量全是两段形态（`[model · ref]` 或 `[user]`），
+#: ref 段与 writer 段都可缺席，且 writer 段永远带 `@` 前缀——ref 组的 `(?!@)`
+#: 前瞻就是为此：没有它，`[model · @cc]` 会把 `@cc` 读成 ref，writer 恒空
+#: （一个"看起来能解析"的静默错，往返等价还会照样成立）。
+_ENTRY_RE = re.compile(
+    r"^- (.*?)"
+    r"(?:\s+<sub>\[([a-z]+)(?: · (?!@)(.*?))?(?: · @([^\]]*))?\]</sub>)?\s*$")
 _GOAL_META_RE = re.compile(r"^<sub>\((?:source: `([^`]*)`)?(?: · )?(?:origin: `([^`]*)`)?\)</sub>$")
 
 
@@ -513,7 +536,8 @@ def parse_ledger_md(text: str, *, base: Ledger | None = None) -> Ledger:
             if src not in ENTRY_SOURCES:
                 src = DEFAULT_ENTRY_SOURCE
             sections.setdefault(current, []).append(
-                LedgerEntry(text=em.group(1), source=src, ref=em.group(3) or ""))
+                LedgerEntry(text=em.group(1), source=src, ref=em.group(3) or "",
+                            writer=em.group(4) or ""))
 
     ledger_id = meta.get("ledger", "")
     goal_text = "\n".join(goal_lines).strip()

@@ -28,6 +28,7 @@ class TestDefaults:
             "router": True, "inject": True, "sensitivity": True, "assembly": True,
             "embed": False,
             "ledger": True, "flash": True, "toolface": True, "interception": True,
+            "export": True, "admin_read": True,   # V-A3（09-06 F0.2）：两个边缘模块，默认开 = 现状
         }
 
     def test_v5_modules_still_have_rollback_channel(self):

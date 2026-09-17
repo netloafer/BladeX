@@ -128,8 +128,7 @@ class TestAdminEventApply:
         import bladex_proxy as _pkg
         from bladex_proxy.models import AdminEventType
         assert AdminEventType.AUDIENCE_SET.value == "audience_set"
-        with open(os.path.join(os.path.dirname(_pkg.__file__), "server.py"),
-                  encoding="utf-8") as f:
-            src = f.read()
+        from _source_probe import package_source
+        src = package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
         assert 'append_admin_event(AdminEventType.AUDIENCE_SET, ""' in src, \
             "端点必须以空 matter_id 追加（fact_id 在 payload）"

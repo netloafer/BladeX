@@ -110,9 +110,8 @@ class TestWiringOrderAcrossProtocols:
 
     @staticmethod
     def _src() -> str:
-        from pathlib import Path
-        return (Path(__file__).resolve().parents[1]
-                / "bladex_proxy" / "server.py").read_text(encoding="utf-8")
+        from _source_probe import package_source
+        return package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
 
     def test_build_always_after_augment(self):
         src = self._src().split("\n")

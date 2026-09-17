@@ -105,6 +105,17 @@ def detect_required_capabilities(
 # ── ADR-0028 E4：Prompt Cache TTL 感知 ──────────────────────────────────────
 
 
+def _should_understand(inject_on: bool, auxiliary: bool, agent_id: str) -> bool:
+    """理解层要不要跑——同步 / 异步两个入口的**唯一判据**（F0.4，2026-09-06）。
+
+    S1 后 `_understand` 的唯一消费者是冷启相关性裁剪 `_prune_if_cold`，而它只在
+    `assembly_enabled_for(agent_id)`（`BLADEX_ASSEMBLY_AGENTS`，默认只 claude-code）之后才跑
+    ⇒ 非 CC 每轮白算一次理解层 + 一条 `query_understood` 日志。判据加上装配门：
+    非 CC 轮 `query_understood` 0 条，CC 轮不变。
+    """
+    return inject_on and not auxiliary and assembly_enabled_for(agent_id)
+
+
 def _understand(messages: list[dict], query: str, source: Any,  # noqa: ANN401
                 session_id: str) -> str:
     """E6.1 Query 理解层：剥信封 + 短指代扩写 + 截断。
@@ -454,7 +465,7 @@ def do_inject(
     # 记忆写入质量（与 ADR-0024 §4.3 装配解耦同一条理由）。
     inject_on = module_enabled("inject")
     # ADR-0028 E6.1：检索用的 query 先过理解层（原 query 不改，只影响召回）
-    if inject_on and not auxiliary:
+    if _should_understand(inject_on, auxiliary, agent_id):
         query = _understand(messages, query, source, session_id)
 
     if not inject_on:
@@ -703,7 +714,7 @@ async def do_inject_async(
     # 语义见 do_inject 内注释；测试 test_module_inject_gate.py 两个入口都钉）。
     inject_on = module_enabled("inject")
     # ADR-0028 E6.1：检索用的 query 先过理解层（原 query 不改，只影响召回）
-    if inject_on and not auxiliary:
+    if _should_understand(inject_on, auxiliary, agent_id):
         query = _understand(messages, query, source, session_id)
 
     if not inject_on:

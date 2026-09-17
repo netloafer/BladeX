@@ -74,11 +74,15 @@ class FlashDaemon:
                  summarize: Callable[[str], str] | None = None,
                  summarize_project: Callable[[str], str] | None = None,
                  profiles_source: Callable[[], tuple] | None = None,
-                 tree_every_s: float = 300.0) -> None:
+                 tree_every_s: float = 300.0,
+                 tombstoned_source: Callable[[], set[str]] | None = None) -> None:
         self._root = root
         self._principal = principal
         self._scope = scope
         self._source = ledger_source
+        #: MQ-F3：() -> 已墓碑账本 id 集合（Hub 真相）。投影删除**只认这个集合**——
+        #: 「不在池里」不是删除判据（池装载降级为空时会误删活本），「被墓碑」才是。
+        self._tombstoned_source = tombstoned_source
         self._emit = emit_admin_event
         #: path -> 上次物化的内容快照。文件≠快照 ⇒ 用户直编（红线 2 的判据：
         #: 与"文件≠当前渲染"不同——池数据更新也会造成后者，只有偏离**我们上次
@@ -242,6 +246,8 @@ class FlashDaemon:
         - **否则** ⇒ 采纳没进 Hub（proxy 重启丢了内存池、模型也没写过）⇒ 走一次
           新采纳路径（emit + 响应池版回写）；proxy 不在则保留 pending（旧路径的
           交给限流重发通道，有上限；新路径的等下次启动再补）。
+        MQ-L51（09-06）后采纳当轮落 Hub ⇒ `pool.rev ≥ adopted_rev` 在重启后成立，
+        `readopted` 只剩"采纳前 proxy 就没写成 Hub"一种来源；判据不改。
         """
         eid = os.path.splitext(os.path.basename(path))[0]
         disk_rev = rendered_rev(current)
@@ -301,7 +307,9 @@ class FlashDaemon:
         两种形态都进 `_pending_edits`（= 物化跳过写，直到 Hub 收敛）：daemon 的
         `ledger_source` 是 **Hub 投影**，采纳只进 proxy 内存池不写 Hub，Hub 要等模型
         下一次 `ledger_update` 才带上用户版——这期间若放开物化，Hub 旧版会把刚写回
-        的用户版再盖掉。"""
+        的用户版再盖掉。
+        MQ-L51（09-06）后 proxy 采纳当轮落 `LEDGER_USER_EDIT` 事件 ⇒ **Hub 当轮持有采纳版**，
+        pending 在下一次 `ledger_source` 读到 rev ≥ 采纳 rev 时自然清；判据不改。"""
         pool_led: Ledger | None = None
         if isinstance(resp, dict) and resp.get("ledger"):
             try:
@@ -338,9 +346,11 @@ class FlashDaemon:
         """一轮维护：先捕获用户直编，再物化。返回读数（写/编辑捕获/跳过）。"""
         edits = self._capture_user_edits()
         written = 0
+        removed = 0
         if self._dirty or edits or self.pending_wait_s() is not None:
             pool, bindings = self._source()
             written = self._materialize(pool)
+            removed = self._purge_tombstoned(pool)
             written += self._materialize_roster()
             self._dirty = False
         else:
@@ -357,9 +367,9 @@ class FlashDaemon:
             # 树刷新带来 last_seen/简介的新值 ⇒ 名册重渲染（write_if_changed
             # 兜底：没变化就不写；不重跑的话增强列要等下一次账本事件才落盘）。
             written += self._materialize_roster()
-        if written or edits:
+        if written or edits or removed:
             self._save_state()
-        return {"written": written, "user_edits": edits}
+        return {"written": written, "user_edits": edits, "removed": removed}
 
     def pending_wait_s(self) -> float | None:
         """旧路径 pending（`_adopted_sha` 非空且未达重发上限）还差多久到下一次重发窗；
@@ -476,6 +486,76 @@ class FlashDaemon:
             self._snapshots[path] = content
             self._baseline_sha[path] = self._sha(content)
         return written
+
+    def _purge_tombstoned(self, pool: dict[str, Ledger]) -> int:
+        """MQ-F3（2026-09-18）：墓碑之后投影文件**必须不可读**——删除语义要兑现到文件面。
+
+        删法（跑前登记，与 `_reclaim_dirs` 同一套纪律「Flash 贵在精、投影可删、
+        用户内容宁留勿删」）：
+        - 判据 = **Hub 墓碑集合**（`tombstoned_source`），不是「不在池里」——池装载
+          降级为空时后者会把活本全删；墓碑集合读不到（空集）就什么都不删。
+        - 同时在池里 ⇒ 不删（防御：不该发生，发生了要可 grep）。
+        - `.md` 投影 `unlink`；同名 `.local.md`（用户覆盖，永不被机器碰）**不动**。
+        - 待收敛直编（`_pending_edits`）或盘上内容 ≠ 我们上次写下的（未捕获直编）
+          ⇒ **不删**、告警 `flash_ledger_tombstoned_kept_user_edit`——误删用户内容比
+          留一份陈旧文件更糟（红线 2）。
+        - 删掉的清 snapshot/baseline 状态；空掉的分桶目录顺手收。
+        每删一本记 `flash_ledger_projection_removed`。返回删除数。
+        """
+        if self._tombstoned_source is None:
+            return 0
+        try:
+            tombstoned = set(self._tombstoned_source())
+        except Exception as e:  # noqa: BLE001 —— 读不到墓碑 = 不删，不是拒服务
+            logger.debug("flash_tombstone_source_failed", error=str(e))
+            return 0
+        removed = 0
+        for ledger_id in sorted(tombstoned):
+            if ledger_id in pool:
+                logger.warning("flash_ledger_tombstoned_but_in_pool", ledger=ledger_id)
+                continue
+            path = ledger_md_path(self._root, self._principal, ledger_id,
+                                  scope=self._scope)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    on_disk = f.read()
+            except OSError:
+                on_disk = None
+            baseline = self._baseline_sha.get(path)
+            snapshot = self._snapshots.get(path)
+            user_touched = (path in self._pending_edits
+                            or (on_disk is not None and snapshot is not None
+                                and on_disk != snapshot)
+                            or (on_disk is not None and snapshot is None
+                                and baseline is not None
+                                and self._sha(on_disk) != baseline))
+            if user_touched:
+                logger.warning("flash_ledger_tombstoned_kept_user_edit",
+                               ledger=ledger_id, path=path)
+                continue
+            try:
+                os.unlink(path)
+            except OSError as e:
+                logger.warning("flash_ledger_projection_remove_failed",
+                               ledger=ledger_id, path=path, error=str(e))
+                continue
+            removed += 1
+            self._snapshots.pop(path, None)
+            self._baseline_sha.pop(path, None)
+            self._adopted_sha.pop(path, None)
+            self._adopted_rev.pop(path, None)
+            logger.info("flash_ledger_projection_removed", ledger=ledger_id, path=path)
+            # 分桶目录空了就收（两级：`ledgers/<a>/<b>/`）
+            d = os.path.dirname(path)
+            for _ in range(2):
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    break
+                d = os.path.dirname(d)
+        return removed
 
     def _reemit_pending(self, path: str, on_disk: str | None) -> None:
         """挂起直编的限流重发（≥30s 一次，最多 `REEMIT_CAP` 次）。
@@ -920,6 +1000,21 @@ def hub_ledger_source(hub: object) -> LedgerSource:
     return _source
 
 
+def hub_tombstoned_source(hub: object) -> Callable[[], set[str]]:
+    """MQ-F3：Hub 墓碑集合源（与 `load_ledger_events` 用同一份判据
+    `ledger_events.tombstoned_ledger_ids`——两边各抄一份迟早分叉）。"""
+    from bladex_proxy.ledger_events import tombstoned_ledger_ids
+
+    def _source() -> set[str]:
+        try:
+            hub.catch_up()  # type: ignore[attr-defined]
+        except Exception as e:  # noqa: BLE001
+            logger.debug("flash_daemon_catch_up_failed", error=str(e))
+        return tombstoned_ledger_ids(hub)
+
+    return _source
+
+
 def registry_agents_source(cache_file: str, *, eligible=None,
                            summaries_file: str | None = None,
                            declared: tuple[str, ...] | list[str] = ()) -> AgentsSource:
@@ -1313,6 +1408,62 @@ def admin_emit(base_url: str, admin_key: str = "") -> EmitEvent:
     return _emit
 
 
+#: proxy 就绪轮询间隔（秒）。不进 flags 表：它不是"待标定"的旋钮而是探针粒度，
+#: 上限才是可配的那一个（`BLADEX_FLASH_WAIT_PROXY_S`）。
+_PROXY_POLL_INTERVAL_S = 0.5
+
+
+def _proxy_healthy(base_url: str, timeout: float = 2.0) -> bool:
+    """proxy `/health` 探针（2xx = 就绪）。任何网络/解析异常一律读作"还没起"。"""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(base_url.rstrip("/") + "/health")  # noqa: S310 —— 本机探针
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            return 200 <= int(getattr(resp, "status", 0) or 0) < 300
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def wait_for_proxy(base_url: str, *, max_wait_s: float | None = None,
+                   probe: Callable[[str], bool] | None = None,
+                   sleep: Callable[[float], None] = time.sleep,
+                   now: Callable[[], float] = time.monotonic) -> float | None:
+    """等 proxy 就绪；返回等待秒数，超时返回 `None`（**不阻塞，照旧起**）。
+
+    ## MQ-L50：为什么修 daemon 而不是改 cli 的起进程顺序
+
+    `cli/lifecycle.py` 的顺序是 embed → consolidator → flash → proxy，于是
+    `startup_check()` 的停机期直编补采 POST 撞 `Connection refused`
+    （09-06 两次 + 09-07 三次 = 5/5 重启全撞），落回重发通道 30s 后才成。
+    L51 修后它是**唯一**还会制造 pending 的来源。
+
+    修在 daemon 侧：**对 proxy 就绪负责的是要 POST 的那一方**——与 `admin_emit`
+    同一层（它同样只知道 `base_url`，不知道谁先起）。改 cli 顺序则要求
+    "起进程的人记得 flash 依赖 proxy"，那是把一个可自证的依赖藏进调用顺序里。
+
+    超时**不阻塞**：Flash 物化本身不需要 proxy（红线 1，真相在 Hub），
+    只有直编采纳需要，而那一路本就有重发通道兜底。宁可晚采不可不起。
+    """
+    from bladex_core.flags import flag_number  # noqa: PLC0415 —— 入口读配置（红线 4）
+    if max_wait_s is None:
+        max_wait_s = flag_number("BLADEX_FLASH_WAIT_PROXY_S")
+    _probe = probe or _proxy_healthy
+    t0 = now()
+    while True:
+        if _probe(base_url):
+            waited = round(now() - t0, 1)
+            logger.info("flash_daemon_proxy_ready", waited_s=waited, proxy=base_url)
+            return waited
+        if now() - t0 >= max_wait_s:
+            logger.warning("flash_daemon_proxy_not_ready",
+                           waited_s=round(now() - t0, 1), proxy=base_url,
+                           max_wait_s=max_wait_s)
+            return None
+        sleep(_PROXY_POLL_INTERVAL_S)
+
+
 def main() -> int:  # pragma: no cover —— 进程入口；接线件各有单测
     """`bladex-flash` console entry。env/配置读取只在这里（红线 4）。"""
     import argparse
@@ -1403,6 +1554,7 @@ def main() -> int:  # pragma: no cover —— 进程入口；接线件各有单�
 
     daemon = FlashDaemon(root=resolve_flash_path(), principal=args.principal,
                          ledger_source=hub_ledger_source(hub),
+                         tombstoned_source=hub_tombstoned_source(hub),
                          emit_admin_event=admin_emit(base_url, _admin_key()),
                          agents_source=registry_agents_source(
                              str(_reg_cache()), eligible=_eligible,
@@ -1418,6 +1570,10 @@ def main() -> int:  # pragma: no cover —— 进程入口；接线件各有单�
     consumer = WakeConsumer(cfg.redis_url)
     hook_last: dict[str, float] = {}
     try:
+        # 🔴 MQ-L50：先等 proxy 就绪再自检——`startup_check()` 的直编补采要 POST
+        # `/admin/ledgers/user-edit`，而 cli 的起进程顺序把 flash 排在 proxy 之前。
+        # 超时照旧起（见 `wait_for_proxy` docstring）。
+        wait_for_proxy(base_url)
         # 启动自检（骨架重建 + 停机期直编识别）+ 首轮全量物化
         stats = daemon.startup_check()
         if any(stats.values()):

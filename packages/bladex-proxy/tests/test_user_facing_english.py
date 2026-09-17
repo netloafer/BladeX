@@ -21,7 +21,14 @@ from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[3]
 _CJK = re.compile(r"[一-鿿]")
-_CLI = _REPO / "packages" / "bladex-proxy" / "bladex_proxy" / "cli.py"
+_CLI_FILES = sorted((_REPO / "packages" / "bladex-proxy" / "bladex_proxy" / "cli").glob("*.py"))   # F0.1 拆包
+
+
+def _cli_tree() -> ast.Module:
+    """cli/ 包全部文件的顶层节点拼成一棵树（断言对象仍是"整个 CLI"）。"""
+    assert _CLI_FILES, "cli/ 包下没有 .py —— 结构又变了？"
+    body = [n for p in _CLI_FILES for n in ast.parse(p.read_text(encoding="utf-8")).body]
+    return ast.Module(body=body, type_ignores=[])
 _DASHBOARD = _REPO / "packages" / "bladex-proxy" / "bladex_proxy" / "dashboard.html"
 
 
@@ -33,7 +40,7 @@ def _iter_str_constants(node: ast.AST):
 
 def test_cli_print_output_is_english():
     """`print(...)` 是用户唯一看得见的东西。"""
-    tree = ast.parse(_CLI.read_text(encoding="utf-8"))
+    tree = _cli_tree()
     bad: list[str] = []
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
@@ -47,7 +54,7 @@ def test_cli_print_output_is_english():
 
 def test_cli_option_help_is_english():
     """`--help` 是新用户的第一张地图。"""
-    tree = ast.parse(_CLI.read_text(encoding="utf-8"))
+    tree = _cli_tree()
     bad: list[str] = []
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
@@ -64,7 +71,7 @@ def test_cli_option_help_is_english():
 def test_cli_command_docstring_summary_is_english():
     """typer 用命令函数 docstring 的**首行**当 help —— 它是用户可见面的一部分，
     不适用"docstring 保持中文"这条（其余行仍可中文，本测试只看首行）。"""
-    tree = ast.parse(_CLI.read_text(encoding="utf-8"))
+    tree = _cli_tree()
     bad: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef):
@@ -81,7 +88,7 @@ def test_cli_command_docstring_summary_is_english():
 
 
 def test_cli_prompts_and_confirms_are_english():
-    tree = ast.parse(_CLI.read_text(encoding="utf-8"))
+    tree = _cli_tree()
     bad: list[str] = []
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)

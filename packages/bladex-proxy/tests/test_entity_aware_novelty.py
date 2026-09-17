@@ -10,19 +10,52 @@
 
 from __future__ import annotations
 
+import hashlib
 import tempfile
 
 from bladex_proxy.storage.memory_index import (
-    FastEmbedAdapter,
     MemoryIndex,
     _LanceDBNoveltyChecker,
 )
 from bladex_core.consolidation_proxy import ProxyConsolidator
 
 
+class _HashEmbedder:
+    """确定性 one-hot 嵌入（64 维，sha1 分桶），**不碰模型、不碰网络、不碰缓存**。
+
+    🔴 MQ-P12 二次命中（2026-09-17 批 M gate）：本文件原用 `FastEmbedAdapter()`（无 cache_dir
+    ⇒ fastembed 落 `tempfile.gettempdir()/fastembed_cache`）。gate 里 `HF_HUB_OFFLINE=1` 只读缓存，
+    而那个目录是 macOS 会清理的临时目录 ⇒ 同一天 18:27 绿、23:26 五例全红；重灌又撞上
+    huggingface.co 0 字节 / hf-mirror 时通时断。**gate 绿不绿由系统何时清 /T 决定**。
+
+    这五例从来不依赖模型语义：入库向量是 `emb.copy()`，cosine=1.0 是**构造**出来的；
+    唯一要"不同"的那例（低 cosine）只需两个文本落到不同桶。sha1 分桶跨进程确定
+    （`hash()` 随 PYTHONHASHSEED 变，不能用）；本文件用到的三段文本落桶 41 / 3 / 2，无碰撞。
+    与 `test_admission_folding.MockEmbedder` 同形，只是把 `hash` 换成 sha1。
+    """
+
+    dim = 64
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        out: list[list[float]] = []
+        for t in texts:
+            vec = [0.0] * self.dim
+            vec[int(hashlib.sha1(t.encode("utf-8")).hexdigest(), 16) % self.dim] = 1.0
+            out.append(vec)
+        return out
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    @property
+    def model_identity(self) -> str:
+        return "test:sha1-onehot-64"
+
+
 def _make_index(tmpdir: str, **kw) -> MemoryIndex:
-    """临时 Memory Index 实例（可写，用于真实 LanceDB 路径测试）。"""
-    embedder = FastEmbedAdapter()
+    """临时 Memory Index 实例（可写，用于真实 LanceDB 路径测试；向量由 `_HashEmbedder` 构造）。"""
+    embedder = _HashEmbedder()
     defaults = dict(
         novelty_threshold=0.95,
         entity_aware_novelty=True,

@@ -151,6 +151,47 @@ def test_count_tokens_auth_valid_via_x_api_key():
         assert resp.status_code == 200
 
 
+def test_p20_count_tokens_endpoint_unchanged():
+    """🔴 MQ-P20 的护栏：`approx_count_tokens` **多了一个消费者**，
+    而这个端点的返回值必须**逐字不变**。
+
+    修 P20 时 `message_start` 开始调 `approx_count_tokens` —— 它不是零调用点，
+    `POST /v1/messages/count_tokens`（T26 为它而建，claude-code 会调）一直在用它。
+    ⇒ 那次改动**可能静默改掉一个对外协议端点**，而既有测试只钉了单条消息的
+    `== 8` 与几条比较式断言。这条补上"Claude Code 真实形状"的字面值：
+    system + tools + tool_use/tool_result 的完整一轮。
+
+    判别力：任何人动 `approx_count_tokens` 的公式、或动 `parse_anthropic_request`
+    的归一（system 折进、tool_result 转 role=tool），这个字面值都会变。
+    **它变了不等于错了 —— 但必须是有意的，且要同步 P20 那一侧。**
+    """
+    body = {
+        "model": "claude-3",
+        "system": "You are Claude Code, a CLI coding assistant.",
+        "tools": [
+            {"name": "Bash", "description": "Run a shell command",
+             "input_schema": {"type": "object",
+                              "properties": {"command": {"type": "string"}}}},
+        ],
+        "messages": [
+            {"role": "user",
+             "content": [{"type": "text", "text": "修一下 ledger_events 的墓碑过滤"}]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Bash",
+                 "input": {"command": "ls"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1",
+                 "content": "ledger_events.py"}]},
+        ],
+    }
+    app = create_app(_make_config())
+    with TestClient(app) as client:
+        resp = client.post("/v1/messages/count_tokens", json=body,
+                           headers=_ANTHROPIC_HEADERS)
+        assert resp.status_code == 200
+        assert resp.json() == {"input_tokens": 83}, "端点返回值必须逐字不变（键与值都是）"
+
+
 # ── models 按 anthropic-version header 分流 ──
 
 def test_models_list_anthropic_shape_with_header():

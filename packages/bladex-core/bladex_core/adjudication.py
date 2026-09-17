@@ -23,7 +23,7 @@
 ## 三个 verdict 的语义（**没有 DELETE**）
 
     ADD    这是新事实 → 入库
-    UPDATE 它取代了某些旧条 → 旧条 `t_invalid` + `superseded_by`，新条入库，写 SUPERSEDES 边
+    UPDATE 它取代了某些旧条 → 旧条 `t_invalid` + `superseded_by`，新条入库（取代关系落在 Fact 字段上，不写边）
     NOOP   同义重述，库里已有 → 新条丢弃，旧条 `strength + 1`（MS-7）
 
 UPDATE 是**非破坏取代**（Mem0g 同型）：旧条保留、可 as-of 查询、重建等价性不破。

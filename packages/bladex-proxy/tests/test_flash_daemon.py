@@ -36,7 +36,7 @@ class TestMaterialize:
         d = _mk(tmp_path, holder, events)
         assert d.run_once()["written"] == 1
         # 无新事：不脏不写
-        assert d.run_once() == {"written": 0, "user_edits": 0}
+        assert d.run_once() == {"written": 0, "user_edits": 0, "removed": 0}
         # push 后内容没变也不真写（write_if_changed）
         d.push()
         assert d.run_once()["written"] == 0
@@ -124,6 +124,53 @@ class TestUserEdit:
         assert out["user_edits"] == 0
         assert events == []
         assert open(path, encoding="utf-8").read() == "完全不是账本格式的东西"
+
+
+class TestWaitForProxy:
+    """MQ-L50（F-A0）：daemon 启动自检前等 proxy 就绪。
+
+    分母纪律：这两条测的是 `wait_for_proxy` 自己的两个出口（就绪 / 超时），
+    不是 live 读数——live 判据在 HANDOFF（重启后 `flash_daemon_proxy_ready` ≥1、
+    `Connection refused` 0）。
+    """
+
+    def test_returns_once_proxy_ready(self):
+        from bladex_proxy.flash_daemon import wait_for_proxy
+        clock = {"t": 0.0}
+        probes = {"n": 0}
+
+        def _probe(_url: str) -> bool:
+            probes["n"] += 1
+            return probes["n"] >= 3        # 第三次才起来
+
+        def _sleep(s: float) -> None:
+            clock["t"] += s
+
+        waited = wait_for_proxy("http://127.0.0.1:9/", max_wait_s=20.0,
+                                probe=_probe, sleep=_sleep,
+                                now=lambda: clock["t"])
+        assert waited == 1.0               # 两次 0.5s 间隔
+        assert probes["n"] == 3
+
+    def test_timeout_does_not_block(self):
+        """超时返回 None 且**不抛**——Flash 物化不依赖 proxy，照旧起。"""
+        from bladex_proxy.flash_daemon import wait_for_proxy
+        clock = {"t": 0.0}
+        probes = {"n": 0}
+
+        def _probe(_url: str) -> bool:
+            probes["n"] += 1
+            return False                   # 永远不起
+
+        def _sleep(s: float) -> None:
+            clock["t"] += s
+
+        assert wait_for_proxy("http://127.0.0.1:9/", max_wait_s=2.0,
+                              probe=_probe, sleep=_sleep,
+                              now=lambda: clock["t"]) is None
+        # 上限 2s / 间隔 0.5s ⇒ 探 5 次（t=0,.5,1,1.5,2）后放弃，不是死循环
+        assert probes["n"] == 5
+        assert clock["t"] == 2.0
 
 
 class TestRenderStability:

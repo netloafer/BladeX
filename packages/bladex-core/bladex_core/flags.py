@@ -75,6 +75,20 @@ MEMORY_FLAG_DEFAULTS: dict[str, bool] = {
     # （没有锚卡 ⇒ `target_ledger_id` 恒空 ⇒ 恒放行），不需要额外条件。
     "BLADEX_LEDGER_GATE": True,
 
+    # ── 首步指令按用户面/工具面两档注（G16.2 / MQ-A56，父条目 MQ-L48，2026-09-09）──
+    # 关 ⇒ 逐字回到 09-09 之前：每请求都注完整首步指令（含 switch 半句、模板、候选列表）。
+    #
+    # 🔴 **默认开**，理由同上面两条：它修的是正确性不是加特性。工具往返里
+    # `_last_user_text` 取回的是同一条原始用户话、逐字不变，而指令要求
+    # "compare the user's request with the Goal" ⇒ 答案不可能与上轮不同；
+    # 同一句还在说 "call bladex_ledger_switch"，而任务中途切账本永远是错的。
+    # 实测 88 次注入 / 1 个用户轮，其中 87 次前提为假。
+    #
+    # 保留开关是**为了当仪器兼回滚通道**：现有证据只覆盖 claude-code 与 hermes
+    # （记账 0 段首 / 26 段中），**codex 与 Pi 的 face 分布仍是 NO-DATA**。
+    # 万一那两个 agent 形态不同，回滚是改一个 env，不是回滚代码。
+    "BLADEX_LEDGER_FACE_SPLIT": True,
+
     # ── V-P3 硬点 8：拦截播报（ADR-0032 §3.2 #8）──
     # 内循环期间以 reasoning/thinking 流播报 BladeX 在做什么，让用户感知工作进行中。
     # 🔴 **默认关**（2026-08-27），但**理由与初稿写的不同，已更正**：
@@ -255,6 +269,11 @@ MEMORY_NUMERIC_DEFAULTS: dict[str, float] = {
     "BLADEX_FLASH_PROJECT_ACTIVE_DAYS": 30,
     # agent 目录回收（天）：超期无流量删目录；AGENTS.md 名册行保留。
     "BLADEX_FLASH_AGENT_RETIRE_DAYS": 90,
+    # MQ-L50（2026-09-07）：flash daemon 启动自检前等 proxy `/health` 的上限（秒）。
+    # cli 的起进程顺序是 …→ flash → proxy，于是 `startup_check()` 的直编补采 POST
+    # 5/5 重启撞 `Connection refused`，靠重发通道 30s 后才成。0 = 只探一次不等；
+    # 超时**不阻塞**（Flash 物化不依赖 proxy，只有直编采纳依赖，而那一路有重发兜底）。
+    "BLADEX_FLASH_WAIT_PROXY_S": 20,
 
     # 重要性遗忘门槛：importance 低于此值的条目**退出召回**（数据不删、as-of 可查，
     # 保 G6 重建等价性）。0 = 不过滤。
@@ -474,6 +493,13 @@ MEMORY_NUMERIC_DEFAULTS: dict[str, float] = {
     # 定时任务防不住这个形态（碎片是被"写"堆出来的，不是被"时间"堆出来的），
     # 所以触发点挂在写侧的 pass 收尾。
     "BLADEX_INDEX_MAX_FRAGMENTS": 100.0,
+    # MQ-I15 ②（2026-09-18）：LanceDB 每写一次新建一个版本、旧版本永不自清 ——
+    # facts/files/matters 三张表里任一张盘上的版本数（`<tbl>.lance/_versions/`）超过
+    # 本值，就在空闲轮 `optimize(cleanup_older_than=60s)` 一次。碎片轴防的是
+    # **检索延迟**（一行一碎片），本轴防的是**磁盘单调上涨**：09-13 实测 files 表
+    # 7,670 版本 242MB、matters 6,988 版本 135MB，真身合起来不到 5MB；一次性清到
+    # 305MB 后四天 matters 又长回 827 版本。0 = 关闭这条自维护。
+    "BLADEX_INDEX_MAX_VERSIONS": 64.0,
     # MQ-S9 / G12.2-pre（2026-08-20，Jason 拍板）：fp: 指纹会话桶的时间窗切分——
     # 同 (user, agent, fp) 桶相邻请求 gap 超过此秒数 → 新纪元后缀（identity.py
     # `_FpEpochWindow`）。取值依据 = probe_session_gaps 读数：gap ≤5m 占 96.5%、
@@ -558,6 +584,9 @@ FLAG_TIERS: dict[str, str] = {
     # 仪器（自己的注释里写着"保留开关是为了当仪器 / 单变量 A/B"）
     "BLADEX_LEDGER_GATE": "instrument",
     "BLADEX_ENTITY_CANON": "instrument",
+    # G16.2（MQ-A56）：默认值就是生产形态；开关存在只为 A/B 与回滚通道
+    # （codex / Pi 的 face 分布仍 NO-DATA），与上面两条同形。
+    "BLADEX_LEDGER_FACE_SPLIT": "instrument",
 }
 FLAG_TIER_NAMES: tuple[str, ...] = ("mechanism", "calibration", "instrument")
 

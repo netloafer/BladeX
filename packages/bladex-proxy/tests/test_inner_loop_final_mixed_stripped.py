@@ -167,9 +167,8 @@ def test_strip_has_a_single_implementation_point():
     本缺陷的形态是「A 说归 B 做、三个 B 都没做」。收成一个 helper 之后，
     再长出第二处调用就意味着又有人自己实现了一遍——那正是分叉的起点。
     """
-    import pathlib
-    src = (pathlib.Path(__file__).resolve().parents[1] / "bladex_proxy" / "agency.py"
-           ).read_text(encoding="utf-8")
+    from _source_probe import package_source
+    src = package_source("agency")   # F0.1 拆包：def 在 runtime.py，两条流式调用点在 streams.py
     assert src.count("strip_bladex_calls(") == 1, \
         "剥离只许在 `_strip_execute_splice` 里发生一次；多出来的一处就是分叉的起点"
     assert src.count("_strip_execute_splice(") == 5, (
@@ -183,7 +182,6 @@ def test_strip_has_a_single_implementation_point():
 ])
 def test_all_three_paths_strip_the_loop_final(path_marker):
     """接线守卫：三条路径都必须在转发前过一次剥离。少一条就是本缺陷复发。"""
-    import pathlib
-    src = (pathlib.Path(__file__).resolve().parents[1] / "bladex_proxy" / "agency.py"
-           ).read_text(encoding="utf-8")
+    from _source_probe import package_source
+    src = package_source("agency")   # F0.1 拆包
     assert path_marker in src, f"这条路径没接剥离：{path_marker}"

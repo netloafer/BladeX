@@ -145,11 +145,22 @@ class TestOrthogonalGates:
                                     model_tier="strong")
         assert not injected
 
-    def test_dsh_still_excluded_under_all(self, monkeypatch):
-        """🔴 dsh 是按 **agent** 排除的（工具只能从 run_code 程序内调）——
-        配成 all 也拿不到。写死这一条，免得后面预期错位。"""
+    def test_agent_exclusion_beats_tiers_all(self, monkeypatch):
+        """🔴 **agent 排除与档位策略正交，且 agent 排除压过 `TIERS=all`**。
+
+        配成 all 也拿不到 —— 排除是"这个 agent 的机制接不住工具面"，
+        不是"这个档位不配"，两者不在一个维度上。
+
+        🔴 **2026-09-11 改写（MQ-A66）**：原名 `test_dsh_still_excluded_under_all`，
+        写死 `agent_id="dsh"`，理由是「工具只能从 run_code 程序内调」。
+        dsh 升级后 27 个工具全部直接声明、`run_code` 已不存在 ⇒ 依据失效、
+        名单清空，这条跟着红。守的正交性一个字没变，**过期的是绑定的那个 agent**。
+        改用合成 agent + monkeypatch 名单。
+        """
+        import bladex_proxy.toolface as _tf
         monkeypatch.setenv("BLADEX_LEDGER_TIERS", "all")
-        _t, injected = inject_tools(None, agent_id="dsh", auxiliary=False,
+        monkeypatch.setattr(_tf, "NO_TOOLFACE_AGENT_BASES", ("excluded-probe",))
+        _t, injected = inject_tools(None, agent_id="excluded-probe", auxiliary=False,
                                     model_tier="strong")
         assert not injected  # 按 agent 排除 = 整个工具面不注，两族都没有
 

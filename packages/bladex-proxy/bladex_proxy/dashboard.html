@@ -746,8 +746,6 @@ async function matterDetail(id){
        ${topicKeyChips(mt.topic_keys,12)}`:""}
      ${(mt.aliases||[]).length?`<div class="sect">Aliases</div>
        ${mt.aliases.map(a=>`<span class="tag">${esc(a)}</span>`).join(" ")}`:""}
-     ${(mt.open_issues||[]).length?`<div class="sect">Open issues</div>
-       ${mt.open_issues.map(x=>`<div class="kv"><span>${esc(x)}</span></div>`).join("")}`:""}
      ${(mt.participants||[]).length?`<div class="sect">Participants</div>
        ${mt.participants.map(p=>`<span class="tag acc">${esc(p.agent_id||p)}</span>`).join(" ")}`:""}
      <div class="sect">Member facts (${(d.facts||[]).length})</div>

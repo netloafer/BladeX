@@ -26,8 +26,52 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
 import textwrap
 from typing import Any
+
+_PROXY_PKG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bladex_proxy")
+
+
+def consumer_module(preferred: str, fallback: str):
+    """monkeypatch 目标：拆包后的消费方子模块；子模块尚不存在时退回门面模块。
+
+    只为 F0.1 三个 commit（agency → server → cli）逐个落地时**中间态仍 gate 绿**而存在：
+    同一个测试文件既被 agency 拆包改了 patch 目标、又要在 cli 拆包时改第二处时，
+    早一个 commit 里 `bladex_proxy.cli.ledger_cmds` 还不存在。三个 commit 全落地后
+    fallback 永不触发，调用点可随时改回直接 import。
+    """
+    import importlib
+    try:
+        return importlib.import_module(preferred)
+    except ModuleNotFoundError:
+        return importlib.import_module(fallback)
+
+
+def package_source(name: str) -> str:
+    """把 `bladex_proxy/<name>/` 下全部 `*.py` 按文件名排序后**拼成一段文本**（含 `__init__.py`）。
+
+    2026-09-06 F0.1：`agency.py` / `server.py` / `cli.py` 三个巨石零行为拆成包。此前 ~30 处
+    "按路径读源码做计数/包含断言"的守卫读的是单文件；拆包后**同一条断言的对象是整个包**
+    （例：`_strip_execute_splice(` 期望 5 处 = def 一处 + 四个调用点，现在分布在
+    `runtime.py` 与 `streams.py`）。故按包拼接，断言原样不动。
+    找不到目录 **报错**而不是返回空串——`"x" not in ""` 恒真是静默假绿。
+    """
+    d = os.path.join(_PROXY_PKG, name)
+    single = os.path.join(_PROXY_PKG, name + ".py")
+    if not os.path.isdir(d):
+        if os.path.isfile(single):
+            # 拆包前的单文件形态（F0.1 三个 commit 逐个落地时，中间态仍要 gate 绿）
+            with open(single, encoding="utf-8") as f:
+                return f.read()
+        raise AssertionError(f"{d} 不是包目录、{single} 也不存在 —— 结构又变了？先修这里，别让守卫假绿")
+    parts = []
+    for fn in sorted(os.listdir(d)):
+        if fn.endswith(".py"):
+            with open(os.path.join(d, fn), encoding="utf-8") as f:
+                parts.append(f"# ==== {name}/{fn} ====\n" + f.read())
+    assert parts, f"{d} 下没有 .py"
+    return "\n".join(parts)
 
 
 def source_of(target: Any, name: str = "") -> str:

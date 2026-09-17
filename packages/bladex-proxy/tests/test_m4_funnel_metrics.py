@@ -27,14 +27,15 @@ from bladex_proxy.metrics import Metrics
 
 
 def test_funnel_covers_the_whole_chain():
-    """漏斗六段齐全，且顺序就是判读顺序（哪段为 0 而上一段非 0 = 那段断了）。
+    """漏斗五段齐全，且顺序就是判读顺序（哪段为 0 而上一段非 0 = 那段断了）。
 
-    2026-09-03 S1：读取侧 RECALL / INJECT 随主动注入检索路径删除（八段 → 六段）。"""
+    2026-09-03 S1：读取侧 RECALL / INJECT 随主动注入检索路径删除（八段 → 六段）。
+    2026-09-06 F0.3（H1 销账）：读取侧 HIT 零埋点亦删（六段 → 五段，只剩写入侧）。"""
     assert F.FUNNEL_ORDER == F.ALL_FUNNEL_METRICS
-    assert len(F.FUNNEL_ORDER) == 6
-    # 写入侧五段 + 读取侧一段（HIT）
+    assert len(F.FUNNEL_ORDER) == 5
+    # 写入侧五段；读取侧零段（0.3.0 重建检索时重立）
     assert F.FUNNEL_CANDIDATES in F.FUNNEL_ORDER[:5]
-    assert F.FUNNEL_HIT in F.FUNNEL_ORDER[5:]
+    assert not hasattr(F, "FUNNEL_HIT"), "零埋点指标不该回来（H1 销账）"
 
 
 def test_metric_names_are_defined_in_core_only():

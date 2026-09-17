@@ -975,8 +975,10 @@ class TestLedgerBoundaryFixes20260826:
         """🔴 MQ-L7 不变式在解耦后仍成立：**有令 ⇒ 必有器**。
 
         拆门后关系从"等价"变"蕴含"。仍有一条路径会"tier 在集合内但工具面没注"
-        —— dsh 系 agent（只有 run_code 可直呼）。调用方传 False，
+        —— `NO_TOOLFACE_AGENT_BASES` 里的 agent。调用方传 False，
         生产点不得把它变回 True。
+        （该名单 2026-09-11 已清空，原唯一成员 dsh 的排除依据过期，见 MQ-A66；
+        名单机制保留，所以这条不变式照样要守 —— 本测试不依赖名单里有谁。）
         """
         from bladex_proxy.agency import AgencyRuntime
         _on(monkeypatch, "toolface", "ledger")
@@ -1140,10 +1142,22 @@ class TestObservabilityGaps20260826:
                              tier="medium")
             # 🔴 2026-08-30 换例：原来第二次用的是 `tier="weak"`（期望
             # reason=weak_tier）。拆掉 weak 门后 weak 会被正常注入，那一档
-            # 已从 reason 枚举里删除——**换成 dsh 来覆盖"没注"的另一个真因**，
+            # 已从 reason 枚举里删除——换成"被排除的 agent"覆盖"没注"的另一个真因，
             # 而不是把断言改成期望它注了：这条测试守的是"三种决策都留痕、
-            # 且 reason 分得清"，不是"weak 会怎样"。
-            ag.augment_tools(None, agent_id="dsh", auxiliary=False,
+            # 且 reason 分得清"，不是某个具体 agent 会怎样。
+            #
+            # 🔴 2026-09-11 再换：原来这里写死 `agent_id="dsh"`——**把一条
+            # 机制测试绑在了一个真实 agent 的能力判断上**。dsh 升级后排除依据
+            # 失效、名单清空（MQ-A66），这条测试就跟着红了，而它守的东西
+            # 一个字都没变。改用**合成 agent + monkeypatch 名单**：机制归机制，
+            # 名单内容归配置。两个消费点都要打（`toolface` 是真正的门，
+            # `agency.runtime` 只用它算 reason 标签）——打一个会得到
+            # `injected=False` 但 `reason=already_present` 的错配。
+            import bladex_proxy.agency.runtime as _rt
+            import bladex_proxy.toolface as _tf
+            monkeypatch.setattr(_tf, "NO_TOOLFACE_AGENT_BASES", ("excluded-probe",))
+            monkeypatch.setattr(_rt, "NO_TOOLFACE_AGENT_BASES", ("excluded-probe",))
+            ag.augment_tools(None, agent_id="excluded-probe", auxiliary=False,
                              tier="medium")
             ag.augment_tools(None, agent_id="hermes:default", auxiliary=True,
                              tier="strong")
@@ -1151,6 +1165,42 @@ class TestObservabilityGaps20260826:
         assert len(rows) == 3, "有一次决策没留痕"
         assert [r["injected"] for r in rows] == [True, False, False]
         assert [r["reason"] for r in rows] == ["", "agent_excluded", "aux"]
+
+    def test_no_toolface_list_is_empty_and_dsh_gets_the_toolface(self, monkeypatch):
+        """🔴 MQ-A66：`NO_TOOLFACE_AGENT_BASES` 必须为空，dsh 必须拿得到工具面。
+
+        ## 这条守的不是"dsh 特殊"，是一类缺陷
+
+        原值 `("dsh",)` 的依据是 2026-08-25 调研的「dsh 只有 `run_code` 可直呼」。
+        那份调研观测的是 dsh **首个预览版**；09-10 凌晨升级后 27 个工具全部直接
+        声明在 `tools` 数组、`run_code` 已不存在 ⇒ **依据消失，而这行常量没有任何
+        机制会发现它过期**，继续生效 17 天。
+
+        代价是一个**极难自证的假阴性**：09-11 的 dsh→BladeX 跑逐轮
+        `reason=agent_excluded`、账本零活动，而"零活动"看起来完全像
+        "模型拿到工具不调用"（已知形态，3%）。若不是 Jason 直接问
+        "是不是还在阴性对照表里"，这一跑会被解释成模型行为。
+
+        ## 为什么断言"空"而不是"不含 dsh"
+
+        断言"不含 dsh"只挡住这一个复发点。真正的不变式是：
+        **任何 agent 进这个名单都必须是当下实测的、带版本号的结论。**
+        断言为空 ⇒ 再加人必须改这条测试 ⇒ 改的人被迫写下依据、版本号、复核判据
+        （三件在常量 docstring 里已列明）。这是把"过期无人发现"变成"过期必须过一道人手"。
+        """
+        from bladex_proxy.agency import AgencyRuntime
+        from bladex_proxy.toolface import NO_TOOLFACE_AGENT_BASES
+        assert NO_TOOLFACE_AGENT_BASES == (), (
+            "往这个名单里加 agent，必须同时写下：排除依据 / 观测时的 agent 版本号 / "
+            "复核判据。三件缺一件就是复刻 MQ-A66。")
+
+        _on(monkeypatch, "toolface", "ledger")
+        tools, injected = AgencyRuntime().augment_tools(
+            None, agent_id="dsh", auxiliary=False, tier="medium")
+        assert injected is True, "dsh 必须拿得到工具面（MQ-A66 拆除排除）"
+        names = {t.get("function", {}).get("name") or t.get("name") for t in (tools or [])}
+        assert any(str(n).startswith("bladex_") for n in names), \
+            "注了但一个 bladex_* 都没有 ⇒ 门开了、货没发"
 
     def test_ledger_block_logs_its_position(self, monkeypatch):
         """`after=0` 就是 MQ-L10 的判据本身——线上必须能直接读到，

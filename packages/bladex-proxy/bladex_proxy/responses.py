@@ -26,7 +26,10 @@ from typing import Any
 
 import structlog
 
-from bladex_proxy.capture import CaptureResult
+from bladex_proxy.capture import (
+    CaptureResult, cache_read_tokens, extract_usage, record_first_chunk, warn_bare_reasoning,
+    warn_inline_think,
+)
 from bladex_proxy.models import ToolEvent
 
 logger = structlog.get_logger()
@@ -76,7 +79,15 @@ def _normalize_input_item(item: dict[str, Any]) -> list[dict[str, Any]]:
     if itype == "function_call":
         return [{
             "role": "assistant",
-            "content": None,
+            # 🔴 MQ-P17（2026-09-08，Codex 首次真实流量当场撞到）：**空串不是 None**。
+            # OpenAI 官方接受 assistant + tool_calls 且 `content: null`；**Ark 的 OpenAI
+            # 兼容端点不接受**，报 `missing messages.content parameter`。live 读数：
+            # `/v1/responses` 63 次里 200 只有 10 次，且那 10 次**全在 Codex 第一次工具
+            # 调用之前** —— 第一个带 `function_call` 的回合起 53 次全 502，两边同一个上游
+            # 模型 ⇒ 差异只能来自消息内容。
+            # 不改成"删掉 content 键"：那是另一种形态的缺数，且 OpenAI 侧对
+            # assistant+tool_calls 要求键存在。
+            "content": "",
             "tool_calls": [{
                 "id": item.get("call_id", "") or f"call_{uuid.uuid4().hex[:12]}",
                 "type": "function",
@@ -153,7 +164,7 @@ def _normalize_user_message_content(content: list) -> list[dict[str, Any]]:
 def _normalize_assistant_message_content(content: list) -> dict[str, Any]:
     """assistant message 的 content blocks -> OpenAI assistant 消息。
 
-    - output_text block -> content（拼接，空则 None）
+    - output_text block -> content（拼接，空则**空串**——MQ-P17，不是 None）
     - function_call block（塞在 assistant content 里）-> tool_calls 字段
     """
     text_parts: list[str] = []
@@ -174,8 +185,8 @@ def _normalize_assistant_message_content(content: list) -> dict[str, Any]:
                 },
             })
     msg: dict[str, Any] = {"role": "assistant"}
-    joined = "\n".join(text_parts)
-    msg["content"] = joined if joined else None
+    # MQ-P17 同族第二处：正文为空时同样给 **空串**而不是 None（理由见上）。
+    msg["content"] = "\n".join(text_parts)
     if tool_calls:
         msg["tool_calls"] = tool_calls
     return msg
@@ -258,11 +269,16 @@ def parse_responses_request(body: dict[str, Any]) -> tuple[list[dict[str, Any]],
     if tc is not None:
         extra["tool_choice"] = tc
 
-    # reasoning.effort -> 暂放 extra_body（字段名待 T1 抓包确认 ARK/glm 实际接受方式）
-    # ADR-0023 §2.2：reasoning 先尽力而为，不阻塞 MVP。
+    # reasoning.effort -> 顶层 `reasoning_effort`（ADR-0023 §2.2：尽力而为，不阻塞 MVP）。
+    # 🔴 MQ-P18 读数（2026-09-09，`scripts/probe_reasoning_forwarding.py` + Hub 155 份 codex 请求体）：
+    #   入站 `reasoning.effort` 155/155 都在 ⇒ 这个条件**每轮命中**、下面这行每轮都设上；
+    #   出站 `router_sdk.py` 的 `litellm.drop_params=True` 对 ARK 这一族（supported_params 无它）
+    #   **每轮都把它丢掉**，`extra_body` 为 `{}`（没藏在里面）⇒ **看着在转发、对 ARK 其实不出站**。
+    # 处置（台账「出站那一格已取到」三条）：不动条件、不删这段——它对支持该参数的上游（o 系 / gpt-5 系）
+    # 仍有效；不走 extra_body 绕过 drop_params（开它的原因就是 ARK 对此参数回 502）；
+    # P18 的修法在响应侧（`reasoning_content` → thinking 块已落，MQ-P26；裸散文泄漏由 MQ-P29 守卫计数）。
     reasoning = body.get("reasoning")
     if isinstance(reasoning, dict) and reasoning.get("effort"):
-        # 多数 OpenAI 兼容上游接受 reasoning_effort 顶层参数；ARK 字段名待 T1 确认
         extra["reasoning_effort"] = reasoning["effort"]
 
     return messages, extra
@@ -413,6 +429,10 @@ async def responses_stream_generator(
     status = "completed"
     input_tokens = 0
     output_tokens = 0
+    # 🔴 MQ-P31：None ≠ 0（同 `capture.cache_read_tokens` 的口径）。
+    # 上游不报是 None，报了且没命中是 0；混成 0 会让"这条路径测不了缓存"
+    # 伪装成"缓存一直没命中"。
+    cache_read: int | None = None
     created_at = int(time.time())
 
     # response.created
@@ -431,6 +451,9 @@ async def responses_stream_generator(
     try:
         async for chunk in stream:
             result.chunk_count += 1
+            # MQ-P19：首字延迟。**这条路径此前没有这一行**，而 codex 只走它。
+            # 共用 `capture.record_first_chunk`（三条入站路径唯一实现点）。
+            record_first_chunk(result, t0)
             try:
                 choice = chunk.choices[0]
                 delta = choice.delta
@@ -555,13 +578,33 @@ async def responses_stream_generator(
 
                 # finish_reason
                 if choice.finish_reason:
+                    # 🔴 MQ-P22：落上游原值（不是映射后的 Responses status）。
+                    # 此前无生产者 ⇒ codex 的流式轮 `finish_reason` 恒空
+                    # ⇒ MQ-A34 截断告警对 codex 结构性失明（实测 393 轮里 7% 有值，
+                    # 那 7% 全是非流式轮）。
+                    result.finish_reason = str(choice.finish_reason)
                     status = _STATUS_MAP.get(choice.finish_reason, "completed")
 
                 # usage（某些 chunk 带 usage）
+                # 🔴 MQ-P21：`getattr(obj, k, 默认)` 在**字段存在且为 None** 时返回 None
+                # （上游报一个空 usage 是常见形态）⇒ 这两个变量会变成 None ⇒
+                # 收尾处 `input_tokens + output_tokens` **TypeError**，而那一行在
+                # try 之外、在 `response.completed` 之前 ⇒ codex 收不到终止事件。
+                # 与 anthropic.py 同一处修法（同一件事，两条路径都要做对）。
                 chunk_usage = getattr(chunk, "usage", None)
                 if chunk_usage:
-                    input_tokens = getattr(chunk_usage, "prompt_tokens", input_tokens)
-                    output_tokens = getattr(chunk_usage, "completion_tokens", output_tokens)
+                    _pt = getattr(chunk_usage, "prompt_tokens", None)
+                    if isinstance(_pt, int):
+                        input_tokens = _pt
+                    _ct = getattr(chunk_usage, "completion_tokens", None)
+                    if isinstance(_ct, int):
+                        output_tokens = _ct
+                    # MQ-P22：同上，此前这条路径不灌 `result.usage`。
+                    result.usage = extract_usage(chunk_usage)
+                    # MQ-P31：与 anthropic 路径同名同义、同一实现点。
+                    _cr = cache_read_tokens(chunk_usage)
+                    if _cr is not None:
+                        cache_read = _cr
 
             except (AttributeError, IndexError, KeyError) as e:
                 logger.debug("responses_chunk_skip", error=str(e))
@@ -633,9 +676,40 @@ async def responses_stream_generator(
         text_len=len(result.full_text),
         tool_events=len(result.tool_events),
         elapsed_ms=round(result.ms, 2),
+        # MQ-P19：与另两条路径同名同义（见 `capture.record_first_chunk`）。
+        ms_first_chunk=round(result.ms_first_chunk, 2),
+        # MQ-P18：结构化思考流走没走上来。`reasoning_len=0` 且下一行告警命中
+        # ⇒ 上游把 reasoning **内联进了正文**，修法在响应侧剥离而不在请求侧转发。
+        reasoning_len=len(result.reasoning_text),
+        # 🔴 MQ-P31（2026-09-10 立，codex 双侧对照驱动）：这三格此前**一个都没有**，
+        # 而 `capture_done`（chat）记 `usage`、`anthropic_capture_done` 记
+        # `input_tokens_reported` / `cache_read_tokens` ⇒ **同一个读数三条路径三种拼法，
+        # 其中一条压根没有**。代价：codex 经 BladeX 的 178 轮里 token 用量、上下文峰值、
+        # 缓存命中率**全部不可测**，于是"BladeX 是否把上下文推过了 codex 的压缩阈值"
+        # ——当前最大的开放问题——无法判定（裸跑侧 tap 有 usage，两侧比不了）。
+        # ⚠️ 本批**只加不改**：另两条路径的字段名一个不动。改名会把正在跑的 bench
+        #    序列断掉（尺子与被测对象不许分两次动）；三路字段统一归后续卡。
+        # 🔴 `usage` 与这两格并列是故意的：`result.usage` 为空而 `input_tokens_reported`
+        #    非零 ⇒ 是 `extract_usage` 的载体判断漏了，不是上游没报。两者分辨得开。
+        usage=result.usage,
+        input_tokens_reported=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read,
         done=result.done,
         error=result.error,
     )
+    # G17.0 守卫（MQ-P18）：codex 侧 `apply_patch` 持续 abort 的直接症状就是
+    # `</think>` 漏进正文，而生产代码此前对它零处置、零告警。
+    # 🔴 **两处都查**：agentic coding 里纯工具回复很常见（`full_text` 为空），
+    # 而真正会让 `apply_patch` abort 的是**工具参数**被污染 —— 只查正文会漏掉
+    # 恰好是最贵的那一种（"同一件事只在一个地方做对了"的又一形态）。
+    warn_inline_think(result.full_text, "responses")
+    warn_inline_think(
+        "".join("".join(acc["arguments_parts"]) for acc in tool_calls_acc.values()),
+        "responses:tool_args",
+    )
+    # MQ-P29 第二步（批 L）：认行为不认标记 —— 正文长 ∧ 同轮 reasoning 为 0。
+    warn_bare_reasoning(result.full_text, len(result.reasoning_text), "responses")
 
     # 构建最终 output（用于 response.completed）
     final_output: list[dict[str, Any]] = []

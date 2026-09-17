@@ -295,10 +295,16 @@ async def resolve_route(
                 principal_id=principal_id, team_ids=team_ids,
                 facts=facts, hard_rules=hard_rules,
             )
+            # 🔴 `agent`/`session_id` 进日志（2026-09-16，MQ-V32）：两者**本来就在参数里**，
+            # 只是从未落进这一行。后果是 `route_decision` **无法归属**——多 agent 并发时
+            # 只能按时间窗切片，而时间窗不区分"谁的车"：T2 格 r-l-1 就因为窗内混进了
+            # 另一个 agent 的流量被判作废（那 21 轮的 system prompt、session 都不同）。
+            # 与刚性原则 13 层 3 同族：**读数存在 ≠ 读数可归属**。
             logger.info(
                 "route_decision",
                 source=decision.source.value, tier=decision.tier,
                 model=decision.model, reason=decision.reason,
+                agent=agent_id or "", session_id=session_id or "",
             )
             primary = ModelRoute(
                 model=decision.model,
@@ -325,6 +331,7 @@ async def resolve_route(
         "route_decision",
         source="fallback_upstream", model=config.upstream_model,
         reason="router inactive or decision failed -> single upstream",
+        agent=agent_id or "", session_id=session_id or "",
     )
     fallback = config.model_route
     fallback.source = "fallback_upstream"
@@ -360,6 +367,20 @@ async def _do_call(
     logger.info("route_calling", model=model, stream=stream, msg_count=len(messages))
     call_kwargs: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
     call_kwargs.update(kwargs)
+    # 🔴 MQ-P23（2026-09-09 实测立）：OpenAI 兼容的**流式**响应，只有在请求带
+    # `stream_options.include_usage` 时才会补发那个带 usage 的收尾 chunk。
+    # 全仓此前**没有任何地方设它** ⇒ `chunk.usage` 恒 falsy ⇒ `extract_usage` 从未
+    # 被调用过 ⇒ `response_meta.usage` 在 claude-code / codex 上恒空。
+    # （hermes 有 97% 是因为**客户端自己带**——`/v1/messages` 与 `/v1/responses`
+    #  的上游请求是 BladeX 自己拼的，我们没加，所以没有。又一次"同一件事只在
+    #  一条路径上做对了"。）
+    # 落在 `_do_call` 是因为它是**唯一的转发点**，三条入站路径共用。
+    # 调用方显式给了就尊重（不覆盖）；`stream_options` 在 supported_params 里，
+    # 不支持的上游由 Router 的 drop_params 摘掉，不会 502。
+    # 🔴 它是 BladeX vs 裸跑对照的**前置条件**：没有 usage 就没有 output_tokens/s，
+    # 而那是仅有的两个协议无关可比项之一（另一个是 TTFB / MQ-P25）。
+    if stream and "stream_options" not in call_kwargs:
+        call_kwargs["stream_options"] = {"include_usage": True}
     if route:
         if route.api_base:
             call_kwargs["api_base"] = route.api_base

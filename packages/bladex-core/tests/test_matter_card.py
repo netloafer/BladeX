@@ -20,7 +20,7 @@ def _matter() -> Matter:
 
 def test_card_fields_default_empty() -> None:
     m = _matter()
-    assert m.participants == [] and m.lifecycle == [] and m.open_issues == []
+    assert m.participants == [] and m.lifecycle == []   # open_issues 已删（F0.3 H1 销账）
     assert m.version == 0
 
 
@@ -60,7 +60,7 @@ def test_card_backward_compatible() -> None:
     """旧 Matter（无卡扩展字段）可反序列化，新字段走默认。"""
     m = _matter()
     old = m.model_dump(mode="json")
-    for k in ("participants", "lifecycle", "open_issues", "version"):
+    for k in ("participants", "lifecycle", "version"):
         old.pop(k, None)
     m2 = Matter.model_validate(old)
     assert m2.version == 0 and m2.participants == [] and m2.lifecycle == []

@@ -14,7 +14,7 @@ import os
 
 import pytest
 
-from bladex_core.ledger import Ledger, render_ledger_md
+from bladex_core.ledger import Ledger, LedgerEntry, render_ledger_md
 from bladex_core.ledger_runtime import activation_scope
 from bladex_proxy.agency import AgencyRuntime
 
@@ -56,10 +56,16 @@ class TestRevLock:
             "rev 必须渲染——模型读不到就回带不了"
 
     def test_stale_rev_rejected_with_latest_content(self):
+        # 🔴 2026-09-07 F-B2：题面从 `op=add` 改成 `op=remove`。
+        # add 起不到题面作用了——add 可交换，旧 rev 的 add 现在**故意放行**
+        # （MQ-L49 ③：8/8 rev 冲突是同一 agent 自撞，拦的全是本该过的 add）。
+        # 这把锁要挡的一直是"按旧视图错删"，remove 才是它的题面。
         led = _led(rev=5)
+        led = led.model_copy(update={"sections": {"next": [
+            LedgerEntry(text="按旧视图会被误删的那条", source="model")]}})
         rt = _rt(led, activation_scope("codex", ""))
-        out = _update(rt, {"section": "verified", "op": "add",
-                           "text": "x", "rev": 3})
+        out = _update(rt, {"section": "next", "op": "remove",
+                           "index": 0, "rev": 3})
         assert out.startswith("Error: ledger changed"), out
         assert "current 5" in out and "- rev: 5" in out, \
             "拒写必须附最新正文（含当前 rev），模型据此合并重试"
@@ -152,9 +158,8 @@ class TestProjectScopeWiring:
         账本在切换成功后对注入面隐形。守卫窄一寸，缺陷就从那一寸过。"""
         import re
         import bladex_proxy as _pkg
-        with open(os.path.join(os.path.dirname(_pkg.__file__), "server.py"),
-                  encoding="utf-8") as f:
-            src = f.read()
+        from _source_probe import package_source
+        src = package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
         entries = ["insert_ledger_block(", "process_message(",
                    "intercept_chat_stream(", "intercept_anthropic_stream(",
                    "intercept_responses_stream("]
@@ -168,10 +173,8 @@ class TestProjectScopeWiring:
     def test_agency_every_ctx_site_carries_project(self):
         """agency 侧对账：每个工具执行 ctx 生产点都必须带 project_id——
         入口再加一个也逃不过（生产点判据，不数入口名单）。"""
-        import bladex_proxy as _pkg
-        with open(os.path.join(os.path.dirname(_pkg.__file__), "agency.py"),
-                  encoding="utf-8") as f:
-            src = f.read()
+        from _source_probe import package_source
+        src = package_source("agency")   # F0.1 拆包：process_message 在 runtime.py、两条流式在 streams.py
         # 2026-09-04 MQ-L40：三处字面量收成 `tool_context(...)` 单实现点（两条流式路径曾漏传
         # turn_index）。project_id 是它的**必填关键字参数**，漏传在调用处就是 TypeError；
         # 本守卫改为：生产点全部走 tool_context，且旧字面量形态不许再长出来。
@@ -272,9 +275,8 @@ class TestUserEditAdoption:
 
     def test_server_adoption_source_guard(self):
         import bladex_proxy as _pkg
-        with open(os.path.join(os.path.dirname(_pkg.__file__), "server.py"),
-                  encoding="utf-8") as f:
-            src = f.read()
+        from _source_probe import package_source
+        src = package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
         assert "admin_ledger_user_edit_clobber_risk" in src, \
             "并发覆盖必须响亮告警，不静默（刚性原则 13 同族）"
         i = src.index("admin_ledger_user_edit_clobber_risk")

@@ -34,6 +34,7 @@ Hub 里。对账口径改为 `route_calling ≈ turn_enqueued + inner_loop_turn_
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from collections.abc import Awaitable, Callable
@@ -99,6 +100,9 @@ class LoopRound:
     usage: dict = field(default_factory=dict)
     messages: list[dict] = field(default_factory=list)
     reply: dict = field(default_factory=dict)
+    #: 本轮以 `Error:` 开头的工具结果数（MQ-L54）。0 与"没读到"要分得开，
+    #: 故是计数不是 bool。
+    errors: int = 0
 
 
 @dataclass
@@ -112,6 +116,16 @@ class InnerLoopResult:
     #: （= 各 `rounds[i].messages` 的拼接）。入 Hub 走 `rounds`，本字段留给
     #: 需要整段视图的调用方。
     transcript: list[dict] = field(default_factory=list)
+    #: 🔴 MQ-L54：本次循环里**同名工具 + 参数逐字相同 + 结果以 `Error:` 开头**的
+    #: 最长连续次数。MQ-L52 那次 62 万 token 的放大器就是这个形态——同一条写错
+    #: 连撞 6 次、照常烧到 `MAX_ROUNDS`，而 `loop_done` 只报 `rounds/tools/degraded`，
+    #: **看不出这几轮是不是同一个错**。
+    #:
+    #: **只埋点不熔断**（拍板 ⑬）：L52 修后模型已能自愈（09-08 实测 3 批次 4 次拒绝、
+    #: 重试 1–2 次后全部成功，`rounds` 最大 3），此时拍一个阈值有可能打断正常自愈
+    #: （同族先例：MQ-L44 的防抖阈值）。一周分布出来再定——正常自愈（1–2）与病态（6）
+    #: 之间要有肉眼可见的间隔；**没间隔 ⇒ 熔断这条路不成立**，改从错误消息侧解。
+    fail_streak: int = 0
 
 
 def _fn(tc: dict) -> tuple[str, str]:
@@ -153,6 +167,16 @@ async def run_inner_loop(
     rounds: list[LoopRound] = []
     calls = list(initial_calls)
     all_results: list[tuple[str, str]] = []
+    # MQ-L54：失败连击。`_streak_key` = (工具名, 参数 hash)，**跨轮**延续——
+    # 病态形态正是"同一条写错跨轮原样重发"，只在轮内数就恒为 1。
+    streak_key: tuple[str, str] | None = None
+    streak = 0
+    fail_streak = 0
+
+    def _fail_key(name: str, args: str) -> tuple[str, str]:
+        """🔴 `args` 只取 hash：原文可能是整份文件正文，**不进日志也不进内存驻留**
+        （原则 13 管的是入 Hub 的采集数据；这里是纯读数，hash 足以判"是不是同一条"）。"""
+        return (name, hashlib.sha256(args.encode("utf-8")).hexdigest()[:12])
 
     for round_index in range(1, rounds_cap + 1):
         rec = LoopRound(round_index=round_index)
@@ -174,6 +198,17 @@ async def run_inner_loop(
                 await on_progress(f"{NARRATE_MARK} {_phrase(name)}…")
             result = await dispatch(name, args)
             all_results.append((name, result))
+            # MQ-L54：失败连击。判据三条**并联**：同名工具 ∧ 参数逐字相同 ∧
+            # 结果以 `Error:` 开头。少了"参数相同"这条，模型换着参数试探
+            # （正常自愈的形状）会被读成病态连击——那正是要区分开的两件事。
+            if (result or "").startswith("Error:"):
+                rec.errors += 1
+                key = _fail_key(name, args)
+                streak = streak + 1 if key == streak_key else 1
+                streak_key = key
+                fail_streak = max(fail_streak, streak)
+            else:
+                streak_key, streak = None, 0
             tool_msg = {"role": "tool", "tool_call_id": tc.get("id", ""),
                         "content": result}
             working.append(tool_msg)
@@ -192,7 +227,8 @@ async def run_inner_loop(
             return InnerLoopResult(
                 final_message=synthesize_results_message(all_results),
                 rounds=rounds, degraded=True, degrade_reason="budget",
-                elapsed_s=elapsed, transcript=transcript)
+                elapsed_s=elapsed, transcript=transcript,
+                fail_streak=fail_streak)
 
         t1 = clock()
         reply = await call_llm(working)
@@ -209,11 +245,16 @@ async def run_inner_loop(
         if disp.mode != MODE_PURE:
             # none / mixed 都返回——mixed 的剥离-拼接归调用方（V-P2/P4 路径）。
             return InnerLoopResult(final_message=reply, rounds=rounds,
-                                   elapsed_s=clock() - start, transcript=transcript)
+                                   elapsed_s=clock() - start, transcript=transcript,
+                                   fail_streak=fail_streak)
         calls = disp.bladex_calls
 
-    logger.warning("innerloop_rounds_degrade", rounds=rounds_cap)
+    # MQ-L54：撞上限时把连击一并报出来——`rounds=6` 有两种成因（六件不同的事 /
+    # 同一条错撞六次），此前在日志里长得一模一样。
+    logger.warning("innerloop_rounds_degrade", rounds=rounds_cap,
+                   fail_streak=fail_streak)
     return InnerLoopResult(
         final_message=synthesize_results_message(all_results),
         rounds=rounds, degraded=True, degrade_reason="max_rounds",
-        elapsed_s=clock() - start, transcript=transcript)
+        elapsed_s=clock() - start, transcript=transcript,
+        fail_streak=fail_streak)
