@@ -11,10 +11,10 @@ import os
 
 from bladex_proxy.project_identity import (
     ProjectIdentity,
+    _cache,
     extract_cwd,
     resolve_from_request,
     resolve_project,
-    _cache,
 )
 
 

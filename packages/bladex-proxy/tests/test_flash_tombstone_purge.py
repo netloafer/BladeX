@@ -16,7 +16,6 @@ import os
 
 from bladex_core.flash import summarize_tree
 from bladex_core.ledger import ledger_local_path, ledger_md_path, new_ledger
-
 from bladex_proxy.flash_daemon import FlashDaemon, hub_tombstoned_source
 
 
@@ -142,7 +141,6 @@ def test_hub_tombstoned_source_reads_hub_tombstones():
 def test_main_wires_tombstoned_source():
     """接线守卫：进程入口必须把墓碑源传给 daemon，否则机制在 live 上不存在。"""
     from _source_probe import source_of
-
     from bladex_proxy import flash_daemon
     src = source_of(flash_daemon.main)
     assert "tombstoned_source=hub_tombstoned_source(hub)" in src

@@ -32,16 +32,10 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
-import secrets
-import shutil
-import signal
-import socket
 import subprocess
 import sys
-import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -361,37 +355,129 @@ app.add_typer(ledger_cmds.ledger_app, name="ledger")
 app.add_typer(ops_cmds.connector_app, name="connector")
 
 # ── 门面 re-export：拆前 `bladex_proxy.cli` 上的全部顶层名（守卫 `test_facade_exports.py`）──
-from bladex_proxy.cli.lifecycle import (  # noqa: E402,F401
-    _redis_hostport, _redis_ping, _is_local_host, _ensure_redis, _consolidator_command,
-    _flash_command, _flash_pid, _start_flash, _embed_pid, _embed_wanted, _embed_listening,
-    _start_embed, _start_consolidator, _start_proxy, _stop_by_pidfile, start, _prune_logs,
-    _report_startup_state, stop, embed, consolidator, _fmt_traffic_row, _scrape_metrics,
-    _print_funnel, _print_traffic, _fmt_bytes, _print_memory_config, _consolidator_activity,
-    _format_queue, _flash_status_line, _ago, _print_degradation_banner, status, restart,
-    _ENV_MINIMAL_TEMPLATE, _ROUTING_MINIMAL_TEMPLATE, _ASSET_TARGETS,
-    _install_model_facing_assets, init, _stale_data_dirs, _probe_upstream, _probe_port, doctor,
-    _hidden_pth_files, _E2E_TEMPLATE, _E2E_RECALL_QUERY, _run_e2e_check
+from bladex_proxy.cli.ledger_cmds import (  # noqa: E402,F401
+    _DOCTOR_GOAL_PREFIX,
+    _DOCTOR_STALE_DAYS,
+    _doctor_age_days,
+    _doctor_findings,
+    _doctor_norm_title,
+    _doctor_scope_key,
+    _ledger_active_cell,
+    _ledger_bind_legacy_matters,
+    _ledger_entry_counts,
+    _ledger_goal_cell,
+    _ledger_time_cell,
+    ledger_app,
+    ledger_doctor,
+    ledger_list,
+    ledger_show,
 )
-from bladex_proxy.cli.ops_cmds import (  # noqa: E402,F401
-    _SyncLog, _fmt_progress, _try_delegate, _run_direct, cmd_sync_run, cmd_sync_status,
-    sync_app, config_app, _upstream_key_problems, _mask_secret, render_effective_config,
-    config_show, config_check, sync_run, sync_status, queue_app, sticky_app, _queue_lines,
-    queue_status, _print_orphan_profile, queue_flush, sticky_status, sticky_flush, backup,
-    restore, connector_app, _build_export_worker, connector_run, connector_status,
-    connector_reset, export_cmd, import_cmd
+from bladex_proxy.cli.lifecycle import (  # noqa: E402,F401
+    _ASSET_TARGETS,
+    _E2E_RECALL_QUERY,
+    _E2E_TEMPLATE,
+    _ENV_MINIMAL_TEMPLATE,
+    _ROUTING_MINIMAL_TEMPLATE,
+    _ago,
+    _consolidator_activity,
+    _consolidator_command,
+    _embed_listening,
+    _embed_pid,
+    _embed_wanted,
+    _ensure_redis,
+    _flash_command,
+    _flash_pid,
+    _flash_status_line,
+    _fmt_bytes,
+    _fmt_traffic_row,
+    _format_queue,
+    _hidden_pth_files,
+    _install_model_facing_assets,
+    _is_local_host,
+    _print_degradation_banner,
+    _print_funnel,
+    _print_memory_config,
+    _print_traffic,
+    _probe_port,
+    _probe_upstream,
+    _prune_logs,
+    _redis_hostport,
+    _redis_ping,
+    _report_startup_state,
+    _run_e2e_check,
+    _scrape_metrics,
+    _stale_data_dirs,
+    _start_consolidator,
+    _start_embed,
+    _start_flash,
+    _start_proxy,
+    _stop_by_pidfile,
+    consolidator,
+    doctor,
+    embed,
+    init,
+    restart,
+    start,
+    status,
+    stop,
 )
 from bladex_proxy.cli.memory_cmds import (  # noqa: E402,F401
-    storage_app, memory_app, matter_app, inspect_app, storage_status, storage_rebuild,
-    inspect_hub, inspect_index, memory_search, memory_show, memory_forget, matter_list,
-    matter_show, matter_create, matter_assign, matter_merge, matter_merge_candidates,
-    matter_detach, matter_split, matter_close, matter_rename
+    inspect_app,
+    inspect_hub,
+    inspect_index,
+    matter_app,
+    matter_assign,
+    matter_close,
+    matter_create,
+    matter_detach,
+    matter_list,
+    matter_merge,
+    matter_merge_candidates,
+    matter_rename,
+    matter_show,
+    matter_split,
+    memory_app,
+    memory_forget,
+    memory_search,
+    memory_show,
+    storage_app,
+    storage_rebuild,
+    storage_status,
 )
-from bladex_proxy.cli.ledger_cmds import (  # noqa: E402,F401
-    ledger_app, _ledger_entry_counts, _ledger_time_cell, _ledger_goal_cell, _ledger_active_cell,
-    ledger_list, _DOCTOR_GOAL_PREFIX, _DOCTOR_STALE_DAYS, _doctor_norm_title, _doctor_age_days,
-    _doctor_scope_key, _doctor_findings, ledger_doctor, _ledger_bind_legacy_matters, ledger_show
+from bladex_proxy.cli.ops_cmds import (  # noqa: E402,F401
+    _build_export_worker,
+    _fmt_progress,
+    _mask_secret,
+    _print_orphan_profile,
+    _queue_lines,
+    _run_direct,
+    _SyncLog,
+    _try_delegate,
+    _upstream_key_problems,
+    backup,
+    cmd_sync_run,
+    cmd_sync_status,
+    config_app,
+    config_check,
+    config_show,
+    connector_app,
+    connector_reset,
+    connector_run,
+    connector_status,
+    export_cmd,
+    import_cmd,
+    queue_app,
+    queue_flush,
+    queue_status,
+    render_effective_config,
+    restore,
+    sticky_app,
+    sticky_flush,
+    sticky_status,
+    sync_app,
+    sync_run,
+    sync_status,
 )
-
 
 # ── 入口（兼容层：scripts/bladex.py 与 test_sync_cli 依赖 main(argv)->int）──
 

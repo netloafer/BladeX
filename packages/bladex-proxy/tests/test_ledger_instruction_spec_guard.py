@@ -19,12 +19,12 @@ from __future__ import annotations
 
 import re
 
+from bladex_proxy.agency.notes import load_ledger_template
 from bladex_proxy.agency.runtime import (
     _FIRST_STEP_NO_LEDGER,
     _FIRST_STEP_WITH_LEDGER,
     _RECORD_ONLY_WITH_LEDGER,
 )
-from bladex_proxy.agency.notes import load_ledger_template
 
 
 def _core_section(md: str) -> str:

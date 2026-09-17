@@ -6,8 +6,8 @@ import tempfile
 
 from bladex_proxy.config import ProxyConfig
 from bladex_proxy.server import create_app
-from bladex_proxy.storage.memory_index import MemoryIndex
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_index import MemoryIndex
 from fastapi.testclient import TestClient
 
 

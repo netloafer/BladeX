@@ -20,8 +20,8 @@ from pathlib import Path
 import pytest
 import redis
 from bladex_proxy.models import Identity, Turn, TurnStatus
-from bladex_proxy.storage.pipeline_redis import PipelineRedis
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.pipeline_redis import PipelineRedis
 from bladex_proxy.storage.pipeline_worker import PipelineWorker
 
 

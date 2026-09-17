@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 from bladex_proxy.models import Identity, ToolEvent, Turn, TurnStatus
-from bladex_proxy.storage.memory_index import MemoryIndex
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_index import MemoryIndex
 
 
 class MockEmbedder:

@@ -13,8 +13,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from bladex_proxy.models import Identity, Turn, TurnStatus
-from bladex_proxy.storage.memory_index import MemoryIndex, _turn_matches_filter
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_index import MemoryIndex, _turn_matches_filter
 
 
 class MockEmbedder:

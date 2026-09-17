@@ -12,7 +12,7 @@ import pytest
 from bladex_core.attribution import LinkJudgeResult, LinkVerdict
 from bladex_core.distillation import DistillFact, DistillOutput, MatterProposal
 from bladex_proxy.linking import IndexJudgmentJournal
-from bladex_proxy.storage.memory_index import MemoryIndex, IndexDistillJournal
+from bladex_proxy.storage.memory_index import IndexDistillJournal, MemoryIndex
 
 
 @pytest.fixture

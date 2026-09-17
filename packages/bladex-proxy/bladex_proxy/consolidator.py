@@ -242,8 +242,8 @@ def main() -> int:
         resolve_embed_settings,
         validate_embed_sensitivity,
     )
-    from bladex_proxy.storage.memory_index import MemoryIndex, IndexDistillJournal
     from bladex_proxy.storage.memory_hub import MemoryHub
+    from bladex_proxy.storage.memory_index import IndexDistillJournal, MemoryIndex
 
     cfg = ProxyConfig()
 
@@ -311,6 +311,7 @@ def main() -> int:
     # 模型自举：env > routing [distill] > 模型池最弱档（写回 routing.toml）。
     # 台账缓存：read_only Memory Hub 读命中复用；写降级，T11 full rebuild 时写生效。
     from bladex_core.distillation import PassthroughDistiller
+
     from bladex_proxy.routing_config import bootstrap_distill_model
     distill_model = bootstrap_distill_model(
         cfg.distill_model, cfg.routing_config, cfg.routing_config_path,
@@ -464,6 +465,7 @@ def main() -> int:
     if not args.once and not args.full and not args.no_control:
         try:
             import redis as _redis
+
             from bladex_proxy.sync_control import SyncControl
             _rc = _redis.Redis.from_url(cfg.redis_url, decode_responses=True,
                                         socket_connect_timeout=2)

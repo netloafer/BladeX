@@ -12,9 +12,8 @@ RocksDB 直接抛。危害不是正确性，是**挡视线**——proxy 端真�
 """
 from __future__ import annotations
 
-from bladex_proxy.storage.memory_index import MemoryIndex
-
 from _source_probe import source_of
+from bladex_proxy.storage.memory_index import MemoryIndex
 
 
 class _FakeMetaDb:

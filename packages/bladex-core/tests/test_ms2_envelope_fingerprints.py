@@ -14,13 +14,11 @@ X6 纪律：本文件的样本不出现在实现代码里；实现里写的是**
 from __future__ import annotations
 
 import pytest
-
 from bladex_core.envelope import (
     is_pure_envelope,
     prepare_distill_inputs,
     strip_envelopes,
 )
-
 
 # ── ① codex：<environment_context> ────────────────────────────────────────
 

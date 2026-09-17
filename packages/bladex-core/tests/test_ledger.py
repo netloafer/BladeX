@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import pytest
+import time as _time
 
+import pytest
 from bladex_core.ledger import (
     ACTOR_DASHBOARD,
     ACTOR_MAINTENANCE,
@@ -24,7 +25,6 @@ from bladex_core.ledger import (
     add_section,
     ledger_local_path,
     ledger_md_path,
-    ledgers_dir,
     new_ledger,
     new_ledger_id,
     parse_ledger_md,
@@ -193,6 +193,7 @@ class TestPoolPaths:
 
     def test_path_has_no_agent_dimension(self):
         import inspect
+
         from bladex_core import ledger as mod
         for fn in (mod.ledger_md_path, mod.ledger_local_path, mod.ledgers_dir):
             assert "agent" not in inspect.signature(fn).parameters
@@ -339,7 +340,6 @@ class TestEventParity:
 # 不能只改渲染：两处按 ISO 串排序 + parse 把文件串原样读回池 ⇒ 文件里出现 `+08:00`
 # 而池里还有 `+00:00` 时字符串序错，候选面 top-5 排错。
 
-import time as _time
 
 
 @pytest.fixture(params=["Asia/Shanghai", "America/Los_Angeles"])
@@ -392,7 +392,7 @@ class TestTimeZone:
     def test_user_hand_written_offset_is_normalized(self):
         """用户直编文件里手写 `+08:00`（或裸串）⇒ 池里仍是 UTC，不混偏移。"""
         md = render_ledger_md(new_ledger(ledger_id="ldg-u", title="t", created_at=self.UTC_S))
-        md = md.replace(f"- updated: ", "- updated: 2026-09-05T13:00:00+08:00\n- x_updated: ", 1)
+        md = md.replace("- updated: ", "- updated: 2026-09-05T13:00:00+08:00\n- x_updated: ", 1)
         led = parse_ledger_md(md)
         assert led.updated_at == "2026-09-05T05:00:00+00:00"
 

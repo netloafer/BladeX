@@ -21,18 +21,18 @@ from typing import Any
 
 import pytest
 from bladex_core.consolidation_proxy import embed_passage_compat, embed_query_compat
+from bladex_core.flags import MEMORY_NUMERIC_DEFAULTS as _FLAGS
 from bladex_proxy.embedding import (
     DEFAULT_LOCAL_MODEL,
     MODEL_PROFILES,
-    RouterEmbedAdapter,
     ProxyEmbedAdapter,
+    RouterEmbedAdapter,
     build_embedder,
     effective_thresholds,
     embed_model_identity,
     validate_embed_sensitivity,
 )
 from bladex_proxy.storage.memory_index import FastEmbedAdapter, MemoryIndex
-
 
 # e5 系（前缀约定 + 阈值标定基准，旧默认）
 _E5_MODEL = "intfloat/multilingual-e5-large"
@@ -67,8 +67,6 @@ class _LegacyEmbedder:
         self.seen.extend(texts)
         return [[1.0, 2.0] for _ in texts]
 
-
-from bladex_core.flags import MEMORY_NUMERIC_DEFAULTS as _FLAGS
 
 _FLAG_NOVELTY = _FLAGS["BLADEX_NOVELTY_THRESHOLD"]
 
@@ -636,7 +634,6 @@ def test_ensure_local_model_skips_when_cached(monkeypatch, tmp_path):
 
 def test_ensure_local_model_rejects_unsupported(tmp_path):
     """白名单外模型 -> 报错并列出推荐档（不静默回落）。"""
-    from bladex_proxy import embedding as em
     with pytest.raises(RuntimeError, match="not supported by fastembed"):
         _REAL_ENSURE("intfloat/multilingual-e5-small", str(tmp_path))
 

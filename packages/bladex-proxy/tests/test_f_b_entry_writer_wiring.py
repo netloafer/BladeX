@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-
 from bladex_core.ledger import Ledger, render_ledger_md
 from bladex_core.ledger_runtime import activation_scope
 from bladex_proxy.agency import AgencyRuntime

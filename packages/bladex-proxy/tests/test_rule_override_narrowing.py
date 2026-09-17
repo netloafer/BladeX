@@ -25,7 +25,6 @@ dashboard 认领 codex，写了一条 `name="codex"` 的用户规则（只带一
 from __future__ import annotations
 
 import structlog.testing
-
 from bladex_proxy.agent_rules import (
     append_user_rule,
     load_agent_rules,

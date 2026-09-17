@@ -7,8 +7,12 @@ tool_call 配对合法性 / 2026-07-14 真实事故会话形状回放。
 from __future__ import annotations
 
 from bladex_core.fact import Fact
-from bladex_proxy.assembly import AssemblyConfig, ContextAssembler
-from bladex_proxy.assembly import SUMMARY_OPEN, estimate_context_chars
+from bladex_proxy.assembly import (
+    SUMMARY_OPEN,
+    AssemblyConfig,
+    ContextAssembler,
+    estimate_context_chars,
+)
 
 
 def _user(text: str) -> dict:

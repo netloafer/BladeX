@@ -24,7 +24,6 @@ import json
 import os
 
 import structlog.testing
-
 from bladex_core.ledger import (
     ACTOR_MODEL,
     Ledger,
@@ -381,10 +380,9 @@ def test_converges_by_rev_when_model_writes_after_adoption(tmp_path):
 # ── ⑥ server 端 ───────────────────────────────────────────────────────────
 
 def test_server_returns_adopted_pool_version_and_flags_resend(monkeypatch):
-    from fastapi.testclient import TestClient
-
     from bladex_proxy.config import ProxyConfig
     from bladex_proxy.server import create_app
+    from fastapi.testclient import TestClient
 
     monkeypatch.setenv("BLADEX_AUTH_ENABLED", "false")
     app = create_app(ProxyConfig())

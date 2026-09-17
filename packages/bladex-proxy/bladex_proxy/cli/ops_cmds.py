@@ -16,10 +16,15 @@ from pathlib import Path
 import typer
 
 from bladex_proxy import deployment
-
 from bladex_proxy.cli import (  # noqa: E402
-    _PROXY_PIDFILE, _admin_call, _consolidator_pid, _read_pidfile, _repo_root,
-    _resolve_distill_concurrency, _run_repo_script, app
+    _PROXY_PIDFILE,
+    _admin_call,
+    _consolidator_pid,
+    _read_pidfile,
+    _repo_root,
+    _resolve_distill_concurrency,
+    _run_repo_script,
+    app,
 )
 
 
@@ -145,8 +150,8 @@ def _run_direct(args: argparse.Namespace, log: _SyncLog) -> int:
         validate_embed_sensitivity,
     )
     from bladex_proxy.routing_config import bootstrap_distill_model
-    from bladex_proxy.storage.memory_index import MemoryIndex, IndexDistillJournal
     from bladex_proxy.storage.memory_hub import MemoryHub
+    from bladex_proxy.storage.memory_index import IndexDistillJournal, MemoryIndex
 
     cfg = ProxyConfig()
     validate_embed_sensitivity(cfg)
@@ -830,8 +835,8 @@ connector_app = typer.Typer(help="Continuous export to the targets configured in
 def _build_export_worker():
     from bladex_proxy.config import ProxyConfig
     from bladex_proxy.export_sync import build_worker_from_config
-    from bladex_proxy.storage.memory_index import MemoryIndex
     from bladex_proxy.storage.memory_hub import MemoryHub
+    from bladex_proxy.storage.memory_index import MemoryIndex
 
     cfg = ProxyConfig()
     if not Path("config/export.toml").is_file():
@@ -944,8 +949,8 @@ def export_cmd(
         return 2
     from bladex_proxy.config import ProxyConfig
     from bladex_proxy.snapshot import export_snapshot
-    from bladex_proxy.storage.memory_index import MemoryIndex
     from bladex_proxy.storage.memory_hub import MemoryHub
+    from bladex_proxy.storage.memory_index import MemoryIndex
 
     cfg = ProxyConfig()
     # 相对路径钉回用户敲命令的目录（main() 已 chdir 到部署根）；缺省值仍落部署根 data/。
@@ -996,8 +1001,8 @@ def import_cmd(
         return 1
     from bladex_proxy.config import ProxyConfig
     from bladex_proxy.snapshot import import_snapshot
-    from bladex_proxy.storage.memory_index import MemoryIndex
     from bladex_proxy.storage.memory_hub import MemoryHub
+    from bladex_proxy.storage.memory_index import MemoryIndex
 
     cfg = ProxyConfig()
     embedder = None

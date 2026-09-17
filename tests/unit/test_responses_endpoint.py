@@ -10,14 +10,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
-from fastapi.testclient import TestClient
-
-from bladex_proxy import server as server_module
 from bladex_proxy.config import ProxyConfig
 from bladex_proxy.server import create_app
+from fastapi.testclient import TestClient
 
 
 def _fake_text_response(text: str = "hello from upstream") -> SimpleNamespace:
@@ -34,7 +31,7 @@ def _fake_text_response(text: str = "hello from upstream") -> SimpleNamespace:
 def _fake_text_chunks(text_parts: list[str]) -> list:
     """流式 OpenAI chat chunks。"""
     chunks = []
-    for i, t in enumerate(text_parts):
+    for _i, t in enumerate(text_parts):
         chunks.append(SimpleNamespace(
             choices=[SimpleNamespace(
                 delta=SimpleNamespace(content=t, tool_calls=None),
@@ -63,7 +60,9 @@ def _make_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_response=
     embedding 后端可选化后 server 经 build_embedder 构建（不再直接引用
     FastEmbedAdapter）——改 patch build_embedder。
     """
-    from bladex_proxy.server import app_factory as _app_mod   # F0.1 拆包：消费方 lifespan 在 server/app_factory.py
+    from bladex_proxy.server import (
+        app_factory as _app_mod,  # F0.1 拆包：消费方 lifespan 在 server/app_factory.py
+    )
     monkeypatch.setattr(
         _app_mod, "build_embedder",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disabled in test")),
@@ -74,7 +73,7 @@ def _make_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_response=
             return _fake_async_iter(mock_chunks or _fake_text_chunks(["hi", " there"]))
         return mock_response or _fake_text_response()
 
-    from bladex_proxy.server import endpoints_responses as _resp_mod   # F0.1 拆包：消费方
+    from bladex_proxy.server import endpoints_responses as _resp_mod  # F0.1 拆包：消费方
     monkeypatch.setattr(_resp_mod, "call_model", fake_call_model)
 
     cfg = ProxyConfig(
@@ -167,7 +166,9 @@ def test_responses_stateful_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 def test_responses_auth_required_when_enabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """auth_enabled=true 时错误 key 回 401。"""
-    from bladex_proxy.server import app_factory as _app_mod   # F0.1 拆包：消费方 lifespan 在 server/app_factory.py
+    from bladex_proxy.server import (
+        app_factory as _app_mod,  # F0.1 拆包：消费方 lifespan 在 server/app_factory.py
+    )
     monkeypatch.setattr(
         _app_mod, "build_embedder",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disabled in test")),

@@ -42,30 +42,69 @@ from typing import Any
 
 import structlog
 
-from bladex_proxy.agency.notes import (  # noqa: F401
-    _MACHINE_TEXT_MARKS, _machine_text_mark, load_ledger_template, _SYSTEM_NOTE_FILES,
-    load_system_notes, load_agents_roster, render_system_notes,
-    LEDGER_SECTION_OPEN, LEDGER_SECTION_CLOSE, _GOAL_MAX_CHARS, _WRAPPER_TAG_RE, _BARE_PREFIX_RES,
-    _last_user_text
-)
 from bladex_proxy.agency.handlers import (  # noqa: F401
-    SUBTASK_TAG, _DESPITE_MATCH_SCORE, USER_NAMED_TITLE_MIN_CHARS, _user_named_ledger,
-    ToolFaceHandlersMixin
+    _DESPITE_MATCH_SCORE,
+    SUBTASK_TAG,
+    USER_NAMED_TITLE_MIN_CHARS,
+    ToolFaceHandlersMixin,
+    _user_named_ledger,
+)
+from bladex_proxy.agency.notes import (  # noqa: F401
+    _BARE_PREFIX_RES,
+    _GOAL_MAX_CHARS,
+    _MACHINE_TEXT_MARKS,
+    _SYSTEM_NOTE_FILES,
+    _WRAPPER_TAG_RE,
+    LEDGER_SECTION_CLOSE,
+    LEDGER_SECTION_OPEN,
+    _last_user_text,
+    _machine_text_mark,
+    load_agents_roster,
+    load_ledger_template,
+    load_system_notes,
+    render_system_notes,
 )
 from bladex_proxy.agency.runtime import (  # noqa: F401
-    LEDGER_BLOCK_OPEN, LEDGER_BLOCK_CLOSE, ABOUT_BLOCK_OPEN, ABOUT_BLOCK_CLOSE,
-    INJECTION_MARKERS, _FIRST_STEP_WITH_LEDGER, _FIRST_STEP_NO_LEDGER, _MATCHING_LEDGERS_HEADER,
-    _call_names, _loop_cost, tool_context, AgencyRuntime,
-    LEDGER_BLOCK_BUCKETS, LedgerBlockBreakdown, _split_ledger_md,
-    rare_pending_units, _pending_text
+    _FIRST_STEP_NO_LEDGER,
+    _FIRST_STEP_WITH_LEDGER,
+    _MATCHING_LEDGERS_HEADER,
+    ABOUT_BLOCK_CLOSE,
+    ABOUT_BLOCK_OPEN,
+    INJECTION_MARKERS,
+    LEDGER_BLOCK_BUCKETS,
+    LEDGER_BLOCK_CLOSE,
+    LEDGER_BLOCK_OPEN,
+    AgencyRuntime,
+    LedgerBlockBreakdown,
+    _call_names,
+    _loop_cost,
+    _pending_text,
+    _split_ledger_md,
+    rare_pending_units,
+    tool_context,
 )
 from bladex_proxy.agency.streams import (  # noqa: F401
-    intercept_chat_stream, _SSE_KEEPALIVE, _Narrator, _ev, _ResponsesNarrator,
-    _AnthropicNarrator, _ChatNarrator, _idle_too_long, _narrate_on, _keepalive_interval_s,
-    _narrate_until_done, _intercept_protocol_stream, _rewrite_stop_anthropic,
-    _rewrite_stop_responses, _synth_responses_tool_call_events,
-    _synth_anthropic_tool_call_events, _synth_anthropic_text_events, _SYNTH_ITEM_ID,
-    _synth_responses_text_events, intercept_anthropic_stream, intercept_responses_stream
+    _SSE_KEEPALIVE,
+    _SYNTH_ITEM_ID,
+    _AnthropicNarrator,
+    _ChatNarrator,
+    _ev,
+    _idle_too_long,
+    _intercept_protocol_stream,
+    _keepalive_interval_s,
+    _narrate_on,
+    _narrate_until_done,
+    _Narrator,
+    _ResponsesNarrator,
+    _rewrite_stop_anthropic,
+    _rewrite_stop_responses,
+    _synth_anthropic_text_events,
+    _synth_anthropic_tool_call_events,
+    _synth_responses_text_events,
+    _synth_responses_tool_call_events,
+    intercept_anthropic_stream,
+    intercept_chat_stream,
+    intercept_responses_stream,
 )
 
 logger = structlog.get_logger()

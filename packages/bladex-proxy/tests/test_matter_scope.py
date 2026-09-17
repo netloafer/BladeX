@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import pytest
-
 from bladex_core.attribution import (
     AttributionDecision,
     AttributionPipeline,

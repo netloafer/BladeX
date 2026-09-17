@@ -18,8 +18,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-import pytest
-from bladex_core.attribution import UNASSIGNED_MATTER_ID, LinkJudgeItem, LinkJudgeResult, LinkVerdict
+from bladex_core.attribution import (
+    UNASSIGNED_MATTER_ID,
+    LinkJudgeItem,
+    LinkJudgeResult,
+    LinkVerdict,
+)
 from bladex_core.consolidation_proxy import _deterministic_fact_id
 from bladex_core.distillation import DistillFact, DistillOutput, MatterProposal
 from bladex_core.matter import EdgeTargetType, Matter, MatterStatus

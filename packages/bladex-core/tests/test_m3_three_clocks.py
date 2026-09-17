@@ -12,7 +12,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-
 from bladex_core.clocks import (
     CLOCK_EXEMPT_KINDS,
     decide_matter_clocks,

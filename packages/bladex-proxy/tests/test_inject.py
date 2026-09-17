@@ -7,8 +7,6 @@ T5: 标记剥离限 system 角色、补多模态 list content。
 import tempfile
 from pathlib import Path
 
-import pytest
-
 from bladex_core.fact import Fact
 from bladex_proxy.config import ProxyConfig
 from bladex_proxy.inject import (
@@ -20,7 +18,6 @@ from bladex_proxy.inject import (
     strip_previous_injection,
 )
 from bladex_proxy.storage.memory_index import MemoryIndex
-
 
 # （2026-09-03 S1：`BLADEX_INJECT_INDEX_RECALL` 与主动检索路径已删，注入面只剩硬规则；
 #  原 `_pin_index_recall_on` 夹具与两条"召回内容进注入块"的用例随删。带 index 的用例

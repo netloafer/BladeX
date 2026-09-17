@@ -1,6 +1,6 @@
 [project]
 name = "bladex"
-version = "0.1.0"
+version = "0.2.0"
 description = "BladeX — memory-first LLM proxy middleware: a self-hosted personal memory layer any agent or model can adopt with near-zero changes."
 requires-python = ">=3.11"
 # Workspace root: no runtime deps; actual packages live in packages/*.
@@ -38,6 +38,11 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# 批 O（2026-09-18）：下面两个目录不进 lint 面——不是豁免规则，是它们不是被维护的代码：
+# 前者是 parked 的 v1/v2 与 bladex-perf/bladex-hermes（不是 workspace member，不入测试收集），
+# 后者是 2026-08-29 冻结的基准快照，价值就在**逐字不变**（lint 自动修会改掉它）。
+# 两者都不进公开树。其余全部（含 scripts/、docs/ 下的脚本）在扫描面内。
+extend-exclude = ["archive", "bench_frozen"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "B", "UP"]

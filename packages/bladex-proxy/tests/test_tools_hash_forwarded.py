@@ -25,8 +25,6 @@ bladex 工具面"的结论——实际**无法判定**。仪器盲区伪装成�
 
 from __future__ import annotations
 
-import inspect
-
 import pytest
 
 _AGENT_TOOL = {"type": "function",
@@ -115,12 +113,12 @@ class TestWiringOrderAcrossProtocols:
 
     def test_build_always_after_augment(self):
         src = self._src().split("\n")
-        aug = [i for i, l in enumerate(src) if "_apply_agency_surfaces(" in l
-               and "def _apply_agency_surfaces" not in l]
-        bld = [i for i, l in enumerate(src) if "request_params = _build_request_params(" in l]
+        aug = [i for i, ln in enumerate(src) if "_apply_agency_surfaces(" in ln
+               and "def _apply_agency_surfaces" not in ln]
+        bld = [i for i, ln in enumerate(src) if "request_params = _build_request_params(" in ln]
         assert len(aug) == 3, f"入站端点数变了？_apply_agency_surfaces 调用 {len(aug)} 次"
         assert len(bld) == 3, f"_build_request_params 出现 {len(bld)} 次"
-        for a, b in zip(sorted(aug), sorted(bld)):
+        for a, b in zip(sorted(aug), sorted(bld), strict=True):
             assert a < b, ("_build_request_params 排在 _apply_agency_surfaces 之前 —— "
                            "记下的会是增补前的工具面（V-R1 病例）")
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-
 from bladex_proxy.toolface import (
     FAMILY_LEDGER,
     FAMILY_MEMORY,

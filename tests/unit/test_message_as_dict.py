@@ -9,9 +9,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from pydantic import BaseModel
-
 from bladex_proxy.server import _message_as_dict
+from pydantic import BaseModel
 
 
 class _Fn(BaseModel):

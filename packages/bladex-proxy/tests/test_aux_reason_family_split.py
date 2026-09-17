@@ -14,10 +14,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
-
 from bladex_proxy.identity import (
     AUX_REASON_ISOLATED,
     AUX_REASON_NO_TOOLS,

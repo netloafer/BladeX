@@ -345,7 +345,7 @@ def test_split_endpoint():
 
 def test_admin_deferred_when_index_busy(monkeypatch):
     """Memory Index: Memory Index 写锁竞争失败时返回 202 deferred（Memory Hub 事件已写）。"""
-    import bladex_proxy.server.admin_api as server_mod   # F0.1 拆包：消费方在 admin_api.py
+    import bladex_proxy.server.admin_api as server_mod  # F0.1 拆包：消费方在 admin_api.py
     from bladex_proxy.config import ProxyConfig
     from bladex_proxy.server import create_app
     from fastapi.testclient import TestClient

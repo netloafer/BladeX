@@ -13,7 +13,6 @@ X6 纪律：本文件的样本词汇**不得出现在实现代码里**。
 from __future__ import annotations
 
 import pytest
-
 from bladex_core.distillation import (
     DistillFact,
     DistillOutput,
@@ -22,7 +21,6 @@ from bladex_core.distillation import (
 )
 from bladex_core.fact import Provenance
 from bladex_proxy import distillation as D
-
 
 # ── ③ 语言钉死（X2：一处病灶三层发病，蒸馏侧一条规则治三层）────────────────
 

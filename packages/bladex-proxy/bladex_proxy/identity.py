@@ -22,7 +22,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
-
 from bladex_core.envelope import ENVELOPE_MAX_OFFSET
 from bladex_core.flags import flag_enabled
 
@@ -32,9 +31,9 @@ from bladex_proxy.agent_bucket import (
     extract_vendor_ids,
     redact_headers,
 )
+from bladex_proxy.agent_registry import _agent_registry
 from bladex_proxy.agent_rules import AgentFingerprintRule as _ExternalRule
 from bladex_proxy.agent_rules import load_agent_rules
-from bladex_proxy.agent_registry import _agent_registry
 from bladex_proxy.innerloop import INNER_LOOP_AUX_SOURCE as _INNER_LOOP_AUX_SOURCE
 from bladex_proxy.innerloop import INNER_LOOP_MARKER as _INNER_LOOP_MARKER
 from bladex_proxy.models import AgentSource, ChatCompletionRequest, Identity, SessionIdSource

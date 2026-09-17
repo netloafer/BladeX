@@ -12,7 +12,6 @@ import typer
 
 from bladex_proxy.cli import _admin_call, _print_op_result  # noqa: E402
 
-
 ledger_app = typer.Typer(help="Task ledgers (five-section working state; read-only except "
                               "`doctor --bind-legacy-matters --yes`)",
                          no_args_is_help=True)
@@ -187,7 +186,7 @@ def _doctor_findings(rows: list[dict], details: dict[str, dict]) -> list[dict]:
                         "detail": f"same title after normalisation: {key!r}",
                         "action": f"bladex ledger show {sorted(ids)[0]}"})
     seen = {tuple(sorted(f["ledger_ids"])) for f in out}
-    for (_scope, key), ids in sorted(by_goal.items()):
+    for (_scope, _key), ids in sorted(by_goal.items()):
         if len(ids) > 1 and tuple(sorted(ids)) not in seen:
             out.append({"kind": "duplicate_goal", "ledger_ids": sorted(ids),
                         "detail": f"same first {_DOCTOR_GOAL_PREFIX} chars of goal",
@@ -232,7 +231,7 @@ def _doctor_findings(rows: list[dict], details: dict[str, dict]) -> list[dict]:
     # 判据改为**数据自证**、不写死日期：取所有已锚账本里最早的 `created_at`
     # 当作机制上线时刻，只报晚于它、却仍无锚的。
     # 一本已锚账本都没有 ⇒ 机制没跑过 ⇒ 整条检查跳过（无从判断）。
-    from bladex_core.ledger import iso_ms   # 比数值不比 ISO 串（MQ-L46）
+    from bladex_core.ledger import iso_ms  # 比数值不比 ISO 串（MQ-L46）
     anchored_births = sorted(
         ((r.get("created_at") or "") for r in rows
          if (r.get("matter_id") or "").strip() and (r.get("created_at") or "")),

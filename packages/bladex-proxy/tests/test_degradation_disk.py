@@ -16,7 +16,6 @@ from pathlib import Path
 import pytest
 from bladex_proxy import admin_read, cli, metrics
 
-
 # ── DegradationLog：滚动窗口 ────────────────────────────────────────
 
 
@@ -285,7 +284,7 @@ def test_consolidator_status_reports_not_running(monkeypatch, capsys, tmp_path):
     for k in list(os.environ):
         if k.startswith("BLADEX_"):
             monkeypatch.delenv(k, raising=False)
-    from bladex_proxy.cli import lifecycle as _lc   # F0.1 拆包：消费方在 cli/lifecycle.py
+    from bladex_proxy.cli import lifecycle as _lc  # F0.1 拆包：消费方在 cli/lifecycle.py
     monkeypatch.setattr(_lc, "_consolidator_pid", lambda: None)
     rc = cli.consolidator("status")
     assert rc == 1

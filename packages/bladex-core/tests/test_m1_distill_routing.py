@@ -11,7 +11,6 @@ X6 纪律：本文件的样本词汇不得出现在实现代码里。分流判�
 from __future__ import annotations
 
 import pytest
-
 from bladex_core.distill_routing import (
     DISCOURSE_MAX_CHARS,
     DOCUMENT_HARD_CHARS,

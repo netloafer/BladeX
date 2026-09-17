@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import patch
 
 from bladex_core.fact import Fact
 from bladex_core.matter import Matter, MatterParticipant

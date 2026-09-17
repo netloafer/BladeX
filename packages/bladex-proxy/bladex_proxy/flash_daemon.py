@@ -32,6 +32,7 @@ import os
 import re
 import time
 from collections.abc import Callable
+from datetime import UTC
 
 import structlog
 from bladex_core.flash import SCOPE_PERSONAL, write_if_changed
@@ -752,11 +753,11 @@ class FlashDaemon:
         _agent_days = flag_number("BLADEX_FLASH_AGENT_RETIRE_DAYS")
 
         def _age_days(last_at: str) -> float:
-            from datetime import datetime, timezone
+            from datetime import datetime
             try:
                 dt = datetime.strptime(last_at, "%Y-%m-%d %H:%M").replace(
-                    tzinfo=timezone.utc)
-                return (datetime.now(timezone.utc) - dt).total_seconds() / 86400
+                    tzinfo=UTC)
+                return (datetime.now(UTC) - dt).total_seconds() / 86400
             except ValueError:
                 return 0.0          # 解析不了当新鲜——宁留勿删
 
@@ -869,6 +870,7 @@ class FlashDaemon:
         grep）；每次删除记 `flash_dir_reclaimed`。
         """
         import shutil
+
         from bladex_core.flash import scope_dir
         base = scope_dir(self._root, self._principal, self._scope)
         removed = 0
@@ -1036,7 +1038,7 @@ def registry_agents_source(cache_file: str, *, eligible=None,
       "最后活跃"；`summary` 归 V-F2b（先立 LLM 预算）。
     """
     import json as _json
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from bladex_core.flash_tree import AgentRow
 
@@ -1074,7 +1076,7 @@ def registry_agents_source(cache_file: str, *, eligible=None,
         rows = []
         # 有 identified_at 的按时间排，没有的排后并按 id 稳定排序（渲染确定性）。
         for aid in sorted(first, key=lambda a: (first[a] == 0.0, first[a], a)):
-            seen = (datetime.fromtimestamp(first[aid], tz=timezone.utc)
+            seen = (datetime.fromtimestamp(first[aid], tz=UTC)
                     .strftime("%Y-%m-%d") if first[aid] else "")
             rows.append(AgentRow(agent_id=aid, first_seen=seen))
         return rows
@@ -1152,10 +1154,10 @@ def hub_tree_source(hub: object, *, max_sessions_per_agent: int = 20,
     （SWITCH 事件 payload 自带 session_id/agent_id）；每 agent 取最新一轮的
     system prompt 摘录（V-F2b 简介源，≤ #agents 次 get）。
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     def _iso(ms: int) -> str:
-        return (datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        return (datetime.fromtimestamp(ms / 1000, tz=UTC)
                 .strftime("%Y-%m-%d %H:%M") if ms else "")
 
     def _source() -> dict:
@@ -1253,7 +1255,7 @@ def hub_tree_source(hub: object, *, max_sessions_per_agent: int = 20,
         # 带了名字，所有会话共用（身份是 pid，名字只是投影，取最新非空即可）。
         pid_names: dict[str, str] = {}
         pid_roots: dict[str, str] = {}
-        for (agent, sess), (pid, pname, proot) in sess_project.items():
+        for (_agent, _sess), (pid, pname, proot) in sess_project.items():
             if pname:
                 pid_names[pid] = pname
             if proot:
@@ -1516,6 +1518,7 @@ def main() -> int:  # pragma: no cover —— 进程入口；接线件各有单�
         summarize = None
         summarize_project = None
     import json as _json
+
     from bladex_proxy.agent_rules import load_agent_rules
     try:
         with open(_reg_cache(), encoding="utf-8") as _f:

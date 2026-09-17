@@ -32,7 +32,6 @@ from pathlib import Path
 
 import pytest
 import structlog.testing
-
 from bladex_core.ledger import Ledger
 from bladex_core.ledger_runtime import activation_scope
 from bladex_proxy.agency import AgencyRuntime

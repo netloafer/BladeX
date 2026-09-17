@@ -12,8 +12,7 @@ import tempfile
 from pathlib import Path
 
 from bladex_core.fact import Fact
-from bladex_core.matter import Matter, MatterEdge, MatterStatus
-from bladex_core.matter import EdgeTargetType
+from bladex_core.matter import EdgeTargetType, Matter, MatterEdge, MatterStatus
 from bladex_proxy.storage.memory_index import MemoryIndex
 
 

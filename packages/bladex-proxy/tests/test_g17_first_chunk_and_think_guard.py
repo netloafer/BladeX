@@ -286,7 +286,7 @@ def test_warn_bare_reasoning_silent_when_reasoning_present_or_text_short() -> No
 
 def _long_text_no_reasoning() -> list[_FakeChunk]:
     """H4 那 11 轮的形状：正文 >400 字符、`reasoning_content` 全程为空、**无任何 think 标记**。"""
-    return _chunks(*["step %d of the plan is to inspect the module and " % i for i in range(12)])
+    return _chunks(*[f"step {i} of the plan is to inspect the module and " for i in range(12)])
 
 
 def _long_text_with_reasoning() -> list[_FakeChunk]:

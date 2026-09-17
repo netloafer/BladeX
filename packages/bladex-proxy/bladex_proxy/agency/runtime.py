@@ -13,32 +13,57 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
+from bladex_core.flags import flag_enabled, flag_number
 from bladex_core.ledger import (
-    SECTION_TITLES, Ledger, children_of, iso_ms, render_ledger_md, replay_ledger_events
+    SECTION_TITLES,
+    Ledger,
+    children_of,
+    iso_ms,
+    render_ledger_md,
+    replay_ledger_events,
 )
 from bladex_core.ledger_runtime import (
-    ActivationTable, activation_scope, candidate_units, relevant_ledgers, staleness_marker
+    ActivationTable,
+    activation_scope,
+    candidate_units,
+    relevant_ledgers,
+    staleness_marker,
 )
-from bladex_core.flags import flag_enabled, flag_number
 
-from bladex_proxy.innerloop import InnerLoopResult, run_inner_loop
-from bladex_proxy.loopledger import InnerLoopLedger
-from bladex_proxy.interception import (
-    MODE_MIXED, MODE_NONE, MODE_PURE, classify_message, strip_bladex_calls, ensure_call_ids
+from bladex_proxy.agency.handlers import ToolFaceHandlersMixin
+from bladex_proxy.agency.notes import (
+    _last_user_text,
+    load_agents_roster,
+    load_ledger_template,
+    load_system_notes,
+    render_system_notes,
 )
+from bladex_proxy.innerloop import InnerLoopResult, run_inner_loop
+from bladex_proxy.interception import (
+    MODE_MIXED,
+    MODE_NONE,
+    MODE_PURE,
+    classify_message,
+    ensure_call_ids,
+    strip_bladex_calls,
+)
+from bladex_proxy.loopledger import InnerLoopLedger
 from bladex_proxy.models import AdminEventType
 from bladex_proxy.modules import module_enabled
 from bladex_proxy.splice import (
-    RecentRequests, SpliceLedger, SpliceRecord, anchor_key, request_fingerprint,
-    splice_into_messages, strip_inbound_echoes
+    RecentRequests,
+    SpliceLedger,
+    SpliceRecord,
+    anchor_key,
+    request_fingerprint,
+    splice_into_messages,
+    strip_inbound_echoes,
 )
 from bladex_proxy.toolface import (
-    NO_TOOLFACE_AGENT_BASES, ToolFace, inject_tools, ledger_tools_allowed
-)
-from bladex_proxy.agency.handlers import ToolFaceHandlersMixin
-from bladex_proxy.agency.notes import (
-    _last_user_text, load_agents_roster, load_ledger_template, load_system_notes,
-    render_system_notes,
+    NO_TOOLFACE_AGENT_BASES,
+    ToolFace,
+    inject_tools,
+    ledger_tools_allowed,
 )
 
 logger = structlog.get_logger()
@@ -868,8 +893,8 @@ class AgencyRuntime(ToolFaceHandlersMixin):
                      *[f"- {m.ledger_id}: {m.title} [{m.score:.2f}]" for m in matches])
             # 🔴 排序键是数值不是 ISO 串（MQ-L46）：池里混入不同偏移时字符串序会错，
             # 而这里就是 recency top-5——排错比时间显示错更贵。
-            others = [(iso_ms(l.updated_at or l.created_at), lid, l.title or lid)
-                      for lid, l in self.pool.items()
+            others = [(iso_ms(lg.updated_at or lg.created_at), lid, lg.title or lid)
+                      for lid, lg in self.pool.items()
                       if (led is None or lid != led.ledger_id)
                       and lid not in matched_ids]   # 命中项只在相关段出现一次
             if others:

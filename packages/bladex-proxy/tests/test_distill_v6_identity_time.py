@@ -19,7 +19,6 @@ from bladex_proxy.distillation import (
     TURN_PROMPT_VER,
 )
 
-
 # ── MQ-D1：提案标题 = 主题身份，不是任务句 ────────────────────────────────
 
 

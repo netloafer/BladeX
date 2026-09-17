@@ -77,7 +77,7 @@ def detect_session_events(text: str) -> list[tuple[str, str]]:
     if "rejected" in hits and "accepted" in hits:
         if hits["rejected"][1] == hits["accepted"][1]:
             hits.pop("accepted")
-    for event, (pos, detail) in sorted(hits.items(), key=lambda kv: kv[1][0]):
+    for event, (_pos, detail) in sorted(hits.items(), key=lambda kv: kv[1][0]):
         if event not in seen:
             seen.add(event)
             out.append((event, detail))

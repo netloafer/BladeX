@@ -13,7 +13,6 @@ import typer
 from bladex_proxy.cli import _admin_call, _print_op_result, _run_repo_script  # noqa: E402
 from bladex_proxy.cli.ops_cmds import sync_run  # noqa: E402
 
-
 storage_app = typer.Typer(help="Storage operations", no_args_is_help=True)
 memory_app = typer.Typer(help="Memory management (via the proxy admin API)", no_args_is_help=True)
 matter_app = typer.Typer(help="Matter management (via the proxy admin API)", no_args_is_help=True)

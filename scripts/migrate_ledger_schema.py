@@ -47,7 +47,6 @@ for _p in ("packages/bladex-core", "packages/bladex-proxy"):
 
 import msgpack  # noqa: E402
 import rocksdict  # noqa: E402
-
 from bladex_proxy.models import Turn  # noqa: E402
 from bladex_proxy.storage.memory_hub import _is_internal_key  # noqa: E402
 

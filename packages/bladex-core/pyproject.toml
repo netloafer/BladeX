@@ -1,6 +1,6 @@
 [project]
 name = "bladex-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "BladeX core - memory orchestration (the moat): prefetch, consolidation, consistency. Agent-neutral."
 requires-python = ">=3.11"
 # v4 记忆编排核心（护城河，agent 中立）：prefetch 相关性注入 + consolidation 增量蒸馏 +

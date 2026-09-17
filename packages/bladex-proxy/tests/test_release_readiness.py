@@ -284,8 +284,7 @@ def test_probe_ready_reads_body_on_503(monkeypatch):
 def test_startup_state_reports_degraded_with_consequences(monkeypatch, capsys):
     """记忆管线的死亡必须出现在 console，且写明后果（不是一句 'degraded'）。"""
     from bladex_proxy import cli
-
-    from bladex_proxy.cli import lifecycle as _lc   # F0.1 拆包：消费方在 cli/lifecycle.py
+    from bladex_proxy.cli import lifecycle as _lc  # F0.1 拆包：消费方在 cli/lifecycle.py
     monkeypatch.setattr(_lc, "_probe_ready",
                         lambda *a, **k: {"ready": False,
                                          "checks": {"redis": False, "hub": True, "index": True}})
@@ -302,8 +301,7 @@ def test_startup_state_reports_degraded_with_consequences(monkeypatch, capsys):
 
 def test_startup_state_reports_ready(monkeypatch, capsys):
     from bladex_proxy import cli
-
-    from bladex_proxy.cli import lifecycle as _lc   # F0.1 拆包：消费方在 cli/lifecycle.py
+    from bladex_proxy.cli import lifecycle as _lc  # F0.1 拆包：消费方在 cli/lifecycle.py
     monkeypatch.setattr(_lc, "_probe_ready",
                         lambda *a, **k: {"ready": True,
                                          "checks": {"redis": True, "hub": True, "index": True}})
@@ -314,8 +312,7 @@ def test_startup_state_reports_ready(monkeypatch, capsys):
 
 def test_startup_state_reports_failed_when_no_response(monkeypatch, capsys):
     from bladex_proxy import cli
-
-    from bladex_proxy.cli import lifecycle as _lc   # F0.1 拆包：消费方在 cli/lifecycle.py
+    from bladex_proxy.cli import lifecycle as _lc  # F0.1 拆包：消费方在 cli/lifecycle.py
     monkeypatch.setattr(_lc, "_probe_ready", lambda *a, **k: None)
     rc = cli._report_startup_state("127.0.0.1", 38080, True, True, timeout_s=0.1)
     assert rc == 1 and "failed" in capsys.readouterr().out
@@ -614,9 +611,10 @@ class _FakeSocket:
 
 
 def _fake_connect(monkeypatch, connect_rc: int) -> None:
-    from bladex_proxy import cli
+    from bladex_proxy.cli import lifecycle
 
-    monkeypatch.setattr(cli.socket, "socket", lambda *a, **k: _FakeSocket(connect_rc))
+    # monkeypatch 打消费方子模块（CLAUDE.md 三包纪律）；`_probe_port` 住在 lifecycle
+    monkeypatch.setattr(lifecycle.socket, "socket", lambda *a, **k: _FakeSocket(connect_rc))
 
 
 # ── doctor --e2e 探针的三条结构约束（2026-08-05 首次实跑 G4 用失败换来的）─────
@@ -679,7 +677,7 @@ def test_probe_port_in_use_by_our_proxy_is_not_a_warning(monkeypatch):
     from bladex_proxy import cli
 
     _fake_connect(monkeypatch, 0)
-    from bladex_proxy.cli import lifecycle as _lc   # F0.1 拆包：消费方在 cli/lifecycle.py
+    from bladex_proxy.cli import lifecycle as _lc  # F0.1 拆包：消费方在 cli/lifecycle.py
     monkeypatch.setattr(_lc, "_probe_ready", lambda *a, **k: {"ready": True, "checks": {}})
     state, detail = cli._probe_port("127.0.0.1", 38080)
     assert state == "ours"
@@ -691,7 +689,7 @@ def test_probe_port_in_use_by_stranger_still_warns(monkeypatch):
     from bladex_proxy import cli
 
     _fake_connect(monkeypatch, 0)
-    from bladex_proxy.cli import lifecycle as _lc   # F0.1 拆包：消费方在 cli/lifecycle.py
+    from bladex_proxy.cli import lifecycle as _lc  # F0.1 拆包：消费方在 cli/lifecycle.py
     monkeypatch.setattr(_lc, "_probe_ready", lambda *a, **k: None)
     state, detail = cli._probe_port("127.0.0.1", 38080)
     assert state == "foreign"
@@ -713,7 +711,7 @@ def test_storage_dir_defaults_have_single_source():
     import re as _re
     from pathlib import Path
 
-    from bladex_proxy.config import DEFAULT_INDEX_DIR, DEFAULT_HUB_DIR
+    from bladex_proxy.config import DEFAULT_HUB_DIR, DEFAULT_INDEX_DIR
 
     assert DEFAULT_INDEX_DIR == "data/bladex_index"
     assert DEFAULT_HUB_DIR == "data/bladex_hub"
@@ -765,7 +763,7 @@ def test_init_template_index_path_matches_config_default(monkeypatch):
 
 def test_resolve_paths_honour_env_and_root(monkeypatch, tmp_path):
     """env 覆盖 > 默认；`root` 只锚相对路径，绝对路径原样保留。"""
-    from bladex_proxy.config import resolve_index_path, resolve_hub_path
+    from bladex_proxy.config import resolve_hub_path, resolve_index_path
 
     monkeypatch.delenv("BLADEX_INDEX_PATH", raising=False)
     monkeypatch.delenv("BLADEX_ROCKSDB_PATH", raising=False)
@@ -777,3 +775,82 @@ def test_resolve_paths_honour_env_and_root(monkeypatch, tmp_path):
     assert resolve_index_path("/repo") == "/repo/custom/idx"
     monkeypatch.setenv("BLADEX_INDEX_PATH", "/abs/idx")
     assert resolve_index_path("/repo") == "/abs/idx", "绝对路径不该被 root 前缀污染"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 批 O · O1（2026-09-18）：包版本单一真相源对账
+#
+# 事故：v0.2.0 打在四个 pyproject 全写 0.1.0 的代码上，release 构建出
+# `bladex_core-0.1.0-py3-none-any.whl`。**本组守的是"互相一致 + 派生不漂"**；
+# "集体停旧"这一形状本组无感（四处一致），由 `scripts/check_release_version.py`
+# 在 release.yml 里拿 tag 比对（`tests/unit/test_check_release_version.py`）。
+# ══════════════════════════════════════════════════════════════════════════
+
+_VERSION_PYPROJECTS = (
+    "pyproject.toml",
+    "packages/bladex-core/pyproject.toml",
+    "packages/bladex-proxy/pyproject.toml",
+    "packages/bladex-mcp/pyproject.toml",
+)
+
+
+def _pyproject_versions() -> dict[str, str]:
+    import tomllib
+
+    return {
+        rel: tomllib.loads((_REPO / rel).read_text(encoding="utf-8"))["project"]["version"]
+        for rel in _VERSION_PYPROJECTS
+    }
+
+
+def test_pyproject_versions_are_identical():
+    """四个 pyproject 的 version 互相一致（阴性对照：改花任一个 ⇒ 这里红）。"""
+    versions = _pyproject_versions()
+    assert len(set(versions.values())) == 1, f"包版本不一致：{versions}"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", next(iter(versions.values()))), versions
+
+
+def test_dunder_version_derives_from_pyproject():
+    """`__version__` 不再是第二份字面量：源码里不许出现 `__version__ = "x.y.z"`，
+    运行时取值必须等于 pyproject（editable 元数据陈旧时这里红 —— 修法 `uv sync`）。
+    """
+    import bladex_mcp
+    import bladex_proxy
+
+    want = _pyproject_versions()["pyproject.toml"]
+    assert bladex_proxy.__version__ == want, (
+        f"bladex_proxy.__version__={bladex_proxy.__version__!r} ≠ pyproject {want!r}："
+        "已安装的 dist 元数据陈旧，跑 `uv sync` 重装 editable 包"
+    )
+    assert bladex_mcp.__version__ == want
+    for rel in ("packages/bladex-proxy/bladex_proxy/__init__.py",
+                "packages/bladex-mcp/bladex_mcp/__init__.py"):
+        src = (_REPO / rel).read_text(encoding="utf-8")
+        assert not re.search(r'^__version__\s*=\s*"', src, re.MULTILINE), (
+            f"{rel} 又写回了版本字面量——单一真相源是 pyproject.toml")
+
+
+def test_package_version_falls_back_to_pyproject_then_explicit_unknown(tmp_path):
+    """源码树直跑（无 dist-info）读旁边的 pyproject；都没有 ⇒ 显式 `0+unknown`，不伪装。"""
+    from bladex_core.version import UNKNOWN_VERSION, package_version
+
+    pkg = tmp_path / "pkg_x"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    assert package_version("no-such-dist-bladex", str(pkg / "__init__.py")) == UNKNOWN_VERSION
+    (tmp_path / "pyproject.toml").write_text('[project]\nname="x"\nversion="9.9.9"\n', encoding="utf-8")
+    assert package_version("no-such-dist-bladex", str(pkg / "__init__.py")) == "9.9.9"
+
+
+def test_readme_version_labels_match_package_version():
+    """README 的版本标签（`(v0.1.0)` 这类标题）随包版本走。
+
+    0.2.0 的公开 tag 里 README 四处标题仍写 v0.1.0——版本号写死的第五处。
+    只守带 `v` 的精确标签；路线图口径（"排在 0.x"）是内容不是标签，人判。
+    """
+    want = _pyproject_versions()["pyproject.toml"]
+    for name in ("README.md", "README.zh.md"):
+        text = (_REPO / name).read_text(encoding="utf-8")
+        labels = set(re.findall(r"[（(]v(\d+\.\d+\.\d+)[)）]", text))
+        assert labels, f"{name} 没有任何版本标签——正则或 README 结构变了，尺子先失效"
+        assert labels <= {want}, f"{name} 的版本标签 {sorted(labels)} ≠ 包版本 {want}"

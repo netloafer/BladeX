@@ -35,10 +35,9 @@ class _StubAgency:
 
 @pytest.fixture
 def client_with_ledgers(monkeypatch):
-    from fastapi.testclient import TestClient
-
     from bladex_proxy.config import ProxyConfig
     from bladex_proxy.server import create_app
+    from fastapi.testclient import TestClient
 
     monkeypatch.setenv("BLADEX_AUTH_ENABLED", "false")
     app = create_app(ProxyConfig())
@@ -53,7 +52,7 @@ def client_with_ledgers(monkeypatch):
                        created_at="2026-08-26T10:30:00Z")
     idle = new_ledger(ledger_id="ldg-idle0000001", title="没人激活的",
                       created_at="2026-08-25T09:00:00Z")
-    pool = {l.ledger_id: l for l in (parent, child, idle)}
+    pool = {led.ledger_id: led for led in (parent, child, idle)}
     # 同一本被两个 agent 激活 —— 跨 agent 交接的真实形态
     bindings = {activation_scope("hermes:default", ""): "ldg-parent00001",
                 activation_scope("codex", ""): "ldg-parent00001",
@@ -111,10 +110,9 @@ def test_unknown_ledger_is_404_in_dashboard_error_shape(client_with_ledgers):
 
 
 def test_no_agency_is_disabled_not_error(monkeypatch):
-    from fastapi.testclient import TestClient
-
     from bladex_proxy.config import ProxyConfig
     from bladex_proxy.server import create_app
+    from fastapi.testclient import TestClient
 
     monkeypatch.setenv("BLADEX_AUTH_ENABLED", "false")
     with TestClient(create_app(ProxyConfig())) as c:

@@ -19,7 +19,6 @@ import re
 from pathlib import Path
 
 import pytest
-
 from bladex_core.flags import (
     MEMORY_FLAG_DEFAULTS,
     MEMORY_NUMERIC_DEFAULTS,

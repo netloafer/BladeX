@@ -13,11 +13,9 @@ from pathlib import Path
 
 import pytest
 from bladex_core.profile import detect_rule_files
-from bladex_proxy.config import ProxyConfig
 from bladex_proxy.models import Identity, ToolEvent, Turn, TurnStatus
-from bladex_proxy.storage.memory_index import MemoryIndex
 from bladex_proxy.storage.memory_hub import MemoryHub
-
+from bladex_proxy.storage.memory_index import MemoryIndex
 
 # （原 `_pin_index_recall_on` 夹具随 2026-09-03 S1 删除：该开关与主动检索路径已不存在。）
 

@@ -8,6 +8,7 @@ from bladex_core.attribution import AttributionSource
 from bladex_core.ledger import (
     EVENT_LEDGER_SWITCH,
     ledger_active_at,
+    new_ledger,
     replay_ledger_events,
     switch_timeline,
 )
@@ -20,7 +21,6 @@ from bladex_core.ledger_runtime import (
     session_of_turn_key,
     turn_key_ts_ms,
 )
-from bladex_core.ledger import new_ledger
 from bladex_core.matter import Matter
 
 

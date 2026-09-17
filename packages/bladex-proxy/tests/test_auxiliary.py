@@ -11,8 +11,8 @@ from bladex_proxy.config import ProxyConfig
 from bladex_proxy.identity import resolve_identity
 from bladex_proxy.inject import MEMORY_OPEN, do_inject
 from bladex_proxy.models import ChatCompletionRequest, Identity, Turn, TurnStatus
-from bladex_proxy.storage.memory_index import MemoryIndex
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_index import MemoryIndex
 
 # ── MoA reference 指纹 ──
 

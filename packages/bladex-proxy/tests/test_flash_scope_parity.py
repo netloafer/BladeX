@@ -26,7 +26,6 @@ from __future__ import annotations
 import itertools
 
 import pytest
-
 from bladex_core import flash
 from bladex_core.matter import Matter
 from bladex_proxy.storage.memory_index import MemoryIndex

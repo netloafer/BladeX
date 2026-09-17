@@ -329,7 +329,7 @@ class _FakePopen:
 def _fake_spawn(monkeypatch):
     _FakePopen.calls = []
     monkeypatch.setattr(cli.subprocess, "Popen", _FakePopen)
-    from bladex_proxy.cli import lifecycle as _lc   # F0.1 拆包：消费方在 cli/lifecycle.py
+    from bladex_proxy.cli import lifecycle as _lc  # F0.1 拆包：消费方在 cli/lifecycle.py
     monkeypatch.setattr(_lc, "_consolidator_pid", lambda: None)  # 假装没在跑
     monkeypatch.setattr(_lc, "_pid_alive", lambda pid: True)
     return _FakePopen
@@ -368,7 +368,7 @@ def test_start_consolidator_honours_explicit_serial(_tmp_cwd: Path, _fake_spawn)
 
 def test_consolidator_command_flag_reaches_the_spawn(_tmp_cwd: Path, _fake_spawn, monkeypatch):
     """`bladex consolidator start --concurrency 8` 端到端到达 argv。"""
-    from bladex_proxy.cli import lifecycle as _lc   # F0.1 拆包：消费方在 cli/lifecycle.py
+    from bladex_proxy.cli import lifecycle as _lc  # F0.1 拆包：消费方在 cli/lifecycle.py
     monkeypatch.setattr(_lc, "_require_config_root", lambda: None)
     rc = cli.main(["consolidator", "start", "--concurrency", "8"])
     assert rc == 0

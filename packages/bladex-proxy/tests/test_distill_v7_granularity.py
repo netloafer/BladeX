@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+from bladex_core.distillation import DistillTurnInput
 from bladex_proxy.distillation import (
     _DISTILL_CONCLUSION_SYSTEM,
     _DISTILL_SYSTEM,
@@ -34,8 +35,6 @@ from bladex_proxy.distillation import (
     _parse_distill_json,
     build_turn_prompt,
 )
-from bladex_core.distillation import DistillTurnInput
-
 
 # ── M1 单一时钟（原案"双日期"，实现形态见 TURN_PROMPT_VER 偏离 ①）─────────
 

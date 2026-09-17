@@ -31,7 +31,6 @@ import asyncio
 import json
 
 import pytest
-
 from bladex_proxy.agency import (
     AgencyRuntime,
     intercept_anthropic_stream,

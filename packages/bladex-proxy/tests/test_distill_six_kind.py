@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 from bladex_proxy.distillation import (
+    _VALID_ITEM_KINDS,
     CONCLUSION_PROMPT_VER,
     PROMPT_VER,
-    _VALID_ITEM_KINDS,
     _parse_distill_json,
 )
 

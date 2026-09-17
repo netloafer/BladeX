@@ -45,7 +45,9 @@ class _Recorder:
 @pytest.fixture()
 def rec(monkeypatch):
     r = _Recorder()
-    from bladex_proxy.cli import memory_cmds as _mem   # F0.1 拆包：消费方在 cli/memory_cmds.py（memory/matter/storage）
+    from bladex_proxy.cli import (
+        memory_cmds as _mem,  # F0.1 拆包：消费方在 cli/memory_cmds.py（memory/matter/storage）
+    )
     monkeypatch.setattr(_mem, "_admin_call", r)
     return r
 
@@ -127,7 +129,7 @@ def test_storage_rebuild_delegates_to_sync_full(monkeypatch):
         captured.update(vars(ns))
         return 0
 
-    from bladex_proxy.cli import ops_cmds as _ops   # F0.1 拆包：消费方在 cli/ops_cmds.py（sync_run）
+    from bladex_proxy.cli import ops_cmds as _ops  # F0.1 拆包：消费方在 cli/ops_cmds.py（sync_run）
     monkeypatch.setattr(_ops, "cmd_sync_run", _fake_sync)
     rc = cli.main(["storage", "rebuild", "--agents", "hermes:default",
                    "--concurrency", "2"])

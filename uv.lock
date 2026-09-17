@@ -272,7 +272,7 @@ wheels = [
 
 [[package]]
 name = "bladex"
-version = "0.1.0"
+version = "0.2.0"
 source = { virtual = "." }
 
 [package.dev-dependencies]
@@ -309,7 +309,7 @@ dev = [
 
 [[package]]
 name = "bladex-core"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "packages/bladex-core" }
 dependencies = [
     { name = "pydantic" },
@@ -332,7 +332,7 @@ provides-extras = ["semantic"]
 
 [[package]]
 name = "bladex-mcp"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "packages/bladex-mcp" }
 dependencies = [
     { name = "mcp" },
@@ -343,7 +343,7 @@ requires-dist = [{ name = "mcp", specifier = ">=1.2" }]
 
 [[package]]
 name = "bladex-proxy"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "packages/bladex-proxy" }
 dependencies = [
     { name = "bladex-core" },

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from bladex_core.ledger import GoalWriteViolation, LedgerError, new_ledger
 from bladex_core.ledger_runtime import (
     ActivationTable,

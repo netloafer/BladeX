@@ -19,9 +19,9 @@ from __future__ import annotations
 
 import pytest
 from bladex_proxy.identity import (
+    _ENVELOPE_MAX_OFFSET,
     CONTINUATION_AUX_RULES,
     DISTILL_ONLY_AUX_RULES,
-    _ENVELOPE_MAX_OFFSET,
     classify_auxiliary,
     is_cheap_tier_auxiliary,
     is_ledgerless_auxiliary,

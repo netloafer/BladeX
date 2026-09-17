@@ -291,9 +291,8 @@ class TestNonStreamingHasNoNarration:
         行号落进了那个方法的范围，于是断言对着完全无关的源码跑。
         红了还算走运：取到相邻函数而断言恰好通过 = 静默假绿。见 `_source_probe`。
         """
-        from bladex_proxy.agency import AgencyRuntime
-
         from _source_probe import source_of
+        from bladex_proxy.agency import AgencyRuntime
 
         src = source_of(AgencyRuntime, "process_message")
         assert "run_inner_loop(" in src
@@ -475,13 +474,16 @@ class TestNarrationAlwaysCloses:
 
         class _Rec:
             def open(self):
-                events.append("open"); return [b"OPEN"]
+                events.append("open")
+                return [b"OPEN"]
 
             def delta(self, t):
-                events.append("delta"); return [b"D"]
+                events.append("delta")
+                return [b"D"]
 
             def close(self):
-                events.append("close"); return [b"CLOSE"]
+                events.append("close")
+                return [b"CLOSE"]
 
             _opened = False
 
@@ -539,13 +541,15 @@ class TestNarrationAlwaysCloses:
 
         class _Rec:
             def open(self):
-                seen.append("open"); return []
+                seen.append("open")
+                return []
 
             def delta(self, t):
                 return []
 
             def close(self):
-                seen.append("close"); return [b"CLOSE"]
+                seen.append("close")
+                return [b"CLOSE"]
 
         async def loop():
             return "ok"

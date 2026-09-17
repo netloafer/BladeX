@@ -154,7 +154,9 @@ def test_fold_user_id_is_wired_at_every_production_rebuild_call_site() -> None:
     import inspect
 
     from bladex_proxy import consolidator
-    from bladex_proxy.cli import ops_cmds   # F0.1 拆包：sync 命令（rebuild_from_hub 调用点）在 cli/ops_cmds.py
+    from bladex_proxy.cli import (
+        ops_cmds,  # F0.1 拆包：sync 命令（rebuild_from_hub 调用点）在 cli/ops_cmds.py
+    )
 
     total_calls = 0
     for mod in (ops_cmds, consolidator):

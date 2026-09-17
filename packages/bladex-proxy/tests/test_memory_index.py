@@ -10,8 +10,8 @@ from bladex_core.consolidation_proxy import ProxyConsolidator
 from bladex_core.fact import ConversationTurn, Fact
 from bladex_proxy.config import ProxyConfig
 from bladex_proxy.models import Identity, Turn, TurnStatus
-from bladex_proxy.storage.memory_index import MemoryIndex
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_index import MemoryIndex
 
 
 class MockEmbedder:
@@ -553,7 +553,6 @@ def test_index_derived_thresholds_wired():
 
 def test_config_has_consolidation_thresholds():
     """ADR-0014 L0: ProxyConfig 暴露三个阈值配置项。"""
-    from bladex_proxy.config import ProxyConfig
 
     cfg = ProxyConfig()
     assert cfg.novelty_threshold > cfg.semantic_threshold, (

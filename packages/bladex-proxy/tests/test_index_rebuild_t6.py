@@ -16,8 +16,8 @@ from bladex_proxy.models import (
     Turn,
     TurnStatus,
 )
-from bladex_proxy.storage.memory_index import MemoryIndex
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_index import MemoryIndex
 
 
 class MockEmbedder:

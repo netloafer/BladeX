@@ -35,7 +35,6 @@ import asyncio
 import json
 
 import pytest
-
 from bladex_core.ledger import new_ledger
 from bladex_proxy.agency import AgencyRuntime
 

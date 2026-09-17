@@ -17,6 +17,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from bladex_core.distillation import DistillTurnInput
 from bladex_proxy import distillation as distillation_mod
 from bladex_proxy import router_sdk
 from bladex_proxy.distillation import (
@@ -30,7 +31,6 @@ from bladex_proxy.distillation import (
     _salvage_turn_json,
     build_turn_prompt,
 )
-from bladex_core.distillation import DistillTurnInput
 
 
 def _resp(content: str, finish_reason: str = "stop"):

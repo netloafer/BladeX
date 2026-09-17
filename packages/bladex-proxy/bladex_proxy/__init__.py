@@ -11,4 +11,7 @@
   - 配置驱动的确定性路由流水线（agent -> 多模态过滤 -> 能力 -> failover）+ 可选 LLM 裁判
 """
 
-__version__ = "0.1.0"
+from bladex_core.version import package_version
+
+# 单一真相源 = pyproject.toml（批 O，O1）；这里只派生，不再写第二份字面量。
+__version__ = package_version("bladex-proxy", __file__)

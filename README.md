@@ -124,7 +124,7 @@ and spliced back. You can see every one of them in `bladex status --traffic`.
 | **You own all data** | ✅ 100% on your infrastructure | depends on the agent | cloud by default |
 | **Memory-aware model routing** | ✅ optional | ❌ | ❌ |
 
-## Quick Start (v0.1.0)
+## Quick Start (v0.2.0)
 
 ### Prerequisites
 
@@ -166,7 +166,7 @@ proves it by sending a probe turn and recalling it.
 > `/ready`. On a slow link this can exceed the 30 s readiness window and `bladex start` may report
 > `failed -- /ready did not answer within 30s` even though the process is fine. Check
 > `logs/proxy-*.log` for `embed_model_download_start … server_ready`, then run `bladex doctor`;
-> the second start is instant. (Tracked as MQ-A42; the window will become download-aware in 0.2.0.)
+> the second start is instant. (Tracked as MQ-A42; the window will become download-aware in 0.3.0.)
 
 ### Configure your agent
 
@@ -249,7 +249,7 @@ baselined, and BladeX will not quote an end-to-end saving until that number exis
 If you run a local model with a small context window (32K and below), watch the injected surface:
 the ledger block and system notes are real tokens, and on a small window they can squeeze the output
 budget. `bladex status --traffic` and the `upstream_output_truncated` warning in the log tell you
-when that is happening. Window-aware routing and budget-aware trimming are on the 0.2.0 list.
+when that is happening. Window-aware routing and budget-aware trimming are on the 0.3.0 list.
 
 ### Non-English users
 
@@ -306,7 +306,7 @@ API providers you configured, for model inference. Encryption at rest is delegat
 
 ## Features
 
-### Core (v0.1.0)
+### Core (v0.2.0)
 
 - 🧾 **Five-section task ledger** — Goal / Core / Verified / Open / Next; survives compaction,
   restarts, and cross-agent handoffs. Goal is user-owned.
@@ -327,21 +327,21 @@ API providers you configured, for model inference. Encryption at rest is delegat
 - 📤 **Export/import** — versioned JSONL snapshots, plus continuous one-way sync to Obsidian and
   PostgreSQL.
 
-### Coming next (0.2.0)
+### Coming next (0.3.0)
 
 - Context-window-aware routing and budget-aware trimming of the injected surface
 - `close` / `supersede` primitives for finished ledgers
 - Bidirectional sync with external tools
 - Hot-reloadable hard rules (today they live in `config/.env` and need a restart)
 
-## Known Limitations (v0.1.0)
+## Known Limitations (v0.2.0)
 
 - Tuned for **individual self-hosting** — enterprise multi-tenant features are still in development.
 - The ledger tool face is enabled by default only for `medium` and `strong` model tiers
   (`BLADEX_LEDGER_TIERS`), or when the session already owns an active ledger. Weak-tier models still
   see the ledger; they just are not asked to maintain it.
 - On small-context local models the injected surface competes with the output budget (see
-  *Small context windows* above); window-aware trimming is 0.2.0.
+  *Small context windows* above); window-aware trimming is 0.3.0.
 - LanceDB ANN indexing is built once a table passes 256 rows; below that, search is brute-force
   (fast at that size, but tiny stores do skip the index).
 - Only OpenAI Chat Completions, Anthropic Messages, and OpenAI Responses endpoints are supported

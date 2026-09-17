@@ -39,7 +39,7 @@ UPDATE 是**非破坏取代**（Mem0g 同型）：旧条保留、可 as-of 查�
 from __future__ import annotations
 
 from enum import Enum
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 

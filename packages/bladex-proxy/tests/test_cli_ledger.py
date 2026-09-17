@@ -52,7 +52,7 @@ class _Recorder:
 @pytest.fixture
 def rec(monkeypatch):
     r = _Recorder()
-    from bladex_proxy.cli import ledger_cmds as _ldg   # F0.1 拆包：消费方在 cli/ledger_cmds.py
+    from bladex_proxy.cli import ledger_cmds as _ldg  # F0.1 拆包：消费方在 cli/ledger_cmds.py
     monkeypatch.setattr(_ldg, "_admin_call", r)
     return r
 
@@ -126,7 +126,7 @@ def test_ledger_list_columns_aligned(capsys, rec):
     # 切点把数据行切片，8 列**每列都非空**。不按空隙 split--列内容填满
     # 列宽时间隙可能只剩 1 空格（如中文标题占满列宽），split 不可靠。
     bounds = header_pos + [len(row)]
-    cells = [row[i:j].strip() for i, j in zip(bounds, bounds[1:])]
+    cells = [row[i:j].strip() for i, j in zip(bounds, bounds[1:], strict=False)]
     assert len(cells) == 8 and all(cells), cells
     # 逐列抽查内容（错位在这里冒出来：列语义与列内容一一对应）。
     assert cells[0] == "ldg-aaba12345001"
@@ -297,8 +297,6 @@ def live_endpoint(monkeypatch):
 
     transport 挂进 cli._admin_call，CLI 的 HTTP 调用全部落到本端点。
     """
-    from fastapi.testclient import TestClient
-
     from bladex_core.ledger import new_ledger
     from bladex_core.ledger_runtime import (
         ActivationTable,
@@ -308,6 +306,7 @@ def live_endpoint(monkeypatch):
     )
     from bladex_proxy.config import ProxyConfig
     from bladex_proxy.server import create_app
+    from fastapi.testclient import TestClient
 
     monkeypatch.setenv("BLADEX_AUTH_ENABLED", "false")
     app = create_app(ProxyConfig())
@@ -341,7 +340,7 @@ def live_endpoint(monkeypatch):
                 payload = {}
             return r.status_code, payload
 
-        from bladex_proxy.cli import ledger_cmds as _ldg   # F0.1 拆包：消费方在 cli/ledger_cmds.py
+        from bladex_proxy.cli import ledger_cmds as _ldg  # F0.1 拆包：消费方在 cli/ledger_cmds.py
         monkeypatch.setattr(_ldg, "_admin_call", transport)
         yield c, transport
 

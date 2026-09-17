@@ -10,7 +10,6 @@ import asyncio
 import time
 
 import pytest
-
 from bladex_proxy.embed_server import (
     PRIORITY_BULK,
     PRIORITY_HOT,

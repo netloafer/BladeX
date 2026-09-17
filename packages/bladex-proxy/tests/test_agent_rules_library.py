@@ -12,7 +12,6 @@ import textwrap
 from pathlib import Path
 
 import pytest
-
 from bladex_proxy.agent_rules import (
     PRESET_RULES_PATH,
     HeaderPattern,

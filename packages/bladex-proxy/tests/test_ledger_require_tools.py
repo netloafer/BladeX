@@ -100,8 +100,8 @@ class TestWiredIntoEveryEndpoint:
         单实现后此序只需在 `_apply_agency_surfaces` 内部成立一次。
         """
         src = self._src().split("\n")
-        cap = [i for i, l in enumerate(src) if "own_tools = list(tools_in or [])" in l]
-        aug = [i for i, l in enumerate(src) if "agency.augment_tools(" in l]
+        cap = [i for i, ln in enumerate(src) if "own_tools = list(tools_in or [])" in ln]
+        aug = [i for i, ln in enumerate(src) if "agency.augment_tools(" in ln]
         assert len(cap) == 1 and len(aug) == 1, (len(cap), len(aug))
         assert cap[0] < aug[0], "own_tools 取值晚于 augment_tools —— 拿到的是增补后形态"
 
@@ -140,6 +140,7 @@ class TestMachineTextAlarm:
     def test_alarm_does_not_block_creation(self):
         """只告警不阻止——判据是启发式的，误伤的代价比漏报大。"""
         import inspect
+
         from bladex_proxy.agency import AgencyRuntime
         src = inspect.getsource(AgencyRuntime._h_ledger_switch)
         i = src.index("agency_ledger_created_from_machine_text")

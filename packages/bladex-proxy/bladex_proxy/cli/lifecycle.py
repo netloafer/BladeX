@@ -9,23 +9,38 @@ from __future__ import annotations
 import json
 import os
 import secrets
-import sys
-import time
-from pathlib import Path
 import shutil
 import signal
 import socket
 import subprocess
+import sys
+import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import typer
 
 from bladex_proxy.cli import (  # noqa: E402
-    _CONS_PIDFILE, _EMBED_PIDFILE, _FLASH_PIDFILE, _PROXY_PIDFILE, _admin_key,
-    _consolidator_pid, _first_client_key, _http_json, _http_request, _pid_alive,
-    _print_admin_unavailable, _print_config_not_found, _probe_ready, _read_pidfile, _repo_root,
-    _require_config_root, _resolve_distill_concurrency, app, assets_dir
+    _CONS_PIDFILE,
+    _EMBED_PIDFILE,
+    _FLASH_PIDFILE,
+    _PROXY_PIDFILE,
+    _admin_key,
+    _consolidator_pid,
+    _first_client_key,
+    _http_json,
+    _http_request,
+    _pid_alive,
+    _print_admin_unavailable,
+    _print_config_not_found,
+    _probe_ready,
+    _read_pidfile,
+    _repo_root,
+    _require_config_root,
+    _resolve_distill_concurrency,
+    app,
+    assets_dir,
 )
 
 

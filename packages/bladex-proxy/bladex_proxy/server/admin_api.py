@@ -13,23 +13,33 @@ from collections.abc import Callable
 from typing import Any
 
 import structlog
-from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import JSONResponse
 from bladex_core.fact import Fact
 from bladex_core.matter import EdgeTargetType, Matter, MatterOrigin, MatterStatus
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 
 from bladex_proxy.admin_read import register_admin_read_routes
 from bladex_proxy.config import ProxyConfig
-from bladex_proxy.modules import module_enabled
-from bladex_proxy.identity import LOCAL_USER_ID, _SYSTEM_ROLES
+from bladex_proxy.identity import _SYSTEM_ROLES, LOCAL_USER_ID
 from bladex_proxy.models import (
-    AdminEventType, AgentClaimBody, AgentRuleBody, AssignMatterBody, CreateMatterBody,
-    DetachEdgeBody, MergeMattersBody, PromoteScopeBody, RememberFactBody, RenameMatterBody,
-    SplitMatterBody, TombstoneSource, TombstoneTargetType
+    AdminEventType,
+    AgentClaimBody,
+    AgentRuleBody,
+    AssignMatterBody,
+    CreateMatterBody,
+    DetachEdgeBody,
+    MergeMattersBody,
+    PromoteScopeBody,
+    RememberFactBody,
+    RenameMatterBody,
+    SplitMatterBody,
+    TombstoneSource,
+    TombstoneTargetType,
 )
-from bladex_proxy.storage.memory_index import MemoryIndex, build_agent_claim_map
-from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.modules import module_enabled
 from bladex_proxy.server.orchestration import _extract_bearer
+from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_index import MemoryIndex, build_agent_claim_map
 
 logger = structlog.get_logger()
 
@@ -1343,7 +1353,7 @@ def register_admin_routes(app: FastAPI) -> None:
             })
         # 激活的排前面，组内按更新时间倒序——最想先看到的是"现在在跑哪本"。
         # 两趟稳定排序：先排时间，再按激活分组（Python sort 稳定，组内序保留）。
-        from bladex_core.ledger import iso_ms   # 数值键，不比 ISO 串（MQ-L46）
+        from bladex_core.ledger import iso_ms  # 数值键，不比 ISO 串（MQ-L46）
         rows.sort(key=lambda r: iso_ms(r["updated_at"] or r["created_at"]), reverse=True)
         rows.sort(key=lambda r: not r["active_in"])
         return JSONResponse(content={"enabled": True, "ledgers": rows,
@@ -1398,8 +1408,9 @@ def register_admin_routes(app: FastAPI) -> None:
         if agency is None:
             return JSONResponse(status_code=503, content={
                 "error": {"message": "agency runtime unavailable", "type": "storage_error"}})
-        from bladex_core.ledger_runtime import bind_matter, ledger_anchor_matter_id
         import datetime as _dt
+
+        from bladex_core.ledger_runtime import bind_matter, ledger_anchor_matter_id
         now_iso = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
         todo = [lid for lid, led in agency.pool.items() if not led.matter_id]
         bound: list[dict] = []

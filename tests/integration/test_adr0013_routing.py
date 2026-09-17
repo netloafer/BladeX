@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import asyncio
 
-from bladex_proxy import router_sdk
 import pytest
 from bladex_core.routing import JudgeResult, RouteSource
+from bladex_proxy import router_sdk
 from bladex_proxy.config import ProxyConfig
 from bladex_proxy.route import build_router, call_model, resolve_route
 

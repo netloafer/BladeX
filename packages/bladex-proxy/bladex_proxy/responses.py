@@ -27,7 +27,11 @@ from typing import Any
 import structlog
 
 from bladex_proxy.capture import (
-    CaptureResult, cache_read_tokens, extract_usage, record_first_chunk, warn_bare_reasoning,
+    CaptureResult,
+    cache_read_tokens,
+    extract_usage,
+    record_first_chunk,
+    warn_bare_reasoning,
     warn_inline_think,
 )
 from bladex_proxy.models import ToolEvent

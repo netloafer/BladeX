@@ -170,7 +170,7 @@ def test_keyless_kinds_still_lost_and_counted(index):
 def test_historical_turns_without_keys_behave_exactly_as_before(index):
     """历史 turn 没有 `injected_fact_keys` ⇒ 走"只按 id"，与改造前逐字一致。"""
     index.add_fact(_fact("a"))
-    before = index._apply_injection_hits({"a": 1})  # noqa: SLF001（不传 keys）
+    before = index._apply_injection_hits({"a": 1})  # noqa: SLF001  # 不传 keys
     assert before == 1
     assert index.get_fact("a").ref_count == 1
 

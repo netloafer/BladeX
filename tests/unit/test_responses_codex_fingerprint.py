@@ -8,7 +8,6 @@ from __future__ import annotations
 from bladex_proxy.identity import _extract_system_text, _extract_tool_names, _fingerprint_agent
 from bladex_proxy.responses import parse_responses_request
 
-
 # Codex CLI 真实 system prompt 开头（公开规范："You are Codex, a coding agent ..."）
 CODEX_INSTRUCTIONS = (
     "You are Codex, a coding agent created by OpenAI. You help users with software "

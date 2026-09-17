@@ -21,10 +21,9 @@ from bladex_core.attribution import (
     LinkVerdict,
 )
 from bladex_core.distillation import DistillFact, DistillOutput, MatterProposal
-from bladex_core.matter import MatterStatus
 from bladex_proxy.models import Identity, Turn, TurnStatus
-from bladex_proxy.storage.memory_index import MemoryIndex
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_index import MemoryIndex
 
 # ── mocks ──
 

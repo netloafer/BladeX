@@ -23,7 +23,6 @@ from bladex_core.adjudication import (
     AdjudicationOp,
     AdjudicationVerdict,
 )
-
 from bladex_core.flags import flag_number
 
 from bladex_proxy import router_sdk

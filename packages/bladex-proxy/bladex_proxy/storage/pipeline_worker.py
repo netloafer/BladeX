@@ -15,8 +15,8 @@ import re
 import structlog
 
 from bladex_proxy.models import Turn
-from bladex_proxy.storage.pipeline_redis import PipelineRedis
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.pipeline_redis import PipelineRedis
 
 logger = structlog.get_logger()
 

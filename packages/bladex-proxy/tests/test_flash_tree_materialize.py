@@ -7,6 +7,8 @@ from __future__ import annotations
 import os
 
 import pytest
+from bladex_core.ledger import Ledger
+from bladex_proxy.flash_daemon import FlashDaemon, hub_tree_source
 
 
 @pytest.fixture(autouse=True)
@@ -18,9 +20,6 @@ def _retention_off(monkeypatch):
               "BLADEX_FLASH_PROJECT_ACTIVE_DAYS",
               "BLADEX_FLASH_AGENT_RETIRE_DAYS"):
         monkeypatch.setenv(k, "0")
-
-from bladex_core.ledger import Ledger
-from bladex_proxy.flash_daemon import FlashDaemon, hub_tree_source
 
 
 class _Ev:

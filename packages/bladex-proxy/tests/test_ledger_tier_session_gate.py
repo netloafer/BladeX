@@ -13,7 +13,6 @@ live 事故：Pi 新会话问「在线吗」，弱档（auto 集合外）无工�
 from __future__ import annotations
 
 import pytest
-
 from bladex_core.ledger import Ledger, binding_sessions
 from bladex_core.ledger_runtime import activation_scope
 from bladex_proxy.agency import AgencyRuntime
@@ -98,9 +97,7 @@ class TestBindingSessionsRecovery:
 def test_server_passes_tier_and_session():
     """§3.2b 判据一致性：server 必须把同一个 tier 判定传给块注入
     （MQ-A18/P7 族防复发——同一开关两个消费点必须同源）。"""
-    import os
 
-    import bladex_proxy as _pkg
     from _source_probe import package_source
     src = package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
     assert src.count("insert_ledger_block(") == 1, "单调用点"

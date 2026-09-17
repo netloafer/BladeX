@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import pytest
-
 from bladex_core.envelope import (
     is_pure_envelope,
     prepare_distill_inputs,
@@ -215,7 +214,7 @@ def test_consolidator_strips_envelope_and_keeps_conclusion():
     🔴 结论通道扛着 66% 的 Fact 产出——纯信封轮次也必须照收结论。
     """
     from bladex_core.consolidation_proxy import ProxyConsolidator
-    from bladex_core.distillation import DistillOutput, DistillFact
+    from bladex_core.distillation import DistillFact, DistillOutput
     from bladex_core.fact import ConversationTurn
 
     seen: list[str] = []
@@ -267,7 +266,7 @@ def test_consolidator_strips_envelope_and_keeps_conclusion():
 def test_consolidator_conclusion_collected_once_per_turn():
     """一轮多条 user 消息时，结论不得按消息数重复收。"""
     from bladex_core.consolidation_proxy import ProxyConsolidator
-    from bladex_core.distillation import DistillOutput, DistillFact
+    from bladex_core.distillation import DistillFact, DistillOutput
     from bladex_core.fact import ConversationTurn
 
     class _Distiller:

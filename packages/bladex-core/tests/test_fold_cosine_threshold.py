@@ -19,7 +19,6 @@ from __future__ import annotations
 import math
 
 import pytest
-
 from bladex_core.fusion import (
     FOLD_COSINE,
     Channel,

@@ -13,15 +13,11 @@
 """
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
-
 from bladex_proxy.capture import CaptureResult
 from bladex_proxy.models import Identity, ToolEvent, Turn
 from bladex_proxy.responses import responses_stream_generator
 from bladex_proxy.storage.pipeline_worker import enrich_tool_results
-
 
 # ── Bug A: generator 填 tool_call_id ─────────────────────────────────────
 

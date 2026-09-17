@@ -100,9 +100,8 @@ def test_facade_keeps_every_pre_split_name(modname: str, names: list[str], expec
 
 
 def test_server_app_is_the_fastapi_instance_and_factory_is_not_named_app() -> None:
-    from fastapi import FastAPI
-
     from bladex_proxy import server
+    from fastapi import FastAPI
 
     assert isinstance(server.app, FastAPI), "uvicorn 入口 `bladex_proxy.server:app` 必须是 FastAPI 实例"
     pkg_dir = Path(server.__file__).parent

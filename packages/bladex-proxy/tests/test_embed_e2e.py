@@ -12,7 +12,6 @@ import asyncio
 import os
 
 import pytest
-
 from bladex_proxy.embed_client import IPCEmbedAdapter
 from bladex_proxy.embed_server import EmbedService, run_server
 

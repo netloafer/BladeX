@@ -26,10 +26,10 @@ import hashlib
 import logging
 import re
 import unicodedata
-from datetime import UTC, datetime
-from enum import Enum
 from collections import Counter
 from collections.abc import Callable
+from datetime import UTC, datetime
+from enum import Enum
 from typing import Protocol
 
 from pydantic import BaseModel, Field

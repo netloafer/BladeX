@@ -17,16 +17,13 @@
 from __future__ import annotations
 
 import pytest
-
 from bladex_core.envelope import strip_envelopes
-
 from bladex_proxy.agency import (
     ABOUT_BLOCK_CLOSE,
     ABOUT_BLOCK_OPEN,
     INJECTION_MARKERS,
     load_system_notes,
 )
-
 
 # ── ① 注入标记 ⇒ 剥离落点（机制化对账）──────────────────────────────────────
 

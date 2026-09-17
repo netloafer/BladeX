@@ -6,6 +6,7 @@ api_key_env 缺失 → warning + 标不可用；策略引用未知模型 → war
 
 from __future__ import annotations
 
+import pytest
 from bladex_core.routing import (
     AgentStrategyData,
     FilterStrategyData,
@@ -13,7 +14,6 @@ from bladex_core.routing import (
     MultimodalStrategyData,
     RequestStrategyData,
 )
-import pytest
 from bladex_proxy.routing_config import RoutingConfig, RoutingConfigError
 
 _SAMPLE_TOML = """

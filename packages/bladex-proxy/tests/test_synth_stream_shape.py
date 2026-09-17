@@ -26,7 +26,6 @@ from __future__ import annotations
 import json
 
 import pytest
-
 from bladex_proxy.agency import (
     _synth_anthropic_text_events,
     _synth_responses_text_events,

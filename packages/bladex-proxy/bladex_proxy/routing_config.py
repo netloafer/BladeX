@@ -412,16 +412,16 @@ class RoutingConfig(BaseModel):
         )
         if looks_like_env:
             detail += (
-                f"  说明：该值形如环境变量名。`api_base` 字段**只接受字面 URL，不做环境变量解析**——\n"
-                f"        这一点与 `api_key_env` 不同（后者存的是变量名）。\n"
+                "  说明：该值形如环境变量名。`api_base` 字段**只接受字面 URL，不做环境变量解析**——\n"
+                "        这一点与 `api_key_env` 不同（后者存的是变量名）。\n"
             )
         raise RoutingConfigError(
             f"{what}: api_base 不是合法 URL，拒绝启动。\n"
             + detail
             + "  两种正确写法（二选一）：\n"
-            f'    ① 字面 URL：    api_base = "https://api.example.com/v1"\n'
-            f'    ② 引用环境变量：api_base_env = "BLADEX_UPSTREAM_API_BASE"\n'
-            f"       （同时配置时 api_base_env 优先）"
+            '    ① 字面 URL：    api_base = "https://api.example.com/v1"\n'
+            '    ② 引用环境变量：api_base_env = "BLADEX_UPSTREAM_API_BASE"\n'
+            "       （同时配置时 api_base_env 优先）"
         )
 
     def _resolve_api_keys(self) -> None:

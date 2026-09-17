@@ -12,7 +12,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from bladex_proxy.modules import MODULE_SPECS, module_enabled, validate_modules
 
 _PKG = Path(__file__).resolve().parents[1] / "bladex_proxy"
@@ -89,10 +88,9 @@ class TestCliExportGate:
 class TestAdminReadGate:
     @staticmethod
     def _client(monkeypatch):
-        from fastapi.testclient import TestClient
-
         from bladex_proxy.config import ProxyConfig
         from bladex_proxy.server import create_app
+        from fastapi.testclient import TestClient
         monkeypatch.setenv("BLADEX_AUTH_ENABLED", "false")
         return TestClient(create_app(ProxyConfig()))
 

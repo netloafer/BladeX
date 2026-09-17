@@ -35,10 +35,11 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+
 from pydantic import BaseModel, Field
 
-from .flash import LOCAL_SUFFIX, safe_component, scope_dir, SCOPE_PERSONAL
+from .flash import LOCAL_SUFFIX, SCOPE_PERSONAL, safe_component, scope_dir
 
 logger = logging.getLogger(__name__)
 
@@ -191,7 +192,7 @@ def _parse_iso(ts: str) -> datetime | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)   # naive 串按 UTC 解（与 iso_ms 同判）
+        dt = dt.replace(tzinfo=UTC)   # naive 串按 UTC 解（与 iso_ms 同判）
     return dt
 
 
@@ -211,7 +212,7 @@ def normalize_iso_utc(ts: str) -> str:
     """任意偏移的 ISO 串 → UTC `+00:00` 秒精度（存储/比较层的唯一形态）。
     空串 / 不合形**原样返回**（不伪造时间，让上层的 0.0 语义接手）。"""
     dt = _parse_iso(ts)
-    return dt.astimezone(timezone.utc).isoformat(timespec="seconds") if dt is not None else ts
+    return dt.astimezone(UTC).isoformat(timespec="seconds") if dt is not None else ts
 
 
 def local_iso(ts: str) -> str:
@@ -229,8 +230,8 @@ def new_ledger_id() -> str:
 
 def children_of(pool: dict[str, Ledger], parent_id: str) -> list[Ledger]:
     """父账本的子账本（从池派生，单一方向存储的读侧；按 updated_at 降序）。"""
-    kids = [l for l in pool.values() if l.parent_ledger_id == parent_id and parent_id]
-    kids.sort(key=lambda l: iso_ms(l.updated_at or l.created_at), reverse=True)
+    kids = [led for led in pool.values() if led.parent_ledger_id == parent_id and parent_id]
+    kids.sort(key=lambda led: iso_ms(led.updated_at or led.created_at), reverse=True)
     return kids
 
 

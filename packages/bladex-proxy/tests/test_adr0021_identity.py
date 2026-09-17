@@ -16,8 +16,8 @@ import pytest
 from bladex_proxy.identity import resolve_identity
 from bladex_proxy.identity_registry import IdentityRegistry
 from bladex_proxy.models import ChatCompletionRequest
-from bladex_proxy.storage.memory_index import MemoryIndex
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_index import MemoryIndex
 
 
 class _MockEmbedder:

@@ -17,7 +17,6 @@ import asyncio
 import pathlib
 
 import pytest
-
 from bladex_core.ledger import ACTOR_MODEL, Ledger, LedgerEntry, add_entry
 from bladex_core.ledger_runtime import UPDATE_OPS, activation_scope
 from bladex_proxy.agency import AgencyRuntime

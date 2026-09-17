@@ -24,7 +24,6 @@ from pathlib import Path
 
 import bladex_proxy.cli.lifecycle as L
 
-
 # ── MQ-L61：配置错误不许被降级成"索引不可用" ────────────────────────────────
 
 

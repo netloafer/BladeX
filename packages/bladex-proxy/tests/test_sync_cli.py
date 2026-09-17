@@ -6,15 +6,14 @@ Memory Index 产出 fact + 日志文件落盘。embedder/蒸馏自举打桩（�
 
 from __future__ import annotations
 
-import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from bladex_proxy import cli
 from bladex_proxy.models import Identity, Turn, TurnStatus
-from bladex_proxy.storage.memory_index import MemoryIndex
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_index import MemoryIndex
 
 
 class MockEmbedder:

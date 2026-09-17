@@ -1,6 +1,6 @@
 [project]
 name = "bladex-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "BladeX MCP server - expose the personal memory layer (facts / matters / hard rules) to MCP clients via the proxy admin API."
 requires-python = ">=3.11"
 dependencies = [

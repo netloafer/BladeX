@@ -38,7 +38,6 @@ from bladex_core.attribution import (
     new_matter_id,
 )
 
-
 # ── 1. 重建等价性 ──────────────────────────────────────────────────────────
 
 

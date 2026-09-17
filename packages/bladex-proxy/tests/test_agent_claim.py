@@ -12,7 +12,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-
 from bladex_proxy.agent_rules import (
     append_user_rule,
     load_agent_rules,
@@ -200,10 +199,9 @@ def test_matter_id_left_empty_on_claim_events() -> None:
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
-
     from bladex_proxy.agent_registry import _agent_registry
     from bladex_proxy.server import create_app
+    from fastapi.testclient import TestClient
 
     _agent_registry.clear()
     app = create_app()
@@ -618,11 +616,10 @@ def test_agent_detail_endpoint_reports_what_the_agent_did(tmp_path: Path) -> Non
 
     用真 Memory Hub：详情靠 `keys_for_agent()` + 抽样 `get()`，替身测不到。
     """
-    from fastapi.testclient import TestClient
-
     from bladex_proxy.models import Identity, Turn, TurnStatus
     from bladex_proxy.server import create_app
     from bladex_proxy.storage.memory_hub import MemoryHub
+    from fastapi.testclient import TestClient
 
     ledger = MemoryHub(tmp_path / "ledger")
     ledger.open()
@@ -763,10 +760,9 @@ def test_bucket_survives_restart_via_ledger(tmp_path: Path) -> None:
     没有这条，管理页只在"本次启动以来恰好来过"时才有东西——大多数时候是空的，
     等于没有管理接口；而已经发生过的误署名更是永远无从处理。
     """
-    from fastapi.testclient import TestClient
-
     from bladex_proxy.agent_registry import _agent_registry
     from bladex_proxy.server import create_app
+    from fastapi.testclient import TestClient
 
     ledger = _seeded_ledger(tmp_path)
     app = create_app()
@@ -798,12 +794,11 @@ def test_known_list_folds_profiles_and_sorts_legacy_last(tmp_path: Path) -> None
       · `a` / `test-agent` / `tool-test` 这些测试残留和真 agent 混排；
       · 裸 `unknown`（G11.9 之前的共用桶）被当成"已知 agent"。
     """
-    from fastapi.testclient import TestClient
-
     from bladex_proxy.agent_registry import _agent_registry
     from bladex_proxy.models import Identity, Turn, TurnStatus
     from bladex_proxy.server import create_app
     from bladex_proxy.storage.memory_hub import MemoryHub
+    from fastapi.testclient import TestClient
 
     ledger = MemoryHub(tmp_path / "ledger")
     ledger.open()
@@ -851,12 +846,11 @@ def test_claim_target_inherits_the_bucket_turn_count(tmp_path: Path) -> None:
     那几轮记忆下次重建就归 Pi 了，说它 0 轮等于告诉用户认领没生效
     （Jason 2026-08-19 追问"为什么已知里有 Pi"时暴露）。
     """
-    from fastapi.testclient import TestClient
-
     from bladex_proxy.agent_registry import _agent_registry
     from bladex_proxy.models import Identity, Turn, TurnStatus
     from bladex_proxy.server import create_app
     from bladex_proxy.storage.memory_hub import MemoryHub
+    from fastapi.testclient import TestClient
 
     ledger = MemoryHub(tmp_path / "ledger")
     ledger.open()
@@ -890,10 +884,9 @@ def test_claim_target_inherits_the_bucket_turn_count(tmp_path: Path) -> None:
 
 def test_claimed_bucket_stays_gone_after_restart(tmp_path: Path) -> None:
     """认领过的桶不得因为重启又冒出来——认领是 journal 里的事实，不是进程内记忆。"""
-    from fastapi.testclient import TestClient
-
     from bladex_proxy.agent_registry import _agent_registry
     from bladex_proxy.server import create_app
+    from fastapi.testclient import TestClient
 
     ledger = _seeded_ledger(tmp_path)
     app = create_app()

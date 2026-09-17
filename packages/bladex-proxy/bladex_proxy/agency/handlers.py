@@ -13,18 +13,28 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
+from bladex_core.flags import flag_number
 from bladex_core.ledger import (
-    ACTOR_MODEL, Ledger, LedgerEntry, LedgerError, add_entry, new_ledger, render_ledger_md
+    ACTOR_MODEL,
+    Ledger,
+    LedgerEntry,
+    LedgerError,
+    add_entry,
+    new_ledger,
+    render_ledger_md,
 )
 from bladex_core.ledger_runtime import (
-    activation_scope, apply_tool_update, bind_matter, ledger_anchor_matter_id,
-    update_edit_ops, update_is_add_only
+    activation_scope,
+    apply_tool_update,
+    bind_matter,
+    ledger_anchor_matter_id,
+    update_edit_ops,
+    update_is_add_only,
 )
-from bladex_core.flags import flag_number
 from bladex_core.sensitivity import exposure_allows
 
-from bladex_proxy.models import AdminEventType
 from bladex_proxy.agency.notes import _machine_text_mark
+from bladex_proxy.models import AdminEventType
 
 logger = structlog.get_logger()
 
@@ -223,8 +233,8 @@ class ToolFaceHandlersMixin:
             import datetime as _dt
             ts = _dt.datetime.fromisoformat(led.updated_at)
             if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=_dt.timezone.utc)
-            age_s = (_dt.datetime.now(_dt.timezone.utc) - ts).total_seconds()
+                ts = ts.replace(tzinfo=_dt.UTC)
+            age_s = (_dt.datetime.now(_dt.UTC) - ts).total_seconds()
         except ValueError:
             return ""
         if age_s < 0 or age_s > window:

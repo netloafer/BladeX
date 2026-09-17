@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import pytest
-
 from bladex_proxy.agent_registry import _agent_registry
 from bladex_proxy.identity import _session_cache, resolve_identity
 from bladex_proxy.models import AgentSource, ChatCompletionRequest

@@ -22,7 +22,6 @@ import pytest
 from bladex_core import funnel as F
 from bladex_proxy.metrics import Metrics
 
-
 # ── 1. 共享词汇表：名字只许有一处定义 ─────────────────────────────────────
 
 
@@ -298,7 +297,7 @@ def test_consolidator_metrics_serves_and_shuts_down():
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5) as r:
             body = r.read().decode()
         assert F.FUNNEL_STORED in body
-        with pytest.raises(Exception):
+        with pytest.raises(urllib.error.HTTPError):
             urllib.request.urlopen(f"http://127.0.0.1:{port}/nope", timeout=5)
     finally:
         server.shutdown()

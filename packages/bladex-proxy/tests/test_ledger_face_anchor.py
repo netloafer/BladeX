@@ -31,9 +31,8 @@ from __future__ import annotations
 
 import pathlib
 
-from bladex_proxy.models import Turn
-
 from _source_probe import package_source, source_of
+from bladex_proxy.models import Turn
 
 #: 包源码目录。**按路径读文本，不 import** —— `memory_index` 需要 rocksdict、
 #: `server` 需要 fastapi/litellm，而本组测的全是**源码写法**，不该被 native

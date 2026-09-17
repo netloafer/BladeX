@@ -21,14 +21,11 @@ import json
 from typing import Any
 
 import pytest
-
 from bladex_core.adjudication import AdjudicationInput, AdjudicationOp
-from bladex_core.distillation import DistillFact
 from bladex_core.distill_fidelity import TAG_LANG_DRIFT, mark_language_drift
-
+from bladex_core.distillation import DistillFact
 from bladex_proxy import adjudicator as adj_mod
 from bladex_proxy.adjudicator import LLMAdjudicator
-
 
 # ══════════════════════════════════════════════════════════════════════════
 # ① 保真层 × 真 DistillFact

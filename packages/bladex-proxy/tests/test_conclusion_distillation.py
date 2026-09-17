@@ -19,8 +19,8 @@ from bladex_core.distillation import (
 from bladex_core.fact import ConversationTurn
 from bladex_proxy.distillation import CONCLUSION_PROMPT_VER, PROMPT_VER, LLMDistiller
 from bladex_proxy.models import Identity, ToolEvent, Turn, TurnStatus
-from bladex_proxy.storage.memory_index import MemoryIndex
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_index import MemoryIndex
 
 
 class MockEmbedder:

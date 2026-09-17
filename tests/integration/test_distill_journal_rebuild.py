@@ -14,8 +14,8 @@ from pathlib import Path
 import pytest
 from bladex_proxy.distillation import LLMDistiller
 from bladex_proxy.models import Identity, Turn, TurnStatus
-from bladex_proxy.storage.memory_index import MemoryIndex, IndexDistillJournal
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_index import IndexDistillJournal, MemoryIndex
 
 
 class _FakeMessage:

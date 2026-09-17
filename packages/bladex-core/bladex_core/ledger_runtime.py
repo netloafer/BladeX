@@ -34,10 +34,14 @@ from .ledger import (
     LedgerEntry,
     LedgerError,
     add_entry,
-    iso_ms,   # 定义已搬到 ledger.py（渲染/排序同用）；这里保留导出名给既有调用方
     remove_entry,
     revise_goal,
 )
+
+# iso_ms 定义已搬到 ledger.py（渲染/排序同用）；这里保留导出名给既有调用方。
+# `as iso_ms` 冗余别名 = 显式再导出，ruff F401 不再当未用 import 删掉（批 O 自动修曾删过一次，
+# test_ledger.py / test_ledger_gate.py / probe_cont_head_layer.py 三处调用方当场红）。
+from .ledger import iso_ms as iso_ms
 
 # 数值默认经 flags 单一真相源（BLADEX_LEDGER_SWITCH_DEBOUNCE / BLADEX_LEDGER_STALE_TURNS）。
 

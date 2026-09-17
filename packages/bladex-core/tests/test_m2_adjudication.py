@@ -13,12 +13,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-
 from bladex_core.adjudication import (
-    AdjudicationInput,
     AdjudicationOp,
     AdjudicationVerdict,
-    NeighborFact,
     apply_verdict,
     build_input,
     fast_path_verdict,

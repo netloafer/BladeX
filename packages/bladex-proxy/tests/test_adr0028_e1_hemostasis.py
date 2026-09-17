@@ -19,7 +19,6 @@ from bladex_core.matter import Matter, MatterStatus
 from bladex_proxy.models import ToolEvent
 from bladex_proxy.storage.memory_index import MemoryIndex, _extract_file_refs
 
-
 # ── E1.1 Matter summary 守卫 ───────────────────────────────────────
 
 

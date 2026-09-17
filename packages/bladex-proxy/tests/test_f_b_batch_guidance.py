@@ -21,7 +21,6 @@ from __future__ import annotations
 import pathlib
 
 import pytest
-
 from bladex_proxy.toolface import TOOL_SCHEMAS
 
 _ASSETS = pathlib.Path(__file__).resolve().parents[1] / "bladex_proxy" / "assets" / "system"

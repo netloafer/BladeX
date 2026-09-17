@@ -31,13 +31,11 @@ live 读数（`codex:guardian`，600 轮）：
 from __future__ import annotations
 
 import pytest
-
 from bladex_core.envelope import (
     ENVELOPE_KINDS,
     ENVELOPE_MAX_OFFSET,
     strip_envelopes,
 )
-
 from bladex_proxy.identity import (
     _AUX_USER_PATTERNS,
     _ENVELOPE_MAX_OFFSET,

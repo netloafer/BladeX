@@ -26,7 +26,6 @@ rebuild 时随库重建。file_ref 不入（与 E1.3 同边界——裸路径不
 
 from __future__ import annotations
 
-import os
 import re
 import sqlite3
 from pathlib import Path

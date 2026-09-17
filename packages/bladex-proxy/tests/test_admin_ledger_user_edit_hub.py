@@ -17,8 +17,6 @@ import json
 import os
 
 import structlog.testing
-from fastapi.testclient import TestClient
-
 from bladex_core.ledger import (
     EVENT_LEDGER_CREATE,
     EVENT_LEDGER_USER_EDIT,
@@ -32,6 +30,7 @@ from bladex_proxy.config import ProxyConfig
 from bladex_proxy.flash_daemon import FlashDaemon
 from bladex_proxy.models import AdminEventType
 from bladex_proxy.server import create_app
+from fastapi.testclient import TestClient
 
 
 class _Ev:

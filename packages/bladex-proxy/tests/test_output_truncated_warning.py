@@ -30,7 +30,6 @@ from unittest.mock import patch
 
 import pytest
 import structlog.testing
-
 from bladex_proxy.capture import OUTPUT_TRUNCATED_REASONS, output_truncated
 from bladex_proxy.config import ProxyConfig
 from bladex_proxy.server import create_app

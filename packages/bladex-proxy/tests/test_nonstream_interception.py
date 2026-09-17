@@ -27,7 +27,6 @@ import json
 from types import SimpleNamespace
 
 import pytest
-
 from bladex_proxy import server as srv
 
 BLADEX_CALL = {"id": "call_bx1", "type": "function",

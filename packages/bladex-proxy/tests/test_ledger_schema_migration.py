@@ -17,7 +17,6 @@ import sys
 
 import msgpack
 import rocksdict
-
 from bladex_proxy.models import Identity, ReconstructionRecord, Turn, TurnStatus
 
 # 迁移脚本按文件路径加载（scripts/ 非包）

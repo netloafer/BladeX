@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import structlog.testing
-
 from bladex_core.ledger import new_ledger
 from bladex_proxy.agency import AgencyRuntime
 
@@ -201,10 +200,12 @@ def test_user_face_block_is_byte_identical_to_before(monkeypatch):
     那会让 G16.3 的判据归因不了（"两边同时改了"）。
     """
     _on(monkeypatch)
-    ag1 = AgencyRuntime(); _seed(ag1)
+    ag1 = AgencyRuntime()
+    _seed(ag1)
     monkeypatch.setenv("BLADEX_LEDGER_FACE_SPLIT", "1")
     on = _block(ag1, [_SYS, _USER], session="s-on")
-    ag2 = AgencyRuntime(); _seed(ag2)
+    ag2 = AgencyRuntime()
+    _seed(ag2)
     monkeypatch.setenv("BLADEX_LEDGER_FACE_SPLIT", "0")
     off = _block(ag2, [_SYS, _USER], session="s-off")
     assert on == off

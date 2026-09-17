@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import pytest
-
 from bladex_core.task_unit import (
     TaskUnitStatus,
     build_task_units,

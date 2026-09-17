@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import pytest
 import structlog.testing
-
 from bladex_proxy.onboarding import _MAX_SEEN, note_onboarding, onboarding_gaps, reset_seen
 
 

@@ -141,7 +141,7 @@ def test_progress_tolerates_distiller_without_capability():
 
 def test_distill_only_aux_rules_are_declared_separately():
     """T3 的信封指纹必须与 Hermes 原生 aux 规则分开——前者不该整轮丢。"""
-    from bladex_proxy.identity import DISTILL_ONLY_AUX_RULES, _AUX_USER_PATTERNS
+    from bladex_proxy.identity import _AUX_USER_PATTERNS, DISTILL_ONLY_AUX_RULES
 
     # 全集 = 模式表规则 + 结构化规则（U3 的 hermes_transcript_replay 用
     # "User:…\n\nAssistant:" 结构匹配、有意不进 _AUX_USER_PATTERNS——

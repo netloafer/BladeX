@@ -13,11 +13,11 @@ from __future__ import annotations
 import hashlib
 import tempfile
 
+from bladex_core.consolidation_proxy import ProxyConsolidator
 from bladex_proxy.storage.memory_index import (
     MemoryIndex,
     _LanceDBNoveltyChecker,
 )
-from bladex_core.consolidation_proxy import ProxyConsolidator
 
 
 class _HashEmbedder:
@@ -70,8 +70,9 @@ def _make_index(tmpdir: str, **kw) -> MemoryIndex:
 
 def _add_fact(index: MemoryIndex, content: str, entities: list[str], embedding: list[float]) -> None:
     """直接构造 Fact 写入 Memory Index（绕过 distiller，用给定 embedding）。"""
-    from bladex_core.fact import Fact
     import uuid
+
+    from bladex_core.fact import Fact
     f = Fact(
         id=f"fact-{uuid.uuid4().hex[:8]}",
         content=content,

@@ -124,8 +124,6 @@ class TestAdminEventApply:
     def test_matter_id_stays_empty_per_mq_a7(self):
         """MQ-A7 护栏：新事件类型 target 走 payload 不占 matter_id
         （MQ-V9：源码断言按路径读文本，不用 inspect.getsource）。"""
-        import os
-        import bladex_proxy as _pkg
         from bladex_proxy.models import AdminEventType
         assert AdminEventType.AUDIENCE_SET.value == "audience_set"
         from _source_probe import package_source

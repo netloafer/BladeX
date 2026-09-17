@@ -205,8 +205,13 @@ def test_looks_like_path_has_one_definition():
     """🔴 守卫：全仓只剩一个定义点（探针 import，不留副本）。"""
     root = pathlib.Path(__file__).resolve().parents[3]
     pat = re.compile(r"^def looks_like_path\(", re.M)
+    # 生成物不算定义点：public-tree/ 是 build_public_tree.py 的输出（私仓源码的复印件，
+    # 09-18 批 O gate 实跑被它红过一次），.venv/ 是安装产物。
+    # 🔴 按**相对仓库根**的路径排除——公开树自己就住在 <私仓>/public-tree/ 下，
+    # 按绝对路径的 parts 排会把公开树里所有文件排光（公开树自测 0 命中，同日第二次红）。
+    skip = {"__pycache__", "archive", "public-tree", ".venv"}
     hits = [p for p in root.rglob("*.py")
-            if "__pycache__" not in p.parts and "archive" not in p.parts
+            if not (skip & set(p.relative_to(root).parts))
             and pat.search(p.read_text(encoding="utf-8", errors="ignore"))]
     assert len(hits) == 1, f"两份判据迟早分叉：{[str(p) for p in hits]}"
     assert hits[0].name == "ledger_runtime.py"

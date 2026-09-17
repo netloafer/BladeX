@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import structlog.testing
-
 from bladex_core.ledger import ACTOR_MODEL, LedgerEntry, add_entry, new_ledger
 from bladex_proxy.models import LedgerAnchor, ToolEvent
 from bladex_proxy.server.orchestration import _ledger_next_referenced

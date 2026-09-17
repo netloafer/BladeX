@@ -17,7 +17,11 @@
 from __future__ import annotations
 
 from bladex_core.ledger import (
-    ACTOR_MODEL, LedgerEntry, add_entry, new_ledger, parse_ledger_md,
+    ACTOR_MODEL,
+    LedgerEntry,
+    add_entry,
+    new_ledger,
+    parse_ledger_md,
     render_ledger_md,
 )
 

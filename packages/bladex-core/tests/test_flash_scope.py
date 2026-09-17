@@ -19,9 +19,7 @@
 from __future__ import annotations
 
 import pytest
-
 from bladex_core import flash
-
 
 # ── 1. 作用域映射 ──────────────────────────────────────────────────────────
 

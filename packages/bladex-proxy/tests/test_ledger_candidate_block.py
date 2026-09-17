@@ -14,7 +14,6 @@ import asyncio
 import json
 
 import structlog.testing
-
 from bladex_core.ledger import new_ledger
 from bladex_proxy.agency import _MATCHING_LEDGERS_HEADER, AgencyRuntime
 
@@ -85,7 +84,7 @@ def test_no_match_renders_exactly_the_old_block(monkeypatch):
     new = ag.insert_ledger_block(msgs, "hermes:default", tier="medium",
                                  with_instruction=True)[-1]["content"]
     # 修前形态 = 相关性函数恒空时的渲染
-    import bladex_proxy.agency.runtime as agency_mod   # F0.1 拆包：消费方 ledger_injection_message 在 runtime.py
+    import bladex_proxy.agency.runtime as agency_mod  # F0.1 拆包：消费方 ledger_injection_message 在 runtime.py
     monkeypatch.setattr(agency_mod, "relevant_ledgers", lambda *a, **k: [])
     old = ag.insert_ledger_block(msgs, "hermes:default", tier="medium",
                                  with_instruction=True)[-1]["content"]
@@ -181,10 +180,9 @@ def _app(monkeypatch):
     import tempfile
     from unittest.mock import patch
 
-    from fastapi.testclient import TestClient
-
     from bladex_proxy.config import ProxyConfig
     from bladex_proxy.server import create_app
+    from fastapi.testclient import TestClient
     _on(monkeypatch)
     cfg = ProxyConfig(hard_rules=[], upstream_model="openai/test", upstream_api_key="sk-fake",
                       rocksdb_path=f"{tempfile.mkdtemp()}/rocksdb")

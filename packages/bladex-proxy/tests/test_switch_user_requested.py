@@ -16,7 +16,6 @@ import json
 import pathlib
 
 import structlog.testing
-
 from bladex_core.ledger import new_ledger
 from bladex_proxy.agency import USER_NAMED_TITLE_MIN_CHARS, AgencyRuntime, _user_named_ledger
 

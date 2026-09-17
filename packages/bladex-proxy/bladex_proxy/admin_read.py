@@ -23,8 +23,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .metrics import DEGRADATION
-from .storage.memory_index import MemoryIndex
 from .storage.memory_hub import MemoryHub
+from .storage.memory_index import MemoryIndex
 from .sync_control import HEARTBEAT_KEY, JOB_PREFIX, LAST_JOB_KEY
 
 logger = structlog.get_logger()
@@ -195,12 +195,12 @@ def _declared_env(root: Path | None = None) -> dict[str, str]:
 def _memory_config(cfg: Any) -> dict[str, Any]:  # noqa: ANN401
     """进程**实际生效**的记忆配置 + 与 .env 声明的漂移清单。"""
     from bladex_core.flags import (
+        MAX_PREFETCH_K,
         MEMORY_FLAG_DEFAULTS,
         MEMORY_NUMERIC_DEFAULTS,
         flag_enabled,
         flag_number,
     )
-    from bladex_core.flags import MAX_PREFETCH_K
 
     effective: dict[str, Any] = {
         "BLADEX_HOTPATH_BUDGET_MS": int(getattr(cfg, "hotpath_budget_ms", 0)),

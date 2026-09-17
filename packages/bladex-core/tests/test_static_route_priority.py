@@ -12,11 +12,10 @@
 from __future__ import annotations
 
 import pytest
-
 from bladex_core.routing import (
-    AgentStrategyData,
     _DYNAMIC_SOURCES,
     _STATIC_SOURCES,
+    AgentStrategyData,
     MemoryAwareRouter,
     ModelCandidate,
     RouteSource,
@@ -119,7 +118,7 @@ async def test_auxiliary_still_works_without_static_config():
 @pytest.mark.asyncio
 async def test_agent_strategy_beats_scale_floor():
     """超大上下文本会抬到 strong，但 agent 策略已钉死 glm-5.2 → 不得改写。"""
-    from bladex_core.routing import AgentStrategyData, ScaleStrategyData
+    from bladex_core.routing import ScaleStrategyData
 
     r = _router(scale=ScaleStrategyData(
         enabled=True, thresholds={"strong": 1000}))
@@ -134,7 +133,7 @@ async def test_agent_strategy_beats_scale_floor():
 @pytest.mark.asyncio
 async def test_agent_strategy_beats_sticky():
     """上一轮粘住了别的模型，也不得改写 agent 策略的选择。"""
-    from bladex_core.routing import AgentStrategyData, StickyStrategyData
+    from bladex_core.routing import StickyStrategyData
 
     r = _router(sticky=StickyStrategyData(enabled=True))
     r.update_sticky("sess-1", "openai/strong-x")

@@ -30,8 +30,8 @@ from bladex_core.fact import Fact
 from bladex_core.matter import EdgeProvenance, Matter, MatterEdge, MatterOrigin
 
 from bladex_proxy.models import AdminEvent, AdminEventType
-from bladex_proxy.storage.memory_index import MemoryIndex
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_index import MemoryIndex
 
 logger = structlog.get_logger()
 

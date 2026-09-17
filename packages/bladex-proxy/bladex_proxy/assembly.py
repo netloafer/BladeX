@@ -27,10 +27,10 @@ import os
 from dataclasses import dataclass, field
 
 import structlog
-
-from bladex_proxy.modules import module_enabled
 from bladex_core.fact import Fact
 from bladex_core.task_unit import build_task_units, unit_indices
+
+from bladex_proxy.modules import module_enabled
 
 logger = structlog.get_logger()
 

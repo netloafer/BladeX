@@ -7,10 +7,7 @@
 
 from __future__ import annotations
 
-import types
-
 import pytest
-
 from bladex_core.consolidation_proxy import ProxyConsolidator
 
 

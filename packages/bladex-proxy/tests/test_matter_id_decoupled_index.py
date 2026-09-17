@@ -25,7 +25,6 @@ from bladex_core.attribution import (
 )
 from bladex_core.fact import Fact
 from bladex_core.matter import EdgeProvenance, EdgeTargetType, MatterEdge
-
 from bladex_proxy.storage.memory_index import MemoryIndex
 
 _TITLE = "泰山啤酒破产重整"

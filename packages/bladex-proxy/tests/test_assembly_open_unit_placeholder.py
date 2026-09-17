@@ -14,10 +14,9 @@
 
 from __future__ import annotations
 
-from structlog.testing import capture_logs
-
 from bladex_proxy.anthropic import _cache_read_tokens
 from bladex_proxy.assembly import AssemblyConfig, ContextAssembler, _placeholder
+from structlog.testing import capture_logs
 
 # ── 改动前（2026-08-28 之前）closed 路径的逐字输出，作为回归黄金值 ──
 _GOLDEN_CLOSED_EXCERPT = (

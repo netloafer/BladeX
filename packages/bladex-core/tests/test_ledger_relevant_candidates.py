@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import pytest
-
 from bladex_core.ledger import new_ledger
 from bladex_core.ledger_runtime import (
     _CANDIDATE_STOP,

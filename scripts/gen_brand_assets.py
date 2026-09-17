@@ -178,7 +178,7 @@ def build() -> None:
     write("bladex-app-icon.svg", doc(
         "BladeX app icon", "0 0 1024 1024",
         gradients("bx-app")
-        + f'  <rect width="1024" height="1024" rx="228" fill="#FFFFFF"/>\n'
+        + '  <rect width="1024" height="1024" rx="228" fill="#FFFFFF"/>\n'
         + placed_symbol((1024 - 594 * SYM_ASPECT) / 2, (1024 - 594) / 2, 594, "bx-app"),
         desc="Rounded-square app icon, light background."))
 
@@ -229,7 +229,7 @@ def build() -> None:
             # Live text: no reliable metrics, so estimate the advance and leave
             # 12% slack for the Helvetica/Arial fallback, which runs wider.
             tag_w = max(len(t) * 0.56 * size * cap
-                        for t, size in zip(taglines, (0.340, 0.226)))
+                        for t, size in zip(taglines, (0.340, 0.226), strict=False))
             w = max(w, word_x + tag_w * 1.12 + pad)
         baseline = h / 2 + cap / 2 if not taglines else h / 2 - 0.10 * cap
         body = f'  <rect width="{w:.0f}" height="{h:.0f}" fill="{bg}"/>\n' if bg else ""
@@ -242,7 +242,7 @@ def build() -> None:
         note = ""
         if taglines:
             for i, (t, fill, size, off) in enumerate(
-                    zip(taglines, tag_fills, (0.340, 0.226), (0.728, 1.253))):
+                    zip(taglines, tag_fills, (0.340, 0.226), (0.728, 1.253), strict=False)):
                 body += (f'  <text x="{word_x + 0.03 * cap:.1f}"'
                          f' y="{baseline + off * cap:.1f}" font-family="{FONT}"'
                          f' font-size="{size * cap:.1f}"'

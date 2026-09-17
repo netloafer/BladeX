@@ -147,7 +147,7 @@ _ENV_BLOCK = re.compile(
     r"<(environment_context|env)>(.*?)</\1>", re.S)
 
 #: 解析缓存（cwd -> ProjectIdentity）。进程生命期内 cwd 集合极小，不设逐出。
-_cache: dict[str, "ProjectIdentity"] = {}
+_cache: dict[str, ProjectIdentity] = {}
 
 
 @dataclass(frozen=True)

@@ -5,16 +5,16 @@ from __future__ import annotations
 import os
 
 from bladex_core.flash_tree import (
-    AgentRow,
-    LedgerRow,
-    MatterRow,
     MATTERS_GATED_MARK,
     PROJECT_GLOBAL_ID,
-    ProjectRow,
     SOURCE_EXPLICIT,
     SOURCE_GIT,
     SOURCE_GLOBAL,
     SOURCE_PATH,
+    AgentRow,
+    LedgerRow,
+    MatterRow,
+    ProjectRow,
     SessionRow,
     agents_roster_path,
     ledger_pool_relpath,
@@ -30,7 +30,6 @@ from bladex_core.flash_tree import (
     resolve_project_identity,
     sessions_roster_path,
 )
-
 
 # ── 项目识别键分层（红线 1）─────────────────────────────────────────────────
 

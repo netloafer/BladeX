@@ -25,7 +25,6 @@ from __future__ import annotations
 import time
 
 import pytest
-
 from bladex_core.routing import (
     FilterStrategyData,
     MemoryAwareRouter,

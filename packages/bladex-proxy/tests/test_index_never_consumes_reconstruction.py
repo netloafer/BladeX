@@ -12,8 +12,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from bladex_proxy.models import Identity, ReconstructionRecord, Turn, TurnStatus
-from bladex_proxy.storage.memory_index import MemoryIndex
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_index import MemoryIndex
 
 _CLARIFY = "[BladeX 澄清] 这里的『它』指代 T8b 的 ANN 索引任务（候选说明，可忽略）"
 _FP_TOKEN = "fingerprint-matter-m1-token"

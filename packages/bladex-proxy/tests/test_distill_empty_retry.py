@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from bladex_proxy import router_sdk
 import pytest
+from bladex_proxy import router_sdk
 from bladex_proxy.distillation import LLMDistiller
 
 

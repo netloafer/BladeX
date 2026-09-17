@@ -75,14 +75,16 @@ def main(argv: list[str] | None = None) -> int:
     root = (ROOT / a.index) if not os.path.isabs(a.index) else Path(a.index)
     ldir = root / "lancedb"
     if not ldir.exists():
-        print(f"没有 {ldir}"); return 2
+        print(f"没有 {ldir}")
+        return 2
     tables = sorted(p for p in ldir.glob("*.lance") if p.is_dir())
     print(f"Index {root} · lancedb 总 {_du(ldir)/1e6:.0f} MB")
     before = {t.name: table_stats(t) for t in tables}
     for n, s in before.items():
         print(f"  {n:16s} versions={s['versions']:5d} data_files={s['data_files']:5d} index_dirs={s['index_dirs']:4d} {s['bytes']/1e6:7.1f} MB")
     if not a.apply:
-        print("干跑结束（加 --apply 执行；先停 consolidator）"); return 0
+        print("干跑结束（加 --apply 执行；先停 consolidator）")
+        return 0
     import lancedb  # noqa: WPS433 —— 与 memory_index 同一依赖
     db = lancedb.connect(str(ldir))
     for t in tables:
@@ -90,7 +92,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             tbl = db.open_table(name)
         except Exception as e:  # noqa: BLE001
-            print(f"  {name}: 打不开（{e}），跳过"); continue
+            print(f"  {name}: 打不开（{e}），跳过")
+            continue
         rows = tbl.count_rows()
         used = vacuum_table(tbl, a.keep_seconds)
         after = table_stats(t)

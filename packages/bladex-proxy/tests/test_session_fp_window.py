@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import pytest
-
 from bladex_proxy.identity import _FpEpochWindow
 from bladex_proxy.models import ChatCompletionRequest
 

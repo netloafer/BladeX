@@ -13,11 +13,9 @@ from __future__ import annotations
 import math
 
 import pytest
-
 from bladex_core.consolidation_proxy import ProxyConsolidator
 from bladex_core.distill_fidelity import identifier_novelty_override
 from bladex_core.fact import ConversationTurn, Fact
-
 
 # ── 公共替身 ───────────────────────────────────────────────────────────────
 

@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import pytest
-
 from bladex_proxy.agency import AgencyRuntime
 from bladex_proxy.models import Turn
 from bladex_proxy.splice import SpliceLedger, SpliceRecord

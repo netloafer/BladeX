@@ -6,6 +6,7 @@ agent 中立：不依赖 proxy 或任何 agent 的类型。
 
 from __future__ import annotations
 
+import re as _re
 from datetime import UTC, datetime
 from enum import Enum
 
@@ -49,7 +50,7 @@ class Provenance(str, Enum):
 PROVENANCE_VALUES: frozenset[str] = frozenset(p.value for p in Provenance)
 
 
-def fact_lane(tags: str, item_kind: "ItemKind | str" = "") -> str:
+def fact_lane(tags: str, item_kind: ItemKind | str = "") -> str:
     """从 tags 读 lane 标记（M9 三条道：task / profile / tool；空 = 未标）。
 
     🔴 按逗号切开后**全串相等**，不做子串 `in` 判断——tags 是自由文本，
@@ -284,7 +285,6 @@ class HardRule(BaseModel):
 # 行事记录类（"小黑于某日重建 Pi 配置"）**有意不拦**——工作事实跨 agent
 # 共享正是价值，只有**定义性**人设事实（称呼/自称/人设配置）才该锁定来源。
 
-import re as _re
 
 #: 人设定义类判据（吃结构化字段不吃全文；判别力实测见 MQ-L27）。
 _PERSONA_PAT = _re.compile(r"称呼|昵称|人设|自称|打招呼")
@@ -300,7 +300,7 @@ def is_persona_fact(subject: str, attribute: str) -> bool:
     return bool(_PERSONA_PAT.search(joined)) and not _PERSONA_NEG.search(joined)
 
 
-def source_agent(fact: "Fact") -> str:
+def source_agent(fact: Fact) -> str:
     """从 fact 的来源 Hub key（`<principal>/<agent>/<sess>/<entry>`）解出
     来源 agent 的**完整 id（含 profile）**。解不出返回空串（不猜）。
 
@@ -314,7 +314,7 @@ def source_agent(fact: "Fact") -> str:
     return parts[1]
 
 
-def effective_audience(fact: "Fact") -> str:
+def effective_audience(fact: Fact) -> str:
     """注入面生效的 audience（MQ-L27 兜底派生）。
 
     已显式标注 → 原样；未标注（"all"）但是定义性人设事实 → 派生为

@@ -11,8 +11,9 @@ from typing import Any
 
 from bladex_core.distillation import DistillFact, MatterProposal
 from bladex_core.task_unit import TaskUnit
-from bladex_proxy.splice import SpliceRecord
 from pydantic import BaseModel, Field, field_validator
+
+from bladex_proxy.splice import SpliceRecord
 
 
 class SessionIdSource(str, Enum):

@@ -15,8 +15,6 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-import pytest
-
 from bladex_core.fact import Fact
 from bladex_proxy.storage.memory_index import MemoryIndex
 
@@ -71,7 +69,7 @@ def test_rerank_promotes_entity_hit_over_pure_cosine(monkeypatch):
     ADR-0027 §5.4：软打分（BLADEX_SOFT_SCORING）自 2026-08-04 起默认开，而它**取代**
     T8a 的 entity 重排（同一批候选走五信号融合排序）。本卡测的是 T8a 那条路径，
     所以显式关掉软打分——两条路径都要保留可测性。
-    
+
     """
     monkeypatch.setenv("BLADEX_SOFT_SCORING", "0")
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -192,7 +190,10 @@ def test_get_facts_for_matter_orders_by_manual_then_weight():
     manual 边优先于 auto；同 provenance 内 weight 高的优先。
     """
     from bladex_core.matter import (
-        Matter, MatterEdge, EdgeTargetType, EdgeProvenance,
+        EdgeProvenance,
+        EdgeTargetType,
+        Matter,
+        MatterEdge,
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:

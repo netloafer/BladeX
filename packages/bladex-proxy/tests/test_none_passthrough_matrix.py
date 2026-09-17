@@ -45,13 +45,11 @@
 """
 from __future__ import annotations
 
-import json
 import re
 import tempfile
 from unittest.mock import patch
 
 import pytest
-
 from bladex_proxy.config import ProxyConfig
 from bladex_proxy.server import create_app
 from fastapi.testclient import TestClient

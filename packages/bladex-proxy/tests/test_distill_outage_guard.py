@@ -28,6 +28,7 @@ import pytest
 from bladex_core.consolidation_proxy import ProxyConsolidator
 from bladex_core.distillation import DistillOutput
 from bladex_proxy.models import Identity, Turn, TurnStatus
+from bladex_proxy.storage.memory_hub import MemoryHub
 from bladex_proxy.storage.memory_index import (
     _DISTILL_OUTAGE_ABORT_RATIO_DEFAULT,
     _DISTILL_OUTAGE_ABORT_RATIO_ENV,
@@ -35,7 +36,6 @@ from bladex_proxy.storage.memory_index import (
     _distill_delta,
     _distill_outage_abort_ratio,
 )
-from bladex_proxy.storage.memory_hub import MemoryHub
 
 
 class MockEmbedder:

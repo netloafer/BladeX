@@ -18,7 +18,6 @@ import pathlib
 import tempfile
 
 import pytest
-
 from bladex_proxy.routing_config import RoutingConfig, RoutingConfigError
 
 _BASE = '[[models]]\nname = "openai/x"\ntier = "weak"\n'

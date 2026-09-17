@@ -15,32 +15,48 @@ import time
 from typing import Any
 
 import structlog
-from fastapi import Request, status
-from fastapi.responses import JSONResponse
 from bladex_core.fact import Fact
 from bladex_core.task_unit import TaskUnit, build_task_units, derive_turn_metadata
+from fastapi import Request
+from fastapi.responses import JSONResponse
 
+from bladex_proxy import metrics as metrics_mod
+from bladex_proxy import onboarding as _onb
 from bladex_proxy.assembly import estimate_context_chars
 from bladex_proxy.capture import CaptureResult, output_truncated
 from bladex_proxy.config import ModelRoute, ProxyConfig
 from bladex_proxy.identity import (
-    AUX_REASON_ISOLATED, AUX_REASON_NO_TOOLS, AUX_REASON_SOURCE, AUX_REASON_SUBAGENT,
-    LEDGER_ONLY_AUX_REASONS, is_cheap_tier_auxiliary, brings_no_tools, is_ledgerless_auxiliary,
-    is_isolated_subcall, resolve_identity
+    AUX_REASON_ISOLATED,
+    AUX_REASON_NO_TOOLS,
+    AUX_REASON_SOURCE,
+    AUX_REASON_SUBAGENT,
+    LEDGER_ONLY_AUX_REASONS,
+    brings_no_tools,
+    is_cheap_tier_auxiliary,
+    is_isolated_subcall,
+    is_ledgerless_auxiliary,
+    resolve_identity,
 )
-from bladex_proxy import onboarding as _onb
 from bladex_proxy.inject import detect_required_capabilities, do_inject_async
-from bladex_proxy.project_identity import extract_cwd
-from bladex_proxy import metrics as metrics_mod
 from bladex_proxy.metrics import Metrics
-from bladex_proxy.modules import module_enabled
 from bladex_proxy.models import (
-    AgentSource, ChatCompletionRequest, DecisionMeta, Identity, LedgerAnchor,
-    ReconstructionRecord, RequestParams, ResponseMeta, ToolEvent, Turn, TurnStatus
+    AgentSource,
+    ChatCompletionRequest,
+    DecisionMeta,
+    Identity,
+    LedgerAnchor,
+    ReconstructionRecord,
+    RequestParams,
+    ResponseMeta,
+    ToolEvent,
+    Turn,
+    TurnStatus,
 )
+from bladex_proxy.modules import module_enabled
+from bladex_proxy.project_identity import extract_cwd
 from bladex_proxy.route import NoCapableCandidateError, call_model, make_success_hook, resolve_route
-from bladex_proxy.storage.pipeline_redis import DiskSpill, PipelineRedis
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.pipeline_redis import DiskSpill, PipelineRedis
 from bladex_proxy.storage.pipeline_worker import PipelineWorker
 
 logger = structlog.get_logger()
@@ -618,6 +634,7 @@ def _ledger_next_referenced(request: Any, anchor: LedgerAnchor | None,
         return          # 这一轮没走过 `_apply_agency_surfaces` ⇒ 无对象可比，不造读数
     try:
         from bladex_core.ledger_runtime import candidate_units, path_like_units
+
         from bladex_proxy.toolface import is_bladex_tool
         units = set(units)
         # `rev_now` 是**此刻**这本账本的 rev（"这一轮被改过没有"），所以它就该读活池。
@@ -874,7 +891,7 @@ async def _try_recover_redis(request: Request) -> PipelineRedis | None:
 
 
 async def _enqueue_inner_loop_turns(
-    request: Request, pipeline: "PipelineRedis", identity: Identity,
+    request: Request, pipeline: PipelineRedis, identity: Identity,
     loop_turns: list[Turn],
 ) -> None:
     """把主轮带出的内循环 aux 轮逐条入队（MQ-P9）。单条失败落盘，不影响其余。

@@ -18,7 +18,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-
 from bladex_core.fact import Fact
 from bladex_proxy.storage.memory_index import MemoryIndex
 

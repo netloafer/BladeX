@@ -23,7 +23,6 @@ import tempfile
 from pathlib import Path
 
 import structlog
-
 from bladex_proxy.innerloop import INNER_LOOP_AUX_SOURCE
 from bladex_proxy.loopledger import PendingRound, build_inner_loop_turn
 from bladex_proxy.models import Identity, Turn, TurnStatus

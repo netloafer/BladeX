@@ -8,7 +8,6 @@ from bladex_core.fusion import _entity_jaccard, build_entity_channel
 from bladex_core.identifiers import extract_identifiers, split_cjk_boundary
 from bladex_core.topic_keys import canonical_entity_key
 
-
 # ── canonical_entity_key ────────────────────────────────────────────────────
 
 class TestCanonicalKey:

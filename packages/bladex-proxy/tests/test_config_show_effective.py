@@ -27,9 +27,7 @@ import re
 from pathlib import Path
 
 import pytest
-
 from bladex_core.flags import MEMORY_FLAG_DEFAULTS, MEMORY_NUMERIC_DEFAULTS
-
 from bladex_proxy.cli import render_effective_config
 from bladex_proxy.config import ProxyConfig
 

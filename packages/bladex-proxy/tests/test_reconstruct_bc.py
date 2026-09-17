@@ -7,11 +7,9 @@ degrade_plan 记录（U2）/ 关闭时与现状逐字一致 / reconstruction 落
 
 from __future__ import annotations
 
-
 import pytest
 from bladex_core.fact import Fact
 from bladex_proxy.assembly import AssemblyConfig, ContextAssembler
-
 
 # （原 `_pin_index_recall_on` 夹具随 2026-09-03 S1 删除：该开关与主动检索路径已不存在。）
 

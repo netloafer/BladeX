@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 from collections import Counter
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -27,11 +26,11 @@ from bladex_core.envelope import (
     segment_long_text,
     strip_envelopes,
 )
-from bladex_core.flags import flag_enabled, flag_number
 from bladex_core.fact import ConversationTurn, Fact, ItemKind, Provenance
+from bladex_core.flags import flag_enabled, flag_number
 from bladex_core.funnel import FUNNEL_DEDUP, FUNNEL_STORED
 from bladex_core.importance import compute_importance
-from bladex_core.supersede import SupersedeMergePlan, plan_supersede_merge
+from bladex_core.supersede import plan_supersede_merge
 
 # 旧 kind（preference|event|task|decision|general）→ 新 item_kind 六类兜底映射（U4）。
 # 蒸馏器显式产出 item_kind 时优先用它；空时按旧 kind 推断，仍无则 assertion（最通用）。
@@ -708,7 +707,6 @@ class ProxyConsolidator:
         from bladex_core.adjudication import (
             AdjudicationOp,
             _observed_iso,
-            apply_verdict,
             build_input,
             fast_path_verdict,
         )
@@ -1428,8 +1426,9 @@ class ProxyConsolidator:
 
         # M4-2：候选按通道计数。漏斗的第一段——它为 0 而 turns 非 0，
         # 说明问题在装配（信封/长度/分流），不在蒸馏。
-        from bladex_core.funnel import FUNNEL_CANDIDATES
         from collections import Counter as _C
+
+        from bladex_core.funnel import FUNNEL_CANDIDATES
 
         for _tag, _n in _C(
             _channel_of(c.get("tags", ""))

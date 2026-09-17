@@ -6,7 +6,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from bladex_proxy.modules import (
     ENV_PREFIX,
     MODULE_SPECS,

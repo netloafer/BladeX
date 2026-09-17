@@ -11,7 +11,6 @@ import tempfile
 from unittest.mock import patch
 
 import pytest
-
 from bladex_proxy.config import ProxyConfig
 from bladex_proxy.server import create_app
 from fastapi.testclient import TestClient
@@ -793,7 +792,8 @@ class TestLedgerBoundaryFixes20260826:
         seen: list[dict] = []
 
         async def fake(model, messages, stream, **kw):
-            seen.clear(); seen.extend(messages)
+            seen.clear()
+            seen.extend(messages)
             return _Resp(_Msg(content="ok"))
 
         # 工具循环形态：末条 user 之后还有 assistant/tool 对
@@ -828,7 +828,8 @@ class TestLedgerBoundaryFixes20260826:
         tools_seen: list = []
 
         async def fake(model, messages, stream, **kw):
-            seen.clear(); seen.extend(messages)
+            seen.clear()
+            seen.extend(messages)
             tools_seen.append(kw.get("tools"))
             return _Resp(_Msg(content="ok"))
 
@@ -1024,8 +1025,8 @@ class TestLedgerBoundaryFixes20260826:
             f'{{"ledger_id": "", "title": "子任务", '
             f'"parent_ledger_id": "{parent.ledger_id}"}}',
             allowed_exposure="public", context=ctx))
-        child = next(l for l in ag.pool.values()
-                     if l.parent_ledger_id == parent.ledger_id)
+        child = next(lg for lg in ag.pool.values()
+                     if lg.parent_ledger_id == parent.ledger_id)
         assert any(SUBTASK_TAG in e.text and parent.ledger_id in e.text
                    for e in child.entries("next")), "子侧没写回写义务"
         parent_now = ag.pool[parent.ledger_id]
@@ -1133,7 +1134,6 @@ class TestObservabilityGaps20260826:
         `test_personal_identity_semantics` 已踩过同一个坑）。
         """
         import structlog.testing
-
         from bladex_proxy.agency import AgencyRuntime
         _on(monkeypatch, "toolface", "ledger")
         ag = AgencyRuntime()
@@ -1206,7 +1206,6 @@ class TestObservabilityGaps20260826:
         """`after=0` 就是 MQ-L10 的判据本身——线上必须能直接读到，
         不能再靠翻消息结构去推。"""
         import structlog.testing
-
         from bladex_proxy.agency import AgencyRuntime
         _on(monkeypatch, "toolface", "ledger")
         ag = AgencyRuntime()

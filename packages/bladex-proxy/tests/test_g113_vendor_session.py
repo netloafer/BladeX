@@ -10,7 +10,6 @@
 """
 
 import pytest
-
 from bladex_proxy.agent_bucket import (
     INFRA_VENDORS,
     RESERVED_VENDOR_SEGMENTS,

@@ -18,7 +18,6 @@ auto 只是 `AUTO_LEDGER_TIERS` 这个有名字的默认值。
 from __future__ import annotations
 
 import pytest
-
 from bladex_proxy.toolface import (
     AUTO_LEDGER_TIERS,
     LEDGER_TIER_NAMES,

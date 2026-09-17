@@ -20,7 +20,6 @@ import logging
 from pathlib import Path
 
 import pytest
-
 from bladex_proxy import router_sdk
 
 _REPO = Path(__file__).resolve().parents[3]
@@ -198,7 +197,6 @@ def test_global_switches_applied_on_import():
 # ══════════════════════════════════════════════════════════════════════════
 
 def _server_src() -> str:
-    import pathlib
     from _source_probe import package_source
     return package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
 

@@ -10,10 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-import os
 
 import pytest
-
 from bladex_core.ledger import Ledger, LedgerEntry, render_ledger_md
 from bladex_core.ledger_runtime import activation_scope
 from bladex_proxy.agency import AgencyRuntime
@@ -26,7 +24,7 @@ def _modules_on(monkeypatch):
 
 
 def _now_iso(minutes_ago: float = 0.0) -> str:
-    return (dt.datetime.now(dt.timezone.utc)
+    return (dt.datetime.now(dt.UTC)
             - dt.timedelta(minutes=minutes_ago)).isoformat(timespec="seconds")
 
 
@@ -157,7 +155,7 @@ class TestProjectScopeWiring:
         codex 走流式，切换绑定落 codex@Global 而注入查 codex@p-10ad1f，
         账本在切换成功后对注入面隐形。守卫窄一寸，缺陷就从那一寸过。"""
         import re
-        import bladex_proxy as _pkg
+
         from _source_probe import package_source
         src = package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
         entries = ["insert_ledger_block(", "process_message(",
@@ -274,7 +272,6 @@ class TestUserEditAdoption:
         assert adopted.rev == 5 and adopted.last_writer == "user"
 
     def test_server_adoption_source_guard(self):
-        import bladex_proxy as _pkg
         from _source_probe import package_source
         src = package_source("server")   # F0.1 拆包：server.py → server/ 包，按包拼接读源码
         assert "admin_ledger_user_edit_clobber_risk" in src, \

@@ -24,7 +24,6 @@ import json
 import pathlib
 
 import structlog.testing
-
 from bladex_core.ledger import new_ledger
 from bladex_proxy.agency import AgencyRuntime, tool_context
 
@@ -173,7 +172,7 @@ def test_old_behaviour_turn_index_zero_debounces_forever(monkeypatch):
     ag = AgencyRuntime()
     _seed(ag)
     scope = ag.scope_of("hermes:default")
-    import bladex_proxy.agency.runtime as agency_mod   # F0.1 拆包：消费方 process_message 在 runtime.py
+    import bladex_proxy.agency.runtime as agency_mod  # F0.1 拆包：消费方 process_message 在 runtime.py
     real = agency_mod.tool_context
     monkeypatch.setattr(agency_mod, "tool_context",
                         lambda **kw: {**real(**kw), "turn_index": 0})

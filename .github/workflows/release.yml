@@ -1,15 +1,28 @@
 name: Release
 
+# 两条触发路径（批 O，2026-09-18，docs/release-process.md 是这份工作流的说明书）：
+#   · push tag v*         —— 正式发版：版本门 → 构建 → （仅当仓库变量 BLADEX_PYPI_PUBLISH == "true"）发 PyPI → GitHub Release 草稿
+#   · workflow_dispatch   —— 演练：必须在 tag 上手动触发，target 选 testpypi（默认）或 pypi
+#
+# 发包不可逆（PyPI 版本号不可覆盖不可重用），所以 `uv publish` 不能是默认行为：
+# 变量未设 / 不是 "true" ⇒ publish 步骤被跳过（是 skip，不是 fail）。
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Publish target for a rehearsal (run this on a tag ref)"
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
 
 jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write   # PyPI trusted publishing (OIDC)
+      id-token: write   # PyPI / TestPyPI trusted publishing (OIDC)
       contents: write   # GitHub Release 草稿
     steps:
       - uses: actions/checkout@v4
@@ -18,6 +31,18 @@ jobs:
         with:
           python-version: "3.11"
 
+      # 发版门（批 O · O1）：tag 去掉前导 v 必须逐字等于四个 pyproject 的 version，
+      # 否则在 uv build 之前就退出——0.2.0 曾把 tag 打在 pyproject 仍写 0.1.0 的代码上，
+      # 构建出 bladex_core-0.1.0 的 wheel；当时靠 CI 红 + publisher 未配才没发出去。
+      # 本地同一条命令：python scripts/check_release_version.py --tag v0.2.0
+      - name: Check tag == package version
+        run: |
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            echo "::error::Release must run on a tag ref (got ${{ github.ref_type }} '${{ github.ref_name }}'). Dispatch it from a v* tag."
+            exit 1
+          fi
+          python scripts/check_release_version.py --tag "${{ github.ref_name }}"
+
       - uses: astral-sh/setup-uv@v3
         with:
           version: "latest"
@@ -25,12 +50,23 @@ jobs:
       - name: Build distributions
         run: uv build --all-packages
 
-      # PyPI trusted publishing：PyPI 项目侧需配置 GitHub trusted publisher（无 API token）。
-      # 首次发布前先在 TestPyPI 走一遍（beta T24）。
+      - name: Publish to TestPyPI (rehearsal)
+        if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+        run: uv publish --publish-url https://test.pypi.org/legacy/ --check-url https://test.pypi.org/simple/
+
       - name: Publish to PyPI
+        if: |
+          (github.event_name == 'push' && vars.BLADEX_PYPI_PUBLISH == 'true') ||
+          (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
         run: uv publish
 
+      - name: Publish skipped
+        if: github.event_name == 'push' && vars.BLADEX_PYPI_PUBLISH != 'true'
+        run: |
+          echo "::notice title=PyPI publish skipped::Repository variable BLADEX_PYPI_PUBLISH is not 'true'. Distributions were built but not uploaded. See docs/release-process.md."
+
       - name: GitHub Release (draft)
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

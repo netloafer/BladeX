@@ -11,7 +11,7 @@ X1 说的"全系统没有一个学习回路是通的"，断点之一就在这里
 from __future__ import annotations
 
 import hashlib
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 from bladex_proxy.models import DecisionMeta, Identity, Turn, TurnStatus

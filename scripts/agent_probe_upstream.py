@@ -50,7 +50,7 @@ def _check_narrate_echo(body: dict) -> None:
     """D7 回带检测：播报指纹出现在入站请求里 = 播报进了 agent 历史（此路不通）。"""
     blob = json.dumps(body, ensure_ascii=False)
     if _NARRATE_MARK in blob:
-        print(f"\n[probe][D7] 🔴 播报文本被 agent 存档回带（transcript 污染）\n")
+        print("\n[probe][D7] 🔴 播报文本被 agent 存档回带（transcript 污染）\n")
 
 
 @app.get("/v1/models")

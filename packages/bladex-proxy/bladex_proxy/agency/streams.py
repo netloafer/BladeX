@@ -12,9 +12,9 @@ from typing import Any
 import structlog
 from bladex_core.flags import flag_number
 
+from bladex_proxy.agency.runtime import AgencyRuntime, _call_names, _loop_cost, tool_context
 from bladex_proxy.innerloop import InnerLoopResult, run_inner_loop
 from bladex_proxy.splice import SpliceRecord, anchor_key
-from bladex_proxy.agency.runtime import AgencyRuntime, _call_names, _loop_cost, tool_context
 
 logger = structlog.get_logger()
 
@@ -50,7 +50,6 @@ async def intercept_chat_stream(
     #: 调用全被拦"那轮把 `finish_reason=tool_calls` 原样放行，agent 收到
     #: 「indicated a tool call but none was included」并重试（实测 4 轮）。
     forwarded_calls = False           # 有 agent 自己的调用被转发出去
-    forwarded_text = False            # 有正文被转发出去
     last_meta = {"id": "bladex-intercept", "model": ""}
     _last_out = [time.monotonic()]   # V-P3：上次给客户端发字节的时刻
 
@@ -75,9 +74,6 @@ async def intercept_chat_stream(
         last_meta["model"] = chunk.get("model", last_meta["model"])
         choices = chunk.get("choices") or []
         finish = choices[0].get("finish_reason") if choices else None
-        delta = (choices[0].get("delta") or {}) if choices else {}
-        if delta.get("content"):
-            forwarded_text = True
         if finish:
             held_terminal.append(sse)     # 终止 chunk 押后：分流未定
             continue
@@ -101,7 +97,7 @@ async def intercept_chat_stream(
 
     ctx = tool_context(session_id=session_id, agent_id=agent_id,
                        project_id=project_id, upstream_messages=upstream_messages)
-    # 🔴 2026-08-26：判据只看 `forwarded_calls`，**不看 forwarded_text**
+    # 🔴 2026-08-26：判据只看 `forwarded_calls`，**不看「有没有转发过正文」**（原 forwarded_text 变量已删）
     # （与 `classify_message` 同一修正；病例见那里的 docstring）。
     # 正文已经流给 agent 了，但"说了一段前言"不代表这一轮结束——模型明说
     # "先归档，再给结论"，得让它拿着工具结果继续。已流出的正文不丢：作为
@@ -489,7 +485,6 @@ async def _intercept_protocol_stream(
 
     held: list[bytes] = []
     forwarded_calls = False
-    forwarded_text = False
     _last_out = [time.monotonic()]   # V-P3：上次给客户端发字节的时刻
     #: 合成 item 的落点与 index（responses 协议：与终止快照同源，见 _synth_* 注释）
     synth_items: list = []
@@ -519,8 +514,6 @@ async def _intercept_protocol_stream(
             if isinstance(out.get("output_index"), int):
                 max_index = max(max_index, out["output_index"])
             t = out.get("type", "")
-            if "text" in t or t.endswith("output_text.delta"):
-                forwarded_text = True
             if "tool_use" in _json.dumps(out) or "function_call" in t:
                 forwarded_calls = True
             _emitted = True

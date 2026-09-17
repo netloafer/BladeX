@@ -6,11 +6,9 @@ SESSIONS 机械摘录名、USER/RULES/AGENT.md Index 读侧投影）。
 
 from __future__ import annotations
 
-import os
 import time
 
 import pytest
-
 from bladex_core.ledger import Ledger
 from bladex_proxy.flash_daemon import FlashDaemon, hub_tree_source
 

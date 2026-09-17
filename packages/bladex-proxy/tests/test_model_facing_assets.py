@@ -27,7 +27,6 @@ from __future__ import annotations
 import pathlib
 
 import pytest
-
 from bladex_proxy.cli import _ASSET_TARGETS, _install_model_facing_assets, assets_dir
 
 _REPO = pathlib.Path(__file__).resolve().parents[3]

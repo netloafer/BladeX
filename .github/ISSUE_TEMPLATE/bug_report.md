@@ -19,7 +19,7 @@ labels: bug
 
 ## Environment
 
-- BladeX version: `0.1.0` (run `python -c "import bladex_proxy; print(bladex_proxy.__version__)"`)
+- BladeX version: (run `bladex --version`, or `python -c "import bladex_proxy; print(bladex_proxy.__version__)"`)
 - Python:
 - OS:
 - Upstream model / provider:

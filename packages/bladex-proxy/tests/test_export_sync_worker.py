@@ -23,8 +23,8 @@ from bladex_proxy.export_sync import (
     load_export_config,
 )
 from bladex_proxy.models import TombstoneTargetType
-from bladex_proxy.storage.memory_index import MemoryIndex
 from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_index import MemoryIndex
 
 
 class MockExporter:

@@ -25,9 +25,13 @@ from __future__ import annotations
 import json
 
 import structlog.testing
-
 from bladex_core.ledger import (
-    ACTOR_MODEL, LedgerEntry, add_entry, add_section, new_ledger, render_ledger_md
+    ACTOR_MODEL,
+    LedgerEntry,
+    add_entry,
+    add_section,
+    new_ledger,
+    render_ledger_md,
 )
 from bladex_proxy.agency import LEDGER_BLOCK_BUCKETS, AgencyRuntime, _split_ledger_md
 from bladex_proxy.models import Identity, LedgerAnchor, Turn

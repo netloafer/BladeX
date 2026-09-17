@@ -40,7 +40,7 @@ from bladex_core.consolidation_proxy import (
     embed_query_compat,
 )
 from bladex_core.distillation import DistillerProtocol, DistillOutput
-from bladex_core.fact import ConversationTurn, Fact, ItemKind, Provenance, fact_lane
+from bladex_core.fact import ConversationTurn, Fact, ItemKind, fact_lane
 from bladex_core.flags import flag_enabled, flag_number
 from bladex_core.matter import (
     _MAX_MATTER_ENTITIES,
@@ -56,10 +56,10 @@ from bladex_core.matter import (
 from rocksdict import Rdict
 
 from bladex_proxy.models import (
+    TASKSTATE_VERDICTS,
     AdminEvent,
     DistillRecord,
     JudgmentRecord,
-    TASKSTATE_VERDICTS,
     TaskStateJudgment,
 )
 from bladex_proxy.storage.memory_hub import MemoryHub
@@ -353,6 +353,7 @@ def _goal_context(ledger: MemoryHub, ledger_key: str) -> tuple[str, str] | None:
     宁可空着，也不拿一个来路不明的文本当用户目标）。
     """
     from bladex_core.query_understanding import last_user_text
+
     from bladex_proxy.identity import classify_turn_disposition
 
     try:
@@ -2734,7 +2735,7 @@ class MemoryIndex:
             names = set(self._files_tbl.schema.names)
         except Exception:  # noqa: BLE001
             return
-        missing = {"origin": "'read'", "blob_ref": "''"} 
+        missing = {"origin": "'read'", "blob_ref": "''"}
         todo = {k: v for k, v in missing.items() if k not in names}
         if not todo:
             return
@@ -3911,7 +3912,7 @@ class MemoryIndex:
             logger.warning("index_keyword_map_build_failed", error=str(e))
             return self._kw_map or {}
         m: dict[str, list[str]] = {}
-        for fid, es in zip(ids, ents):
+        for fid, es in zip(ids, ents, strict=False):
             for e in es or []:
                 k = canonical_entity_key(str(e))
                 if k:
@@ -6363,7 +6364,7 @@ class MemoryIndex:
         logger.info("index_rebuild_scan_sorted", candidates=len(_scan_batch),
                     skipped_filtered=skipped_filtered)
 
-        for ts_iso, key_str in _scan_batch:
+        for _ts_iso, key_str in _scan_batch:
             # 通过筛选 -> 才付完整加载（Pydantic 校验 + content_ref 还原）
             turn = ledger.get(key_str)
             if turn is None:
@@ -6411,6 +6412,7 @@ class MemoryIndex:
             # T2(ADR-0018 R2): 不信任冻结的 turn.auxiliary，用最新规则重判
             # （identity 初判可能漏 user 角色的委派/子任务；rebuild 用 classify_auxiliary 补）
             from bladex_core.task_goal import TURN_DROPPED, TURN_REAL
+
             from bladex_proxy.identity import classify_turn_disposition
 
             # G12.3：三分收进 `classify_turn_disposition`（原地展开的那一行判据
@@ -7074,7 +7076,7 @@ class MemoryIndex:
                 _la_events = load_ledger_events(ledger)
                 _la_pool, _la_bind = _la_replay(_la_events)
                 _la_timeline = _la_tl(_la_events)
-                _la_titles = {lid: (l.title or lid) for lid, l in _la_pool.items()}
+                _la_titles = {lid: (lg.title or lid) for lid, lg in _la_pool.items()}
             except Exception as e:  # noqa: BLE001 —— 锚层装载失败=降级走 D1/五层
                 logger.warning("ledger_anchor_load_failed", error=str(e))
                 _la_enabled = False

@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-
 from bladex_core.ledger import ACTOR_MODEL, Ledger, LedgerEntry, add_entry
 from bladex_core.ledger_runtime import activation_scope, update_is_add_only
 from bladex_proxy.agency import AgencyRuntime

@@ -13,7 +13,6 @@ from bladex_core.supersede import (
     supersede_key,
 )
 
-
 # ── U5.4 importance ──
 
 

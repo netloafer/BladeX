@@ -156,9 +156,9 @@ def load_agents_roster(max_rows: int = 15) -> str:
     `max_rows` 封顶（ADR-0032 §3.1「一行一个封顶」）——名册是注意力预算的
     一部分，agent 多到溢出时裁最旧的（表按 first_seen 升序，尾部最新，保尾）。
     """
-    import os as _os
 
     from bladex_core.flash_tree import agents_roster_path
+
     from bladex_proxy.config import resolve_flash_path
     path = agents_roster_path(resolve_flash_path(), "local")
     try:

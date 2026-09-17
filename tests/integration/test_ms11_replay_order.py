@@ -25,13 +25,11 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-import pytest
 from bladex_core.adjudication import AdjudicationOp, AdjudicationVerdict, build_input
 from bladex_core.fact import Fact
 from bladex_proxy.models import Identity, Turn, TurnStatus
 from bladex_proxy.storage.memory_hub import MemoryHub
 from bladex_proxy.storage.memory_index import MemoryIndex
-
 
 # ── 先证明问题存在（不然修的是想象中的 bug）────────────────────────────
 
@@ -211,7 +209,7 @@ def test_t_valid_is_the_turn_time_not_the_rebuild_time(tmp_path):
     idx = _run(tmp_path, _OrderRecordingAdjudicator())
     facts = idx.all_facts()
     assert len(facts) == 2
-    tvs = sorted((f.t_valid.isoformat() for f in facts if f.t_valid))
+    tvs = sorted(f.t_valid.isoformat() for f in facts if f.t_valid)
     assert tvs == [_TS_EARLY, _TS_LATE], (
         f"t_valid 应逐字等于两轮的发生时间，实得 {tvs} —— "
         "取成重建时刻的话两条会几乎相同，时序规则退化成没比")

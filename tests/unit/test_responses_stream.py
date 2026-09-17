@@ -13,7 +13,6 @@ import json
 from typing import Any
 
 import pytest
-
 from bladex_proxy.capture import CaptureResult
 from bladex_proxy.responses import responses_stream_generator
 

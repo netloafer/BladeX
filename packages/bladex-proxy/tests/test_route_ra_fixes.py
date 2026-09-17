@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import asyncio
 
-from bladex_proxy import router_sdk
 import pytest
+from bladex_proxy import router_sdk
 from bladex_proxy.config import ModelRoute
 from bladex_proxy.model_health import ModelHealth
 from bladex_proxy.route import call_model

@@ -19,7 +19,7 @@ import inspect
 import os
 
 import pytest
-
+from _source_probe import package_source
 from bladex_proxy.innerloop import (
     INNER_LOOP_AUX_SOURCE,
     INNER_LOOP_MARKER,
@@ -34,8 +34,6 @@ from bladex_proxy.models import Identity, Turn
 
 _PKG = os.path.dirname(inspect.getsourcefile(run_inner_loop))
 
-
-from _source_probe import package_source
 
 
 def _src(name: str) -> str:

@@ -9,27 +9,43 @@ import json
 import time
 
 import structlog
-from fastapi import FastAPI, Header, Request, status
+from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from bladex_proxy import router_sdk
+from bladex_proxy.agency import intercept_anthropic_stream
 from bladex_proxy.anthropic import (
-    anthropic_stream_generator, approx_count_tokens, format_anthropic_response,
-    parse_anthropic_request
+    anthropic_stream_generator,
+    approx_count_tokens,
+    format_anthropic_response,
+    parse_anthropic_request,
 )
 from bladex_proxy.capture import CaptureResult
 from bladex_proxy.config import ModelRoute, ProxyConfig
-from bladex_proxy.agency import intercept_anthropic_stream
 from bladex_proxy.models import (
-    AgentSource, ChatCompletionRequest, DecisionMeta, Identity, RequestParams, ToolEvent,
-    TurnStatus
+    AgentSource,
+    ChatCompletionRequest,
+    DecisionMeta,
+    Identity,
+    RequestParams,
+    TurnStatus,
 )
 from bladex_proxy.route import call_model
 from bladex_proxy.server.orchestration import (
-    _apply_agency_surfaces, _build_request_params, _build_response_meta_from_capture,
-    _build_response_meta_from_response, _call_hooks, _collect_headers, _enqueue_turn,
-    _enqueue_turn_shielded, _extract_bearer, _extract_output_modalities, _intercept_non_stream,
-    _loop_reply, _prepare_round, _store_raw_request
+    _apply_agency_surfaces,
+    _build_request_params,
+    _build_response_meta_from_capture,
+    _build_response_meta_from_response,
+    _call_hooks,
+    _collect_headers,
+    _enqueue_turn,
+    _enqueue_turn_shielded,
+    _extract_bearer,
+    _extract_output_modalities,
+    _intercept_non_stream,
+    _loop_reply,
+    _prepare_round,
+    _store_raw_request,
 )
 
 logger = structlog.get_logger()
@@ -74,7 +90,6 @@ def register_anthropic_routes(app: FastAPI) -> None:
         headers = _collect_headers(request, authorization, x_agent_id, x_session_id, user_agent)
 
         # 用归一后的 messages 构造一个临时 ChatCompletionRequest 供身份解析
-        from bladex_proxy.models import ChatCompletionRequest
         req = ChatCompletionRequest(
             model=body.get("model", ""),
             messages=messages,
