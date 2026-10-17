@@ -126,8 +126,12 @@ def test_ready_no_operational_data_leaked():
         try:
             resp = client.get("/ready")
             data = resp.json()
-            # 顶层仅 ready + checks
-            assert set(data.keys()) == {"ready", "checks"}
+            # 顶层 = 就绪位 + 两个**静态构建标识**（批 T0b，MQ-I24）。
+            # `admin_contract` / `build` 不是运行数据：它们与流量无关、与本进程处理过
+            # 多少轮无关，重启同一份代码读数逐字不变。放在免鉴权的 /ready 上不新增
+            # 暴露面——`__version__` 本来就在 FastAPI 默认发布的 /openapi.json 里。
+            assert set(data.keys()) == {"ready", "checks", "admin_contract", "build"}
+            assert isinstance(data["admin_contract"], int)
             # checks 仅四个布尔位
             assert set(data["checks"].keys()) == {"redis", "hub", "index", "upstream"}
             assert all(isinstance(v, bool) for v in data["checks"].values())

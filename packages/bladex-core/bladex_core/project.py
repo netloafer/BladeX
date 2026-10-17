@@ -146,17 +146,5 @@ def matter_belongs_to_project(member_paths: list[str], root_path: str,
     return hit / len(member_paths) >= min_ratio
 
 
-def render_project_card(p: Project, active_matters: int = 0) -> list[str]:
-    """①平面 Project 卡（≤4 行：name / 进展 / 语言 / 活跃 Matter 数）。
-
-    触发条件由调用方判定（当前请求的 system prompt 或 tool 参数出现 root_path 前缀，
-    确定性匹配）—— 卡本身只管渲染。
-    """
-    lines = [f"[Project: {p.name or p.project_id}] {p.description}".rstrip()]
-    if p.progress_note:
-        lines.append(f"  进展: {p.progress_note}")
-    if p.languages:
-        lines.append(f"  语言: {', '.join(p.languages)}")
-    if active_matters:
-        lines.append(f"  活跃 Matter: {active_matters}")
-    return lines[:4]
+# （`render_project_card`——①平面 Project 卡——已于 2026-09-18 批 S 删除：注入面 09-03 起
+#  不消费 Project 卡，零生产调用点；拍板 0.3.0-(5)，ADR-0034 §3.2。`Project` 对象保留。）

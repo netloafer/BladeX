@@ -30,7 +30,9 @@ from bladex_proxy.capture import (
     CaptureResult,
     cache_read_tokens,
     extract_usage,
+    note_cache_reading,
     record_first_chunk,
+    round_fields,
     warn_bare_reasoning,
     warn_inline_think,
 )
@@ -196,6 +198,48 @@ def _normalize_assistant_message_content(content: list) -> dict[str, Any]:
     return msg
 
 
+def _instruction_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """顶层 `instructions` 归一出的消息（0 或 1 条 system）。"""
+    instructions = body.get("instructions")
+    if instructions:
+        if isinstance(instructions, str):
+            return [{"role": "system", "content": instructions}]
+        if isinstance(instructions, list):
+            text = _extract_content_text(instructions)
+            if text:
+                return [{"role": "system", "content": text}]
+    return []
+
+
+def empty_input_error(body: dict[str, Any], messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """`input` 一条消息都没归一出来 ⇒ 400 错误体（MQ-P24）；否则 None。
+
+    此前照常把 `messages=[]`（或只剩 instructions 那条 system）发给上游，用户读到的是
+    上游那句 "messages … minimum length 1, but got an empty array"——而 BladeX 手里
+    明明有全部信息（"这些 item type 我不认识"），只在日志里打了一条
+    `responses_unknown_input_item_type` warning。**失败要响在最早能判定的地方。**
+
+    判据只看 `input` 贡献的消息数（`messages` 减去 instructions 那条）：只有 system 的
+    请求同样没有可答的对话。错误信息点名收到的 item type 清单。
+    """
+    if len(messages) > len(_instruction_messages(body)):
+        return None
+    raw = body.get("input")
+    if isinstance(raw, list):
+        types = [str(it.get("type")) if isinstance(it, dict) else type(it).__name__ for it in raw]
+    else:
+        types = [] if raw is None else [type(raw).__name__]
+    detail = (f"received {len(types)} input item(s) of type(s) {sorted(set(types))}, "
+              f"none of which was recognized" if types else "`input` is missing or empty")
+    return {"error": {
+        "type": "invalid_request_error",
+        "param": "input",
+        "message": (f"No message could be built from `input`: {detail}. BladeX understands "
+                    f"`message`, `function_call` and `function_call_output` items (and plain "
+                    f"strings); refusing instead of sending an empty conversation upstream."),
+    }}
+
+
 def parse_responses_request(body: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """把 OpenAI /v1/responses 请求归一成内部 OpenAI chat 格式。
 
@@ -205,17 +249,8 @@ def parse_responses_request(body: dict[str, Any]) -> tuple[list[dict[str, Any]],
 
     无状态假设：不处理 previous_response_id（由 handler 拦截）。
     """
-    messages: list[dict[str, Any]] = []
-
     # instructions（顶层）-> 首条 system 消息（同 Anthropic system 字段处理）
-    instructions = body.get("instructions")
-    if instructions:
-        if isinstance(instructions, str):
-            messages.append({"role": "system", "content": instructions})
-        elif isinstance(instructions, list):
-            text = _extract_content_text(instructions)
-            if text:
-                messages.append({"role": "system", "content": text})
+    messages: list[dict[str, Any]] = _instruction_messages(body)
 
     # input: string -> 单条 user 消息；list -> 逐项归一
     input_field = body.get("input")
@@ -701,12 +736,15 @@ async def responses_stream_generator(
         cache_read_tokens=cache_read,
         done=result.done,
         error=result.error,
+        # 批 R · R1：归属 / 工具结果体量 / 起止墙钟（三条路径同一实现点 `capture.round_fields`）。
+        **round_fields(result),
     )
     # G17.0 守卫（MQ-P18）：codex 侧 `apply_patch` 持续 abort 的直接症状就是
     # `</think>` 漏进正文，而生产代码此前对它零处置、零告警。
     # 🔴 **两处都查**：agentic coding 里纯工具回复很常见（`full_text` 为空），
     # 而真正会让 `apply_patch` abort 的是**工具参数**被污染 —— 只查正文会漏掉
     # 恰好是最贵的那一种（"同一件事只在一个地方做对了"的又一形态）。
+    note_cache_reading(result, cache_read)
     warn_inline_think(result.full_text, "responses")
     warn_inline_think(
         "".join("".join(acc["arguments_parts"]) for acc in tool_calls_acc.values()),

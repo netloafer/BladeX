@@ -30,7 +30,7 @@ server.py 只拿到三个薄调用点（inbound 准备 / tools 增补 / 响应�
 #   runtime.py  `AgencyRuntime` 本体 + 注入块常量 + `tool_context`
 #   handlers.py ToolFace handlers（mixin）+ 账本写路径辅助
 #   streams.py  三条流式拦截 + `_Narrator` 族 + 合成事件
-#   notes.py    模板 / 系统自我介绍 / AGENTS 名册 / `_last_user_text`
+#   notes.py    模板 / 系统自我介绍 / AGENTS 名册 / `_last_user_text`（+ `_clean_user_text`）
 # 本模块只做门面：re-export 全部原公开名与测试引用的私有名（守卫 `test_facade_exports.py`）。
 # 🔴 monkeypatch 目标要打在**消费方模块**上（如 `bladex_proxy.agency.runtime.tool_context`），
 #    打在门面上只换门面的引用、消费方看不到。
@@ -52,14 +52,16 @@ from bladex_proxy.agency.handlers import (  # noqa: F401
 from bladex_proxy.agency.notes import (  # noqa: F401
     _BARE_PREFIX_RES,
     _GOAL_MAX_CHARS,
+    _MACHINE_ONLY_PREFIXES,
     _MACHINE_TEXT_MARKS,
     _SYSTEM_NOTE_FILES,
     _WRAPPER_TAG_RE,
     LEDGER_SECTION_CLOSE,
     LEDGER_SECTION_OPEN,
+    _clean_user_text,
     _last_user_text,
     _machine_text_mark,
-    load_agents_roster,
+    _user_texts,
     load_ledger_template,
     load_system_notes,
     render_system_notes,

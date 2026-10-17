@@ -27,6 +27,48 @@ from bladex_proxy.models import Turn
 
 logger = structlog.get_logger()
 
+#: 🔴 批 Z1b（MQ-A77）：**测试进程闸**。只由仓库根 `conftest.py` 在导入时置 True；生产进程里恒 False
+#: ⇒ `connect()` 一行不变。
+#:
+#: 为什么是模块属性、不是环境变量：本闸要拦的缺陷形状正是"某个夹具删光 `BLADEX_*` 环境变量 ⇒
+#: `ProxyConfig()` 回落 live 默认命名空间"（`test_cli_ledger.py` 的 `_isolate_env` 在 live stream 上开读约
+#: 25 天，批 Z1 §3.6）。标记放进 env，会被同一个夹具一起删掉；进程内的模块属性删不掉。
+#: 为什么不靠 MQ-A38 的实例检测：它看的是**活着的**消费者，live 停着时跑 gate，测试会直接在 live 的
+#: stream 上建组、开读，什么都不报。本闸不看对方在不在，只看"测试进程要连的是不是 live 的名字"。
+TEST_PROCESS_GUARD = False
+
+
+class LiveNamespaceInTestError(RuntimeError):
+    """测试进程试图连 live 的默认 Redis 命名空间。"""
+
+
+def refuse_live_namespace_in_tests(stream: str, group: str, consumer: str) -> None:
+    """测试进程里目标 stream 是 live 默认值 ⇒ 抛错并点名是哪个测试。生产进程（闸未开）直接返回。
+
+    判据只看 **stream**：共用 stream 就是互相污染（同组偷、异组串，见 `instance_claim` 模块说明）；
+    默认值取自 `config.DEFAULT_REDIS_*`（单一真相源），不抄字面量。
+    """
+    if not TEST_PROCESS_GUARD:
+        return
+    import os
+
+    from bladex_proxy.config import (
+        DEFAULT_REDIS_CONSUMER,
+        DEFAULT_REDIS_GROUP,
+        DEFAULT_REDIS_STREAM,
+    )
+    if stream != DEFAULT_REDIS_STREAM:
+        return
+    test = os.environ.get("PYTEST_CURRENT_TEST", "(unknown test)")
+    raise LiveNamespaceInTestError(
+        f"test process tried to open the LIVE Redis namespace: stream={stream!r} group={group!r} "
+        f"consumer={consumer!r} (live defaults: {DEFAULT_REDIS_STREAM!r} / {DEFAULT_REDIS_GROUP!r} / "
+        f"{DEFAULT_REDIS_CONSUMER!r}) in {test}. A fixture probably deleted the conftest isolation "
+        "values (BLADEX_REDIS_STREAM/GROUP/CONSUMER) before creating the app -- keep them "
+        "(see tests/test_cli_ledger.py::_isolate_env). MQ-A77."
+    )
+
+
 
 class DiskSpill:
     """磁盘溢出 - Turn 落本地文件的最终兜底（ADR-0009 §5b，T1 提为独立类）。
@@ -145,7 +187,10 @@ class PipelineRedis:
         不设 timeout 会阻塞到系统级 TCP 超时 ~60s）。
         socket_keepalive: 主动探测死连接。
         health_check_interval: 定期 PING 检测连接健康。
+
+        批 Z1b：测试进程里连 live 默认 stream ⇒ 在建连接之前就抛（生产进程闸未开，零变化）。
         """
+        refuse_live_namespace_in_tests(self._stream, self._group, self._consumer)
         self._redis = aioredis.from_url(
             self._redis_url,
             decode_responses=False,

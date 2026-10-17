@@ -208,3 +208,44 @@ def test_session_suffix_set_is_deliberately_singleton():
 def test_exclusion_sets_have_no_overlap():
     """保留段与基础设施名单各管一件事，重叠说明有一处该收窄。"""
     assert not (RESERVED_VENDOR_SEGMENTS & INFRA_VENDORS)
+
+
+# ── MQ-A76（批 U · U1.1，2026-09-23）：codex 的裸 `session-id` header ─────────
+#
+# codex 每条请求都发 `session-id: <会话 UUID>`（无 `x-` 前缀），`x-session-id` 却是空串；
+# 此前一条都没读 ⇒ 116 个 codex 会话被指纹 / 尾部接续塞进 69 个桶（批 U-前置 §4-1）。
+
+_CODEX_UUID = "01a09d61-2098-7092-b068-100578958865"
+
+
+def test_bare_session_id_header_is_explicit_session():
+    ident = _resolve({"session-id": _CODEX_UUID, "thread-id": _CODEX_UUID, "x-session-id": ""})
+    assert ident.session_id == _CODEX_UUID
+    assert ident.session_id_source == SessionIdSource.EXPLICIT
+
+
+def test_bare_session_id_splits_two_codex_sessions_with_identical_prefix():
+    """同仓库两个 codex 会话首轮逐字相同（AGENTS.md 机器文本）——修前指纹会把它们并进一个桶。"""
+    a = _resolve({"session-id": "11111111-aaaa"})
+    b = _resolve({"session-id": "22222222-bbbb"})
+    assert a.session_id != b.session_id
+
+
+def test_bare_session_id_loses_to_more_specific_headers():
+    ident = _resolve({"session-id": "bare-1", "x-session-id": "ours-1"})
+    assert ident.session_id == "ours-1"
+    ident = _resolve({"session-id": "bare-2", "x-foo-session-id": "vendor-2"})
+    assert ident.session_id == "vendor-2"
+
+
+def test_bare_thread_id_alone_is_not_a_session_signal():
+    """`thread-id` 粒度未标定，不收（与 VENDOR_SESSION_SUFFIXES 同一条理由）。"""
+    ident = _resolve({"thread-id": "t-only"})
+    assert ident.session_id != "t-only"
+    assert ident.session_id_source != SessionIdSource.EXPLICIT
+
+
+def test_bare_session_id_still_screened():
+    """裸 header 与另两档走同一道校验（值会原样拼进 Hub key）。"""
+    ident = _resolve({"session-id": "a/b"})
+    assert ident.session_id != "a/b"

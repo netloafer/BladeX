@@ -44,6 +44,19 @@ provider = "ark"
 #   温热 → 全量转发、复用上一轮冻结的降解/裁剪计划，不新增任何改写（保 cache 命中）；
 #   冷   → 装配正常跑 + 冷启相关性裁剪（cache 反正要重建，此时裁剪只赚不赔）。
 cache_ttl_s = 300
+# 批 Z · Z2（MQ-A34 ①②）：上下文窗口（token）。**可选；不写 = 逐字零行为**（不参与选池判断、
+# 不告警、不裁剪）。写了之后：
+#   · 动态选池会排除"估算 prompt + 输出下限（BLADEX_CONTEXT_OUTPUT_FLOOR_TOKENS）> 窗口"的模型；
+#   · 静态策略钉死的模型放不下 ⇒ **不改写路由**，只打 `route_static_context_window_exceeded`
+#     告警指回这里（刚性原则 9：配置说了算，程序不替你换模型）；
+#   · BladeX 自己的注入面（自我介绍 / 账本块 / bladex 工具 schema）按剩余预算裁剪，
+#     硬规则永不裁，agent 的正文与 max_tokens 一字不动。
+# 值从 `ollama show <model>`（num_ctx）或厂商文档抄，BladeX 不猜、不探测；`bladex doctor`
+# 会提示看起来是本地模型却没配窗口的条目。
+# context_window = 131072
+# 字符 → token 换算（可选，0/不写 = 用全局 BLADEX_CHARS_PER_TOKEN=2.5）。各模型实测分布见
+# 实测：中文多的模型偏小、英文代码偏大（按你自己的流量 `route_decision` 里的 prompt_tokens_est 与上游 usage 对一次）。
+# chars_per_token = 2.5
 
 [[models]]
 name = "openai/glm-5.2"
@@ -78,6 +91,18 @@ api_key_env = "BLADEX_UPSTREAM_API_KEY"
 capabilities = ["text"]
 tier = "weak"
 provider = "ark"
+
+# 本地小窗口模型示例（Z2）：ollama 的 num_ctx 是硬件常量，写进 context_window，
+# 放不下的请求动态选池会绕开它，BladeX 注入面按 32K 的预算裁剪。
+# [[models]]
+# name = "openai/qwen3.6:35b-a3b"
+# api_base = "http://127.0.0.1:11434/v1"
+# api_key_env = "OLLAMA_API_KEY"
+# capabilities = ["text", "code"]
+# tier = "medium"
+# provider = "ollama"
+# exposure = "local"
+# context_window = 32768
 
 # ══ 默认上游（策略全关时用；有序 = failover 链）════════════════════════════════
 # 首选失败（5xx/超时）→ 按序 failover；429 只跨 provider 切；4xx 不切。

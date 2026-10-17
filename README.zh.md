@@ -5,6 +5,10 @@
   </picture>
 </p>
 
+<p align="center">
+  <a href="https://github.com/netloafer/BladeX/actions/workflows/ci.yml"><img src="https://github.com/netloafer/BladeX/actions/workflows/ci.yml/badge.svg" alt="CI 状态"></a>
+</p>
+
 > **Build your private data assets.**
 > **Connect all your agents and LLMs like a blade.**
 >
@@ -81,7 +85,7 @@ BladeX 的做法是：**一份任务状态、一种格式，放在代理层**。
 | **Pipeline** | Redis（AOF） | 接入缓冲。落库成功才 ack；Redis 掉线走磁盘兜底，轮次不丢。 |
 | **Memory Hub** | RocksDB | 完整总账，**唯一真相源**，长期留存。其它层都能从它重建。 |
 | **Memory Index** | LanceDB + FTS | 派生层：蒸馏事实、向量、Matter 关联网络。可从 Hub 增量重建。 |
-| **Memory Flash** | 文件 | 当前状态的文件投影，`User → Agent → Project → Session`。你自己也读得懂，不只给代理读。 |
+| **Memory Flash** | 文件 | 任务账本的可编辑 Markdown（用你自己的编辑器改一本，BladeX 会采纳你的版本），外加可在 dashboard 查看的行为画像 `behavior.json`。都是 Hub 的投影，不是第二个真相源。 |
 
 ### 3. 代理 —— BladeX 对模型是**可见**的
 
@@ -109,9 +113,8 @@ BladeX 的做法是：**一份任务状态、一种格式，放在代理层**。
 | **跨不同 Agent 生效** | ✅ 一份记忆放在所有 Agent 背后 | ❌ 各自为政 | 取决于集成方式 |
 | **有任务状态，不只有事实** | ✅ 五段账本 | ❌ | ❌ |
 | **数据完全由你掌控** | ✅ 100% 在你自己的基础设施 | 取决于 Agent | 默认云端 |
-| **记忆驱动的模型路由** | ✅ 可选 | ❌ | ❌ |
 
-## 快速开始（v0.2.0）
+## 快速开始（v0.3.0）
 
 ### 环境要求
 
@@ -146,12 +149,13 @@ bladex doctor --e2e    # 端到端：记忆到底有没有被提炼出来、能�
 
 `bladex start` 会打印 dashboard 地址；如果记忆管线有任何一环没起来，它会打印 `degraded` 并**写明后果**
 （例如「Redis 不可达 → 对话不会入库，不会产生任何记忆」）。绿色的 `ready` 表示闭环成立，
-`bladex doctor --e2e` 会发一条探针对话真正证明它。
+`bladex doctor --e2e` 会发一条探针对话真正证明它。脚本里可看退出码：`bladex start` 就绪返回 `0`、失败返回 `1`、降级启动返回 `3`。
 
 > **首次启动会先下载 embedding 模型**（约 70 MB，来自 Hugging Face），下完 proxy 才应答 `/ready`。
-> 网络慢时会超过 30 秒的就绪窗口，`bladex start` 可能报 `failed -- /ready did not answer within 30s`，
-> 但进程其实是好的：看 `logs/proxy-*.log` 里 `embed_model_download_start … server_ready`，再跑
-> `bladex doctor` 即可；第二次启动是秒起。（已登记 MQ-A42，0.3.0 让等待窗口感知下载。）
+> `bladex start` 会识别出"正在下载"并等它下完：打印 `downloading embedding model … first start only`
+> 与下载进度，不会在 30 秒就绪窗口到点时判失败（下完后才重新计 30 秒窗口）。下载失败、或连续 2 分钟
+> 没有进度，`start` 会报 `failed -- the embedding model download failed` 并写明原因（同时停掉刚起的
+> proxy）。第二次启动是秒起。
 
 ### 配置你的 Agent
 
@@ -190,6 +194,7 @@ bladex status --traffic     # 最近每轮一行：agent / 注入了什么 / 路
 bladex doctor --e2e         # 完整闭环：转发 → 入库 → 提炼 → 召回
 bladex ledger list          # 任务账本，最近的在前
 bladex ledger show <id>     # 某一本的五段
+bladex ledger close <id>    # 把做完的账本标为关闭（撤销：bladex ledger reopen <id>）
 bladex memory search "..."  # BladeX 到底记住了什么
 ```
 
@@ -227,9 +232,14 @@ BladeX 不会对外说「端到端省了多少」。
 
 ### 小上下文窗口
 
-如果你跑的是小窗口本地模型（32K 及以下），要盯住注入面：账本块与系统说明是实打实的 token，
-在小窗口上会挤压输出预算。`bladex status --traffic` 与日志里的 `upstream_output_truncated`
-告警会告诉你什么时候发生了。窗口感知路由与按预算裁剪排在 0.3.0。
+如果你跑的是小窗口本地模型（32K 及以下），把窗口告诉 BladeX：在 `config/routing.toml` 该模型的
+`[[models]]` 条目里加 `context_window = <token 数>`（`ollama show <model>` 的 `num_ctx`）。配了之后：
+动态路由会绕开放不下"请求 + 输出预留（`BLADEX_CONTEXT_OUTPUT_FLOOR_TOKENS`，默认 2048）"的模型；
+BladeX **只裁自己的**注入面来适应剩余预算——先裁切换候选段，再裁账本块，再裁账本工具族，最后裁系统说明；
+硬规则永不裁，你的 agent 的消息、工具和 `max_tokens` 一个字不动。静态策略钉死的模型不会被换掉，
+只会收到一条指向 `routing.toml` 的 `route_static_context_window_exceeded` 告警。不配 `context_window`
+一切照旧。`bladex doctor` 会列出没配窗口的本地模型；`bladex status --traffic` 与日志里的
+`upstream_output_truncated` 告警仍然告诉你输出何时被截断。
 
 ### 非英语用户请注意
 
@@ -242,6 +252,29 @@ BladeX 不会对外说「端到端省了多少」。
 model = "intfloat/multilingual-e5-large"   # 2.24 GB，BladeX 的阈值就是在这个模型上标定的
 ```
 
+### 没有本地 embedding 模型？用 embedding API
+
+embedding 模型默认在本机跑。机器跑不动（小 VPS、内存不够）时，把 BladeX 指到一个托管的 embedding API
+——配置项已经有了：
+
+```toml
+# config/routing.toml
+[embedding]
+backend = "api"
+model = "openai/text-embedding-3-small"   # Router 格式：provider/model
+api_base = ""                              # 可选；留空用该 provider 的默认地址
+api_key_env = "OPENAI_API_KEY"             # 放密钥的环境变量名；密钥本身永远不进这个文件
+```
+
+切之前要知道两件事：
+
+- **隐私**：`api` 档下**每一条**蒸馏出的事实和**每一次**查询都会发给 embedding 服务商。BladeX 启动时会打
+  `EMBED_API_PRIVACY` 提醒你。记忆必须留在本机的话，保持 `local`。
+- **换后端或换模型 = 换向量空间。** 要在记忆攒起来之前做；否则先停掉两个进程、跑一遍
+  `python scripts/reembed_index.py`——不然 Memory Index 会因为模型不匹配拒绝启动。
+
+`api` 档不使用可选的 embedding 独立模块（`BLADEX_MODULE_EMBED`）；那个模块只用来在进程间共享一个**本地**模型。
+
 ## 我的数据存在哪里？
 
 全部本地存储在你机器的 `data/`：
@@ -249,22 +282,27 @@ model = "intfloat/multilingual-e5-large"   # 2.24 GB，BladeX 的阈值就是在
 - **Pipeline**：Redis AOF 持久化
 - **Memory Hub**：RocksDB —— 完整对话总账，唯一真相源
 - **Memory Index**：LanceDB —— 向量、蒸馏事实、Matter 关联网络（可从 Hub 重建）
-- **Memory Flash**：`data/bladex_flash` 下的普通文件 —— 当前状态投影为
-  `User → Agent → Project → Session`。想让它出现在你顺手能打开的地方（比如笔记库），
-  改 `BLADEX_FLASH_PATH`。
+- **Memory Flash**：`data/bladex_flash` 下的普通文件 —— 每本任务账本一个 Markdown
+  （`<principal>/personal/ledgers/…/<id>.md`；改了它，BladeX 会采纳你的版本），以及
+  `behavior.json`（按 agent / 项目的活动画像）。想在顺手的地方编辑账本，改 `BLADEX_FLASH_PATH`。
+  （0.3.0 之前 Flash 还会写一棵 `User → Agent → Project → Session` 目录树；这棵树已不再写入，
+  见发版说明。）
 
 BladeX **绝不会把你的记忆发送给第三方服务器**。唯一的出站请求是发往你自己配置的 LLM API 供应商的
 模型推理请求。静态加密交给磁盘（FileVault / LUKS），应用层不另做一套。
 
 ## 功能特性
 
-### 核心（v0.2.0）
+### 核心（v0.3.0）
 
 - 🧾 **五段任务账本** —— Goal / Core / Verified / Open / Next；活过压缩、重启与跨 Agent 交接，
-  Goal 归用户所有。
-- 🧠 **记忆质量就是产品** —— 相关性优先于数量、压缩之前就完成增量提取、写入时做矛盾校验、
+  Goal 归用户所有。做完的账本可以**关闭或标记被取代** —— Agent 用 `bladex_ledger_close`，你用
+  `bladex ledger close | reopen | supersede --by <id>`；关了的账本不再出现在「最近在做」的列表里、
+  也不再吸入新的轮次；当你说的话与它的内容对得上（关闭一天之内、且没有被取代）时，它会带着「已关闭」标记重新出现在
+  匹配的账本里——换会话、换 Agent 都一样——切回去即重开。`bladex ledger show` 会沿取代链读下去。
+- 🧠 **记忆质量就是产品** —— 相关性优先于数量、压缩之前就完成增量提取、
   容量满走信任衰减与归档而不是删除。
-- 🛠️ **工具面** —— `bladex_memory_search` 加三个账本工具，边界严格（只碰记忆与账本对象），
+- 🛠️ **工具面** —— `bladex_memory_search` 加四个账本工具，边界严格（只碰记忆与账本对象），
   不调用时零行为差异。
 - 🔌 **零改造接入** —— 任何说 OpenAI Chat Completions / Anthropic Messages / OpenAI Responses 的 Agent。
 - 🚦 **Router** —— 配置驱动的确定性路由 + 可选 LLM 裁判 + 会话粘性 + 按健康度 failover；
@@ -274,21 +312,60 @@ BladeX **绝不会把你的记忆发送给第三方服务器**。唯一的出站
 - 🖥️ **Web 管理面板** `http://localhost:38080/dashboard` —— 状态、事实检索、Matter 关联图、
   账本、会话回放、硬规则。
 - 🔌 **MCP Server**（`bladex-mcp`）—— 给说 MCP 的客户端的第二个读写面。
-- 📤 **导出 / 导入** —— 带版本的 JSONL 快照，以及到 Obsidian 与 PostgreSQL 的持续单向同步。
+- 📤 **导出 / 导入** —— 带版本的 JSONL 快照，以及与 Obsidian、PostgreSQL 的持续**双向**同步。
+  你在那边做的修改会作为管理事件回流进 Memory Hub —— 全量重建后仍在，之后的自动蒸馏也不会把它改回去：
+  - **Obsidian** —— 改一行 fact 文字（更正）、把它挪到另一个 Matter 页（换归属；挪进 `Inbox.md`
+    = 摘除归属）、删掉它（忘掉）。默认开，`backflow = false` 关。改 `Hard Rules.md` 同样入账，
+    几秒内生效（硬规则热加载，见下）。
+  - **PostgreSQL** —— 导出表仍是只读镜像；要改东西就往只追加的 `bladex_edit_inbox` 表 `INSERT`
+    一条请求，BladeX 处理后回写 `accepted` / `rejected` 与原因。**默认关**（`config/export.toml`
+    里 `inbox = true` 才开），且**永不接受硬规则改动** —— 否则能写这张库的人就能往每个 agent 里塞指令。
+  - 大面积删除只告警、不执行：整页消失，或一次扫描里消失的 fact 超过
+    `BLADEX_BACKFLOW_MAX_DELETES`（默认 5）。
 
-### 下一步（0.3.0）
+### 0.3.0 已交付
 
-- 上下文窗口感知的路由 + 按预算裁剪注入面
-- 已完结账本的 `close` / `supersede` 原语
-- 与外部工具的双向同步
-- 硬规则热加载（当前写在 `config/.env`，改完要重启）
+0.2.0 README「下一步」里列的每一条：
 
-## 已知限制（v0.2.0）
+- 上下文窗口感知的路由 + 按预算裁剪注入面（见上文「小上下文窗口」；`[[models]].context_window`、
+  `BLADEX_CHARS_PER_TOKEN`、`BLADEX_CONTEXT_OUTPUT_FLOOR_TOKENS`）。注入面的稳定层（系统说明与工具 schema）
+  现在在会话首轮定格、之后按内容锚点复位，agent 往末尾追加 system 提醒时它的位置不再漂。
+- 做完的账本可以 `close` / `supersede`：模型多了一个 `bladex_ledger_close` 工具（可顺带指明被哪本取代），
+  你这边有 `bladex ledger close | reopen | supersede`。关掉的账本不再出现在「最近在做」的列表里；
+  当你说的话与它的内容对得上时，它会带着「已关闭」标记重新出现，再切回去 = 自动重开。
+- 与外部工具双向同步：你在 Obsidian vault 里的改动（改一条事实的文字、把它挪到别的 Matter 页、删掉它、
+  改 `Hard Rules.md`）会作为管理事件写回记忆（`export.toml` 里 `backflow = true` 默认开；设 `false` 回到
+  只导出不回流）。PostgreSQL 多一张可选的只追加收件表（`inbox = true`）。
+- 硬规则热加载：改 `config/.env` 的 `BLADEX_HARD_RULES`（或 `Hard Rules.md`），各进程在
+  `BLADEX_HARD_RULES_RELOAD_S`（默认 5 秒）内生效，不用重启。
+- `bladex start` 首启会等 embedding 模型下完，不再误报 `/ready` 超时。
+
+0.3.0 里还有：
+
+- `bladex start` 降级启动（proxy 起来了、记忆管线缺了一部分）时退出码改为 3，不再是 0；1 仍表示启动失败。
+- `bladex status` 多一行队列趋势，`/metrics` 输出 `bladex_backlog_*` 系列；积压持续上升时日志打
+  `backlog_rising` 告警。
+- BladeX 拒绝在同一个 `data/` 目录上再起第二个 Redis；`bladex repair-aof` 可修复指向缺失文件的
+  Redis AOF manifest（默认只预演）。
+- `bladex memory tombstone-project` 这类耗时的管理命令改在 proxy 后台执行，不再卡住 proxy。
+- consolidator 空载轮的开销降到原来的约五分之一。
+
+### 下一步（0.4.0）
+
+- agent 自己压缩长对话之后，BladeX 仍把它当作同一个会话：账本保持绑定，轮次接着数。
+- 把一个任务交给另一个 agent：`bladex ledger handoff` 给出一页可携带的账本交接包；你也可以用
+  `bladex ledger create | edit` 自己建账本、改账本。
+- 互相矛盾的记忆会被标出来给你裁定，BladeX 不替你删。
+- Codex 走 `/v1/responses` 时推理参数原样转发，输出里不再混入思考文本。
+- 全量重建可中断、可续跑，上游断网不作废，写入中途崩溃也不会留下写了一半的索引。
+
+## 已知限制（v0.3.0）
 
 - 当前面向**个人自部署**优化 —— 企业多租户能力仍在开发中。
 - 账本工具面默认只对 `medium` / `strong` 档模型开（`BLADEX_LEDGER_TIERS`），或者本会话已经绑着
   激活账本时开。弱档模型仍**看得见**账本，只是不被要求去维护它。
-- 小窗口本地模型上，注入面会与输出预算竞争（见上文「小上下文窗口」）；按窗口裁剪排在 0.3.0。
+- 小窗口本地模型上，除非你声明了该模型的 `context_window`，注入面会与输出预算竞争（见上文「小上下文窗口」）；
+  BladeX 不自动探测窗口，也不改 agent 的 `max_tokens`。
 - LanceDB 的 ANN 索引在表超过 256 行后才建；低于这个规模是暴力扫描（该规模下很快，
   但确实意味着小库不走索引）。
 - 目前只原生支持 OpenAI Chat Completions、Anthropic Messages、OpenAI Responses 三种端点，
@@ -296,9 +373,18 @@ BladeX **绝不会把你的记忆发送给第三方服务器**。唯一的出站
 - **导出到外部的记忆可能是旧的**：到 Obsidian / PostgreSQL 的持续同步会推送新增与更新的事实，
   但 Matter 卡的 `summary` / `open_issues` **没有**像单条事实那样按敏感度过滤。
   同步到共享位置前请先自查。
-- 硬规则在 `config/.env` 里编辑（`||` 分隔）且需要重启 proxy；dashboard 只读展示。
+- dashboard 只读展示硬规则。改硬规则在 `config/.env`（`BLADEX_HARD_RULES`，`||` 分隔）或 Obsidian 的
+  `Hard Rules.md` 里改，**不用重启**——proxy、consolidator、Flash 维护进程各自在
+  `BLADEX_HARD_RULES_RELOAD_S`（默认 5 秒）内生效并打一行 `hard_rules_reloaded`；两边都改过时**后改的赢**。
+  把那一行清空不会清空规则（保留原来的并告警）。
 - CLI 按当前目录（或 `BLADEX_HOME`）解析 `config/`、`data/`、`logs/`。在无关目录下跑
   `bladex status` 会看到一个空库——**数据没丢，只是你指错了地方**。
+- **还没有矛盾检测。** 两条互相冲突的事实可以同时存在于记忆里，不会被标出。
+- **模型路由不使用你的记忆。** 路由由配置驱动（外加可选的 LLM 裁判）；记忆驱动的路由尚未实现。
+- **agent 自己压缩历史时**（如 Hermes 或 DeepSeek Harness 的长会话），BladeX 目前会把压缩后的下一个请求
+  当成新会话：轮次从头计，账本不再自动绑定。账本本身仍在 —— 它会作为切换候选提供给模型。
+- **Codex 上游是推理模型时**：`/v1/responses` 上的推理参数暂未转发，思考文本可能混进输出，
+  `apply_patch` 可能失败。
 
 ## 许可证
 

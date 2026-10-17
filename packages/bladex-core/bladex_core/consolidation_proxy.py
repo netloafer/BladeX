@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections import Counter
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
 from bladex_core.distillation import DistillerProtocol
@@ -213,9 +214,30 @@ class InRunNeighborSource:
     （目标本来就没进库）；judgment 台账里会留悬空 id，读侧脚本需容忍。
     """
 
-    def __init__(self, checker: Any | None = None) -> None:
+    def __init__(self, checker: Any | None = None,
+                 hydrate: Callable[[str], Fact | None] | None = None) -> None:
         self._checker = checker
         self._facts: list[Fact] = []
+        #: 🔴 2026-09-18（批 S · S2.1，MQ-I20）：库内视图的行**没有坐标**（LanceDB facts
+        #: 表只有 id/vector/content/category/source_*/entities），此前用它们拼出的 Fact
+        #: subject/attribute 恒空 ⇒ `fast_path_verdict` 对库内邻居从不命中同键。
+        #: `hydrate(fact_id)` 由 proxy 侧传入（meta_rocksdb 的 `get_fact`），把库内邻居
+        #: 补成完整 Fact；取不到时回落旧的拼装（缺坐标 = 不命中，不造强信号）。
+        self._hydrate = hydrate
+        #: 本轮从**库内视图**取回过的邻居 id（`library_ids()`）——裁决快路径对库内
+        #: 同键走保守分支，需要知道谁是库里的（`fast_path_verdict(library_ids=)`）。
+        self._library_seen: set[str] = set()
+        #: 其中被 `hydrate` 补成**完整 Fact** 的那些（对象本身可被 `apply_verdict` 改写、
+        #: 由 proxy 侧 upsert 回 meta）。未补齐的壳对象**不得**进 `by_id`——UPDATE/NOOP
+        #: 会把一个只有 id+content 的壳写回库里，等于抹掉原条。
+        self._hydrated: dict[str, Fact] = {}
+
+    def library_ids(self) -> frozenset[str]:
+        return frozenset(self._library_seen)
+
+    def hydrated(self) -> dict[str, Fact]:
+        """本轮补齐过坐标的库内邻居 `{id: Fact}`（同一对象，判决改写落在它身上）。"""
+        return dict(self._hydrated)
 
     def add(self, fact: Fact) -> None:
         """收录一条本轮已算过邻居的候选（无 embedding 的不收，查不到）。"""
@@ -249,11 +271,19 @@ class InRunNeighborSource:
                     fid = str(row.get("fact_id") or row.get("id") or "")
                     if not fid or any(f.id == fid for f, _ in out):
                         continue
-                    out.append((Fact(
-                        id=fid, content=str(row.get("content", "") or ""),
-                        subject=str(row.get("subject", "") or ""),
-                        attribute=str(row.get("attribute", "") or ""),
-                    ), sim))
+                    full = self._hydrated.get(fid)
+                    if full is None and self._hydrate is not None:
+                        full = self._hydrate(fid)
+                        if full is not None:
+                            self._hydrated[fid] = full
+                    if full is None:
+                        full = Fact(
+                            id=fid, content=str(row.get("content", "") or ""),
+                            subject=str(row.get("subject", "") or ""),
+                            attribute=str(row.get("attribute", "") or ""),
+                        )
+                    self._library_seen.add(fid)
+                    out.append((full, sim))
             except Exception as e:  # noqa: BLE001 —— 库内视图拿不到 ≠ 内存集也作废
                 logger.warning("neighbor_source_store_view_failed err=%s", e)
 
@@ -383,10 +413,13 @@ class ProxyConsolidator:
             self.parse_failed_ledger_keys.add(ledger_key)
 
     def _report(self, **ev: Any) -> None:
-        if self._progress_cb is None:
+        # getattr：嵌入 / novelty 段也报进度后（批 Q3B），绕过 __init__ 构造的实例
+        # （test_embed_chunking 用 __new__）也会走到这里——进度永远不许拖垮本体。
+        cb = getattr(self, "_progress_cb", None)
+        if cb is None:
             return
         try:
-            self._progress_cb(ev)
+            cb(ev)
         except Exception:  # noqa: BLE001 —— 进度回调失败不影响 consolidation
             pass
 
@@ -516,6 +549,13 @@ class ProxyConsolidator:
         new_facts: list[Fact] = []
         for candidate, emb in zip(candidates, candidate_embs, strict=True):
             _nov_seen += 1
+            if _nov_seen % 200 == 0 or _nov_seen == len(candidates):
+                # MQ-I25 ②：novelty 段进 progress_cb（理由同 `_embed_chunked`）
+                _el = _t_nov.perf_counter() - _nov_t0
+                _rate = _nov_seen / max(_el, 1e-6)
+                self._report(phase="novelty", done=_nov_seen, total=len(candidates),
+                             rate=round(_rate, 1),
+                             eta_s=int((len(candidates) - _nov_seen) / max(_rate, 1e-6)))
             if _nov_seen % 2000 == 0:
                 _el = _t_nov.perf_counter() - _nov_t0
                 logger.info(
@@ -745,7 +785,18 @@ class ProxyConsolidator:
                     len(running), len(pending), _adj_nb / _adj_seen,
                 )
             basket = [n.id for n, _ in neighbors]
-            fp = fast_path_verdict(fact, [n for n, _ in neighbors])
+            # 🔴 2026-09-18（批 S · S2.1，MQ-I20）：补齐过坐标的库内邻居进 `by_id`。
+            # 此前 `existing` 在增量 + LanceDB 形态下恒空 ⇒ `apply_verdict` 对库内目标
+            # 查不到 ⇒ **UPDATE / NOOP 一律降级 ADD**（"宁多勿丢"那条兜底），台账却记着
+            # 判决——live 快照：09-02 全量重建后 1,691 条 NOOP / 139 条 UPDATE 的候选仍
+            # current（降级），只有 201 条真应用。对象同一份：判决改写落在它身上，
+            # `records[…]["changed"]` 带回 proxy upsert。
+            hydrated = getattr(self._neighbor_source, "hydrated", None)
+            if hydrated is not None:
+                for _hid, _hf in hydrated().items():
+                    by_id.setdefault(_hid, _hf)
+            fp = fast_path_verdict(fact, [n for n, _ in neighbors],
+                                   library_ids=self._neighbor_source.library_ids())
             if fp is not None:
                 self._apply_one(fp, fact, by_id, now, kept, running, records,
                                 considered=basket)
@@ -1066,6 +1117,12 @@ class ProxyConsolidator:
             t_chunk = _time.perf_counter()
             out.extend(self._embedder.embed(chunk))
             now = _time.perf_counter()
+            # MQ-I25 ②（批 Q3B）：同一份读数也进 progress_cb —— 上面那行 logger.info 在
+            # `bladex sync run` 里**没人配 stdlib logging**，嵌入阶段对用户仍是静默的。
+            _rate = len(out) / max(now - t0, 1e-6)
+            self._report(phase=f"embed:{phase}", done=len(out), total=total,
+                         rate=round(_rate, 1),
+                         eta_s=int((total - len(out)) / max(_rate, 1e-6)))
             logger.info(
                 "consolidate_embed_progress phase=%s %d/%d chunk_s=%.1f "
                 "elapsed_s=%.1f rate=%.1f/s eta_s=%.0f",

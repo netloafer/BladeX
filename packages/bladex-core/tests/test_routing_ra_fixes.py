@@ -403,11 +403,32 @@ def test_requested_model_overrides_sticky_and_updates_it():
     assert d3.source == RouteSource.STICKY
 
 
-def test_requested_model_unknown_falls_through():
-    """req_model 未命中名单（如 Hermes 展示名）→ 走流水线。"""
+def test_requested_model_unknown_raises_when_strategy_on():
+    """🔴 语义变更（批 W W1 / 拍板 (12)，2026-09-22）：策略**开** + 名字未命中
+    ⇒ **报错**，不再"走流水线"。
+
+    本用例的旧断言是 `source == UPSTREAM_DEFAULT`（"如 Hermes 展示名 → 走流水线"）。
+    改判理由：策略对该 agent 开着 = 用户明说"我写哪个就用哪个"，悄悄换一个
+    等于把唯一的显式选择静默旁路（刚性原则 9：配置错误应正常报错，
+    程序不替用户改选择）。Hermes 那个场景不受影响——它 live 落的是
+    **策略关**那一格（09-20 日志 80 次 `route_request_model_ignored_disabled
+    agent=hermes:default req_model=ark-code-latest`），那一格照旧回落动态。
+    """
+    from bladex_core.routing import UnknownRequestedModelError
+
     router = MemoryAwareRouter(
         _models(), ["pro", "glm", "mini"],
         request_strategy=RequestStrategyData(enabled=True),
+    )
+    with pytest.raises(UnknownRequestedModelError):
+        _run(router.route("q", req_model="bladex-auto-whatever"))
+
+
+def test_requested_model_unknown_falls_through_when_strategy_off():
+    """阴性对照（hermes / dsh 的 live 形态）：策略**关** ⇒ 仍走流水线，不报错。"""
+    router = MemoryAwareRouter(
+        _models(), ["pro", "glm", "mini"],
+        request_strategy=RequestStrategyData(enabled=False),
     )
     d = _run(router.route("q", req_model="bladex-auto-whatever"))
     assert d.source == RouteSource.UPSTREAM_DEFAULT

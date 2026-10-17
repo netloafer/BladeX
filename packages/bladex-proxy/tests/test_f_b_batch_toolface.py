@@ -93,8 +93,11 @@ class TestSchemaRuntimeParity:
     def test_tool_face_stays_within_attention_budget(self):
         """加参数不是免费的（ADR-0029）。与 `test_toolface` 同一把尺、同一上限。"""
         import json
+
+        from bladex_proxy.toolface import TOOL_FACE_SCHEMA_BUDGET_CHARS
         total = sum(len(json.dumps(t, ensure_ascii=False)) for t in TOOL_SCHEMAS)
-        assert total <= 8000, f"工具面 schema 总长 {total} 超预算 8000"
+        assert total <= TOOL_FACE_SCHEMA_BUDGET_CHARS, \
+            f"工具面 schema 总长 {total} 超预算 {TOOL_FACE_SCHEMA_BUDGET_CHARS}"
 
 
 # ── handler：一次 rev / 一条事件 ────────────────────────────────────────────

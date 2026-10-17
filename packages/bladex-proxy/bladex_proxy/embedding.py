@@ -210,7 +210,41 @@ MODEL_PROFILES: dict[str, dict[str, Any]] = {
                 "the only model whose thresholds are calibrated on real traffic",
         "novelty": 0.98, "semantic": 0.85, "digestion": 0.85, "calibrated": True,
     },
+    # ── 线上 API 档（backend=api，G18.3 / MQ-W9 断点③）──
+    # 只补元数据（dim/languages/note）；阈值一律 flags 保守默认、calibrated=False——
+    # 标定是跨所有非 e5 模型的另一张卡（本地 7 条里 6 条同样未标定），不在本组。
+    # 🔴 `"api": True` 是**本地/线上的分界标记**：`_local_model_for`（强制回本地时
+    # 不许把 api 模型名喂 fastembed）与 `ensure_local_model` 的推荐名单靠它区分——
+    # 本表在 G18.3 之前恰好就是 fastembed 白名单，这个隐含义随 api 条目失效。
+    # ⚠️ 记忆内容出境：api 档把每条 fact + 每轮 query 发给 embedding 供应商
+    # （build_embedder 启动打 EMBED_API_PRIVACY，敏感层开着时 fail-closed 回本地）。
+    "openai/text-embedding-3-small": {
+        "api": True, "dim": 1536, "languages": "100+",
+        "note": "API tier; cheap, solid multilingual; no local RAM/download needed",
+        "novelty": 0.98, "semantic": 0.85, "digestion": 0.85, "calibrated": False,
+    },
+    "openai/text-embedding-3-large": {
+        "api": True, "dim": 3072, "languages": "100+",
+        "note": "API tier; strongest OpenAI embedding, 2x vector size of -small",
+        "novelty": 0.98, "semantic": 0.85, "digestion": 0.85, "calibrated": False,
+    },
+    "doubao-embedding": {
+        "api": True, "languages": "zh+en",
+        "note": "API tier (Volcengine); dim varies by model version -- "
+                "`bladex doctor` probes and reports the actual dimension",
+        "novelty": 0.98, "semantic": 0.85, "digestion": 0.85, "calibrated": False,
+    },
+    "dashscope/text-embedding-v3": {
+        "api": True, "dim": 1024, "languages": "50+",
+        "note": "API tier (Alibaba DashScope); strong Chinese coverage",
+        "novelty": 0.98, "semantic": 0.85, "digestion": 0.85, "calibrated": False,
+    },
 }
+
+
+def local_profile_names() -> list[str]:
+    """MODEL_PROFILES 里可喂 fastembed 的本地模型名（api 条目除外）。"""
+    return [k for k, v in MODEL_PROFILES.items() if not v.get("api")]
 
 # 阈值对应的显式 env（显式设置永远压过 profile）
 _THRESHOLD_ENVS = {
@@ -416,6 +450,97 @@ def _endpoint_reachable(url: str) -> bool:
         return False
 
 
+# ── MQ-A42（批 Z1，2026-09-23）：首次下载状态标记 ─────────────────────────────
+#
+# `bladex start` 轮询 /ready 等 30 秒；而本地档首启要在 proxy 的 lifespan 里**阻塞**下
+# embedding 模型（`build_embedder` → 本函数），lifespan 不完成 uvicorn 就不答 /ready ⇒
+# 每个新装用户首启都看到一次 `state: failed`。CLI 需要一个**能指认来源**的信号回答
+# "它是在下模型，还是真起不来"（原则 13 层 4）——就是这个标记：
+#
+#   `<fastembed_cache>/.bladex-download/<pid>.json`
+#
+# - **唯一写入点** = `ensure_local_model` 的"未缓存"分支（与 `embed_model_download_start`
+#   日志同一处）；下载成功即删，失败改写成 `state=failed` + 错误原文；
+# - **按 pid 分文件**：proxy / consolidator / embedding 模块三个进程可能同时首启、各下各的
+#   （HF 缓存自带文件锁，后到的等前一个）；CLI 只读**它等的那个进程**的那一份；
+# - 进程被杀留下的 `downloading` 标记不会误导：读方要求 pid 活着（`read_download_state`）。
+# 守卫：`tests/test_z1_startup_download_aware.py`。
+DOWNLOAD_STATE_DIRNAME = ".bladex-download"
+
+
+def _download_state_path(cache_dir: str, pid: int) -> str:
+    return os.path.join(cache_dir, DOWNLOAD_STATE_DIRNAME, f"{pid}.json")
+
+
+def _write_download_state(cache_dir: str, **fields: Any) -> None:
+    """写本进程的下载状态（原子替换）。写不了只告警——标记是给 CLI 的提示，不许拖垮下载。"""
+    import json
+    import time
+
+    path = _download_state_path(cache_dir, os.getpid())
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # 顺手清掉死进程留下的标记（被 kill -9 的上一次首启）
+        for name in os.listdir(os.path.dirname(path)):
+            stem = name.removesuffix(".json")
+            if stem.isdigit() and int(stem) != os.getpid() and not _pid_alive(int(stem)):
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(os.path.dirname(path), name))
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(), "updated_at": time.time(), **fields}, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.warning("embed_download_state_write_failed", path=path, error=str(e))
+
+
+def _clear_download_state(cache_dir: str) -> None:
+    with contextlib.suppress(OSError):
+        os.unlink(_download_state_path(cache_dir, os.getpid()))
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def read_download_state(cache_dir: str, pid: int) -> dict | None:
+    """进程 `pid` 的首次下载状态：`{"state": "downloading"|"failed", "model", ...}` 或 None。
+
+    `downloading` 只在 pid 还活着时算数（死进程的残留 = None）；`failed` 无论死活都返回
+    ——下载失败后 proxy 会降级继续跑，embedding 模块则直接退出，两种都要能报出原因。
+    """
+    import json
+
+    if not cache_dir or not pid:
+        return None
+    try:
+        with open(_download_state_path(cache_dir, pid), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("state") == "downloading" and not _pid_alive(pid):
+        return None
+    return data
+
+
+def cache_bytes(cache_dir: str) -> int:
+    """缓存目录当前总字节数（下载进度 / 停滞判定用；HF 的 `*.incomplete` 也算在内）。"""
+    total = 0
+    for root, _dirs, files in os.walk(cache_dir):
+        for name in files:
+            with contextlib.suppress(OSError):
+                total += os.path.getsize(os.path.join(root, name))
+    return total
+
+
 def ensure_local_model(model_name: str, cache_dir: str) -> bool:
     """启动前确保本地模型可用；缺失则自动下载（必要时切镜像）。
 
@@ -436,7 +561,7 @@ def ensure_local_model(model_name: str, cache_dir: str) -> bool:
 
     supported = [m["model"] for m in TextEmbedding.list_supported_models()]
     if model_name not in supported:
-        recommended = list(MODEL_PROFILES.keys())
+        recommended = local_profile_names()
         raise RuntimeError(
             f"embedding model {model_name!r} is not supported by fastembed. "
             f"Recommended models: {recommended}"
@@ -446,6 +571,23 @@ def ensure_local_model(model_name: str, cache_dir: str) -> bool:
     size = profile.get("size_gb")
     user_endpoint = os.environ.get("HF_ENDPOINT")
     source = user_endpoint or "https://huggingface.co"
+    # MQ-A42：从这里起到下载结束，CLI 的 /ready 等待窗口按"正在下载"处理（见标记说明）。
+    _write_download_state(cache_dir, state="downloading", model=model_name,
+                          size_gb=size, source=source)
+    try:
+        _download_local_model(model_name, cache_dir, size, user_endpoint, source)
+    except Exception as e:
+        _write_download_state(cache_dir, state="failed", model=model_name,
+                              size_gb=size, source=source, error=str(e))
+        raise
+    _clear_download_state(cache_dir)
+    return True
+
+
+def _download_local_model(model_name: str, cache_dir: str, size: Any,
+                          user_endpoint: str | None, source: str) -> None:
+    """`ensure_local_model` 的下载段（选源 + 阻塞下载）；异常原样上抛给它记失败标记。"""
+    from fastembed import TextEmbedding
 
     if not user_endpoint and not _endpoint_reachable("https://huggingface.co"):
         for mirror in _HF_MIRRORS:
@@ -461,6 +603,8 @@ def ensure_local_model(model_name: str, cache_dir: str) -> bool:
                 f"huggingface.co nor mirrors {list(_HF_MIRRORS)} are reachable. "
                 f"Set HF_ENDPOINT to a reachable mirror, or pre-populate {cache_dir}."
             )
+        _write_download_state(cache_dir, state="downloading", model=model_name,
+                              size_gb=size, source=source)
 
     logger.info("embed_model_download_start", model=model_name,
                 size_gb=size, source=source, cache_dir=cache_dir,
@@ -472,7 +616,6 @@ def ensure_local_model(model_name: str, cache_dir: str) -> bool:
             f"embedding model download failed for {model_name!r} from {source}: {e}"
         ) from e
     logger.info("embed_model_download_done", model=model_name, source=source)
-    return True
 
 
 class _QueryLRU:
@@ -743,10 +886,12 @@ def _local_model_for(settings: EmbedSettings, forced: bool) -> str:
     """回落 local 档时的模型名。
 
     forced=True（敏感度强制 / 误配回落）时 model 可能是 api 模型名，
-    不能拿去喂 fastembed —— 不在内置本地 profile 表内就退默认 e5-large。
+    不能拿去喂 fastembed —— 不是内置**本地** profile 就退默认。
+    （G18.3 起 MODEL_PROFILES 含 api 条目，判据从"在表内"收紧为"在表内且非 api"，
+    否则强制回本地时会把 openai/... 喂给 fastembed。）
     """
     m = settings.model or DEFAULT_LOCAL_MODEL
-    if forced and m not in MODEL_PROFILES:
+    if forced and m not in local_profile_names():
         return DEFAULT_LOCAL_MODEL
     return m
 

@@ -84,6 +84,30 @@ class NoCapableCandidateError(RoutingError):
     """
 
 
+class UnknownRequestedModelError(RoutingError):
+    """[strategies.request] 对该 agent **开着**，但请求体里的 model 名不在 [[models]]
+    （T5b / MQ-R13 / 批 W 拍板 (12)，2026-09-22）。
+
+    语义与 NoCapableCandidateError 同族——**配置错误，程序不替用户改选择**
+    （刚性原则 9 的"能力不满足 ≠ 硬约束，是配置错误"）：用户为这个 agent 明确
+    打开了 req_model 策略、又写了一个不存在的名字，BladeX 悄悄换一个 =
+    把用户的显式选择静默旁路掉。调用方应**快返结构化错误、不发起任何上游调用**。
+
+    🔴 只覆盖「策略开 ∧ 名字未知」这一格。策略**关**那一格（配置语义 =
+    "这个 agent 的 model 名本就不作数，由动态路由决定"）保持
+    `route_request_model_ignored_disabled` 告警 + 回落动态，**不抛错**——
+    live 证据：dsh 每轮都落在那一格（09-20 日志 9/9），改成报错会打死它全部流量。
+    """
+
+    def __init__(self, req_model: str, agent_id: str | None = None) -> None:
+        self.req_model = req_model
+        self.agent_id = agent_id
+        super().__init__(
+            f"requested model {req_model!r} is not in routing.toml [[models]] "
+            f"(agent={agent_id or 'unknown'})"
+        )
+
+
 class RouteSource(str, Enum):
     """路由决策来源（流水线可解释）。
 
@@ -152,7 +176,22 @@ class ModelCandidate(BaseModel):
     # ADR-0028 §2：该模型的 Prompt Cache TTL（秒）。0 = 无 cache，永远按冷处理。
     # 温热期禁止新增裁剪/降解（打碎前缀省的 token 不够 cache 损失）；
     # 冷启期才允许相关性裁剪（E4.3）。
+    #
+    # 🔴 地位（MQ-CA17，2026-09-19 实测降级）：**这个值只是粗略兜底，不是 cache 冷热的真相。**
+    # R4 窗口 183 轮实测：cache 命中的最长轮间隔 4h16m、掉 0 的最小轮间隔 0.042s，
+    # 两个区间完全重叠 ⇒ 失效与轮间隔无关，300 这个数与命中上限差两个数量级。
+    # 谁在读它（全部消费方，且都只需要"距上次转发是否超过一个粗略窗口"这种弱判据）：
+    #   1. inject.py::_cache_warm → E4 冻结计划的复用门；
+    #   2. route.py::_CacheWarmthAdapter.is_warm → 粘性 FAILOVER 的自动释放（G14/MQ-RT1）。
+    # 谁**不该**读它：ADR-0033 §2.3 的装配触发门——它改用上游直接回报的
+    # `cache_read_tokens == 0`（事实，非推断）。新代码要判 cache 冷热，先看那一条。
     cache_ttl_s: int = 300
+    # 批 Z · Z2.1（MQ-A34 ①，2026-09-24）：该模型的上下文窗口（token）。**0 = 未配置**，
+    # 等于不参与任何窗口判断（选池照常、不告警、不裁剪）——"没配的用户什么都不变"。
+    # 值由用户从 `ollama show` / 厂商文档抄进 routing.toml，BladeX **不猜、不探测**。
+    # 消费方：① `MemoryAwareRouter.route` 动态选池排除放不下的模型 / 静态命中只告警；
+    # ② proxy `surface_budget` 按 窗口 − agent prompt − 输出下限 裁 BladeX 自己的注入面。
+    context_window: int = 0
 
 
 class RouteDecision(BaseModel):
@@ -167,6 +206,21 @@ class RouteDecision(BaseModel):
     reason: str = ""
     # primary 被选出时所用的合格池（供 failover：同池内切换，保能力）。
     pool: list[ModelCandidate] = Field(default_factory=list)
+    # Z2.1：primary 的上下文窗口（token；0 = 未配置）。proxy 侧裁注入面要用，
+    # 从 decision 带出去比让 proxy 再回查 routing_config 少一个不一致点。
+    context_window: int = 0
+
+
+def fits_context_window(cand: ModelCandidate, prompt_tokens_est: int | None,
+                        output_floor_tokens: int = 0) -> bool:
+    """Z2.2 唯一判据："放得下" = 估算 prompt + 输出下限 ≤ 窗口。
+
+    窗口未配（0）或没有估算值 ⇒ **恒为放得下**（不参与判断，照常入池）。
+    三个消费点（动态选池 / 粘性沿用 / 静态命中告警）都调它，不各写一份。
+    """
+    if not cand.context_window or prompt_tokens_est is None:
+        return True
+    return int(prompt_tokens_est) + int(output_floor_tokens or 0) <= int(cand.context_window)
 
 
 # ── 策略数据（agent 中立，由 proxy 侧 routing_config 产）────────────────────
@@ -418,6 +472,11 @@ class MemoryAwareRouter:
         context_chars: int | None = None,
         req_model: str | None = None,
         allowed_exposure: str = "public",
+        # 批 Z · Z2.2：窗口感知。`prompt_tokens_est` = 调用方按 chars/token 估的 prompt
+        # 规模（含 agent 工具 schema 与硬规则）；`output_floor_tokens` = 给输出预留的下限。
+        # None / 0 ⇒ 窗口判断整体不参与（逐字零行为）。
+        prompt_tokens_est: int | None = None,
+        output_floor_tokens: int = 0,
         # Phase 2 预留（本卡不实现，签名保持兼容）
         facts: list[Fact] | None = None,
         hard_rules: list[HardRule] | None = None,
@@ -455,13 +514,54 @@ class MemoryAwareRouter:
         # `test_adr0028_e3_route_order.py`。
 
         # T5b: req_model 显式指定（opt-in；per-agent 覆盖表优先于全局 enabled）
-        if req_model and self._request_enabled_for(agent_id):
-            explicit = self._match_requested(req_model)
-            if explicit is not None:
-                self._warn_static_sensitivity(
-                    RouteSource.REQUESTED, explicit.model, allowed, allowed_exposure)
-                return self._route_requested(explicit, requires, session_id, None,
-                                             agent_id=agent_id)
+        #
+        # 🔴 MQ-R13（2026-09-19）：请求体写死 model 却被 filter 裁判静默换掉。两条旁路
+        # 路径此前**一条告警都不打**——原则 9 要求"静态被旁路必须可 grep"，否则用户看到
+        # 的只有 `source=filter`，无从知道自己写的 model 去哪了（R4 段 B 的形状：
+        # 写死 deepseek-v4-flash，前两轮被换成 doubao-seed-2.0-lite）。
+        # 两条路径都只打告警、不抛错，理由是刚性原则 10（BladeX 适配 agent，不要求 agent 改）：
+        # Claude Code 逐轮发自己的模型名（`claude-*`），那些名字本来就不在 [[models]] 里，
+        # 抛错等于打死全部 CC 流量；"按配置回落动态路由"才是这两条的设计意图，
+        # 缺的只是**让它可被发现**。
+        if req_model:
+            if not self._request_enabled_for(agent_id):
+                logger.warning(
+                    "route_request_model_ignored_disabled agent=%s req_model=%s -- "
+                    "[strategies.request] is OFF for this agent; the model written in the "
+                    "request body is ignored and dynamic routing decides. "
+                    "Fix routing.toml: [strategies.request].enabled or "
+                    "[strategies.request.agent_overrides].",
+                    agent_id, req_model,
+                )
+            else:
+                explicit = self._match_requested(req_model)
+                if explicit is not None:
+                    self._warn_static_sensitivity(
+                        RouteSource.REQUESTED, explicit.model, allowed, allowed_exposure)
+                    self._warn_static_context_window(
+                        RouteSource.REQUESTED, agent_id, explicit,
+                        prompt_tokens_est, output_floor_tokens)
+                    return self._route_requested(explicit, requires, session_id, None,
+                                                 agent_id=agent_id)
+                # 🔴 批 W 拍板 (12)（2026-09-22）：这一格从"告警 + 回落动态"改为
+                # **报错给客户端**。理由是刚性原则 9 的"能力不满足 ≠ 硬约束，
+                # 是配置错误——程序不替用户改选择"：策略对这个 agent 明确开着，
+                # 说明用户要的就是"我写哪个就用哪个"；名字不存在时悄悄换一个，
+                # 等于把用户唯一的显式选择静默旁路（MQ-R13 的本体）。
+                # 覆盖面 live 校核（09-22，全量 logs/proxy-*.log）：
+                #   `route_request_model_unknown` **0 次**；claude-code 99/99 轮
+                #   `source=requested`（发的 openai/deepseek-v4-flash 在 [[models]] 内）；
+                #   hermes:default(80) / dsh(9) 落的是「策略关」那一格，不受本改动影响。
+                logger.warning(
+                    "route_request_model_unknown agent=%s req_model=%s -- "
+                    "[strategies.request] is ON for this agent but the name is not in "
+                    "routing.toml [[models]] (full name or display name); refusing the "
+                    "request instead of silently picking another model. "
+                    "Fix routing.toml [[models]], or turn this agent off in "
+                    "[strategies.request.agent_overrides].",
+                    agent_id, req_model,
+                )
+                raise UnknownRequestedModelError(req_model, agent_id)
 
         # ① 静态选池（team → principal → agent）——**不带敏感度裁剪**（静态胜出）
         static_pool, static_source = self._select_static_pool(
@@ -471,6 +571,10 @@ class MemoryAwareRouter:
         if static_hit:
             self._warn_static_sensitivity(
                 static_source, static_pool[0].model, allowed, allowed_exposure)
+            # Z2.2 / 刚性原则 9：静态命中放不下 ⇒ **不改写路由**，只留可 grep 的告警。
+            self._warn_static_context_window(
+                static_source, agent_id, static_pool[0],
+                prompt_tokens_est, output_floor_tokens)
 
         # 静态未命中时才轮到敏感硬边界：允许池空 → 快返错（fail-closed 不变）
         if not static_hit and allowed is not None and not allowed:
@@ -498,7 +602,8 @@ class MemoryAwareRouter:
         # vs `source=requested` 1 次，配置的 GLM-5.2 形同虚设）。
         # 现在它排在静态策略之后，且静态命中时整段跳过。
         if auxiliary and not static_hit:
-            aux_pool = self._aux_pool(requires, allowed)
+            aux_pool = self._filter_fits(self._aux_pool(requires, allowed),
+                                         prompt_tokens_est, output_floor_tokens)
             if aux_pool:
                 return self._decision(
                     aux_pool, RouteSource.AUXILIARY,
@@ -545,6 +650,12 @@ class MemoryAwareRouter:
                     if cap_override is not None:
                         source = cap_override
 
+        # Z2.2 窗口感知（动态推断，静态命中整段跳过——原则 9）：排除放不下的模型；
+        # 没配窗口的模型不参与判断、照常入池。全被排除 ⇒ 保留原池 + warning，
+        # 与规模 floor / 健康过滤同一条纪律：宁试也不打死请求。
+        if not static_hit:
+            pool = self._filter_fits(pool, prompt_tokens_est, output_floor_tokens)
+
         # ③ empty pool → 结构化错误（不静默降级）
         if not pool:
             raise NoCapableCandidateError(
@@ -575,11 +686,33 @@ class MemoryAwareRouter:
         pool = self._filter_healthy(pool)
         health_degraded = bool(pool) and pool[0].model != pre_health_pool[0].model
 
+        # 🔴 MQ-R14（批 W W4，2026-09-22）：熔断挤掉**静态选出的首选**时升为 warning。
+        # 这一格属原则 9 允许的"硬约束推翻静态"（不是缺陷——熔断是客观事实，
+        # 不是"我觉得该换一个"），但原则同时要求它**必须留可 grep 的告警**：
+        # 此前只有 `_filter_healthy` 里那条 `info route_skip_unhealthy`，
+        # 与正常 failover 混在同一级别，用户看到 `source=agent` 却跑了另一个模型，
+        # 无从知道自己配置的那个去哪了。
+        # 覆盖面：TEAM / PRINCIPAL / AGENT（`static_hit` 那三档）。
+        # **不覆盖 REQUESTED** —— 它在上面 `_route_requested` 就提前返回了，
+        # 根本不过 `_filter_healthy`（熔断中的 req_model 是进 failover 池，不是被换掉）。
+        # 调用上下文由调用方在这里判（`_filter_healthy` 只有 pool 一个入参，猜不出）。
+        if static_hit and health_degraded:
+            logger.warning(
+                "route_static_model_circuit_open source=%s agent=%s static_model=%s "
+                "used_model=%s reason=health_circuit_open -- the model pinned by config "
+                "is in circuit-breaker cooldown; a hard constraint overrode your static "
+                "choice for this request (this is not a routing decision). "
+                "If it keeps happening, the pinned model is failing upstream.",
+                source.value, agent_id, pre_health_pool[0].model, pool[0].model,
+            )
+
         # T2: 会话粘性（只升不降）
         # 刚性原则 10：粘性是**动态推断**，静态策略命中时不得改写其选择——
         # 否则同一 agent 配了固定模型，却因为上一轮粘住别的模型而被改掉。
         if not static_hit:
-            sticky_d = self._try_sticky(session_id, pool, requires, allowed)
+            sticky_d = self._try_sticky(session_id, pool, requires, allowed,
+                                        prompt_tokens_est=prompt_tokens_est,
+                                        output_floor_tokens=output_floor_tokens)
             if sticky_d is not None:
                 return sticky_d
 
@@ -715,8 +848,11 @@ class MemoryAwareRouter:
         pool: list[ModelCandidate],
         requires: list[str] | None,
         allowed: set[str] | None = None,
+        *,
+        prompt_tokens_est: int | None = None,
+        output_floor_tokens: int = 0,
     ) -> RouteDecision | None:
-        """粘性判定：新档 <= 粘住档 且 sticky 模型能力合格、健康 → 沿用。
+        """粘性判定：新档 <= 粘住档 且 sticky 模型能力合格、健康、**放得下** → 沿用。
 
         注意用能力直查而非池成员判断——filter 的三档池互斥，
         判 weak 时 sticky 的 medium 模型不在 weak 池内，但正是"不降档"要保的对象。
@@ -750,6 +886,12 @@ class MemoryAwareRouter:
             return None  # 能力不合格（如带图但 sticky 无 vision）
         if self._health is not None and not self._health.is_healthy(cand.model):
             return None
+        if not fits_context_window(cand, prompt_tokens_est, output_floor_tokens):
+            logger.info(
+                "route_sticky_no_fit session=%s model=%s context_window=%s prompt_tokens_est=%s",
+                session_id[:16], cand.model, cand.context_window, prompt_tokens_est,
+            )
+            return None  # Z2.2：粘住的模型放不下这一轮 ⇒ 不沿用，回正常选池
         self._sticky.move_to_end(session_id)
         rest = [c for c in pool if c.model != cand.model]
         # MQ-RT3：reason 里带上 origin 与持有时长——G14 之前 failover 造成的
@@ -1106,6 +1248,43 @@ class MemoryAwareRouter:
         )
         return pool
 
+    def _filter_fits(self, pool: list[ModelCandidate], prompt_tokens_est: int | None,
+                     output_floor_tokens: int) -> list[ModelCandidate]:
+        """Z2.2：剔掉放不下的候选；剔空则保留原池 + warning（不打死请求）。"""
+        if prompt_tokens_est is None or not pool:
+            return pool
+        fits = [c for c in pool if fits_context_window(c, prompt_tokens_est, output_floor_tokens)]
+        if fits:
+            if len(fits) < len(pool):
+                logger.info(
+                    "route_skip_context_window prompt_tokens_est=%s output_floor=%s skipped=%s",
+                    prompt_tokens_est, output_floor_tokens,
+                    [(c.model, c.context_window) for c in pool if c not in fits],
+                )
+            return fits
+        logger.warning(
+            "route_context_window_no_fit prompt_tokens_est=%s output_floor=%s pool=%s -> keeping pool",
+            prompt_tokens_est, output_floor_tokens,
+            [(c.model, c.context_window) for c in pool],
+        )
+        return pool
+
+    def _warn_static_context_window(self, source: RouteSource, agent_id: str | None,
+                                    cand: ModelCandidate, prompt_tokens_est: int | None,
+                                    output_floor_tokens: int) -> None:
+        """Z2.2 / 刚性原则 9：静态命中放不下 ⇒ 路由**逐字不变**，告警点名五项指向配置。"""
+        if fits_context_window(cand, prompt_tokens_est, output_floor_tokens):
+            return
+        logger.warning(
+            "route_static_context_window_exceeded source=%s agent=%s model=%s "
+            "context_window=%s prompt_tokens_est=%s output_floor=%s -- config pins a model "
+            "whose context window cannot hold this request; the route is NOT rewritten "
+            "(static config wins), upstream will truncate or reject. Fix routing.toml "
+            "([[models]].context_window or the strategy), not the code.",
+            source.value, agent_id, cand.model, cand.context_window,
+            prompt_tokens_est, output_floor_tokens,
+        )
+
     # ── auxiliary（T9 保留）─────────────────────────────────────────────────
 
     def _aux_pool(
@@ -1181,6 +1360,7 @@ class MemoryAwareRouter:
         return RouteDecision(
             model=c.model, api_base=c.api_base, api_key=c.api_key,
             tier=c.tier, provider=c.provider, source=source, reason=reason, pool=pool,
+            context_window=c.context_window,
         )
 
     def _pool_reason(

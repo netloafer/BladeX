@@ -86,7 +86,7 @@ def last_user_text(messages: list[dict]) -> str:
     """末条 user 消息的文本（含 list content 的多模态形态）。
 
     = 进入理解层之前的**原始 query**。此前同一段逻辑有三份实现
-    （`server._extract_query` / `inject._understand` 里的 open 单元取文 /
+    （`server._extract_query` / `inject._understand`（批 U · U1.4 已删）里的 open 单元取文 /
     离线仪器各自的近似），而"筛子和被测系统各算各的"正是本仓 MQ-S4 的形态。
     这里是唯一实现，另两处委托过来。
     """
@@ -135,8 +135,8 @@ def retrieval_query(
 ) -> tuple[str, list[str]]:
     """整轮 messages → **生产实际用于检索的 query**（纯函数、零 LLM、可离线复现）。
 
-    热路径（`inject._understand`）与离线仪器（`scripts/eval_consumption.py`）
-    共用这一条路。仪器若自己近似一份，就会拿"末条 user 原文"去判相关性，
+    热路径（`inject._understand`，🔴 批 U · U1.4 随 E4.3 冷启裁剪删除——现只剩离线仪器与
+    `server._extract_query` 的取文段）与离线仪器（`scripts/eval_consumption.py`）共用这一条路。仪器若自己近似一份，就会拿"末条 user 原文"去判相关性，
     而检索用的是剥完信封、必要时被 open 单元意图扩写过的串——
     claude-code 那种 p50 七万字符的信封会让相关性虚高，「继续」这类短指代
     会让它虚低，且两个方向随 agent 而异。参照系脱钩的尺子给不出可用的判读。

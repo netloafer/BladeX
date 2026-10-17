@@ -1,8 +1,11 @@
-"""U10（ADR-0026 R5）：画像卡与工具习惯。
+"""U10（ADR-0026 R5）：画像**写侧捕获**与工具习惯。
 
-覆盖：规则文件被动捕获（确定性）/ 工具计数器聚合 / 渲染 / audience 隔离
-（codex 工具习惯不出现在 hermes 注入）/ 重建等价（重放两次一致）/
-U7 ①平面接线（get_profile_cards 进常驻卡）/ 默认关零回归。
+2026-09-18 批 S（拍板 0.3.0-(5)，ADR-0034 §3.2）：①平面画像卡 / 习惯卡的**注入渲染**
+（`get_profile_cards`）删除——注入面 09-03 起不读它，零生产调用点，live 484 轮 `planes=False`。
+写侧捕获（规则文件 / 工具计数）与投影数据源（`get_profile_md` / `get_tool_stats` /
+`get_rule_files`）保留：它们喂 USER.md / AGENT.md 投影与 `/admin/profiles`。本文件改守这一面：
+规则文件被动捕获（确定性）/ 工具计数器聚合 / per-agent 隔离 / 重建等价 / 默认关零回归 /
+渲染入口不许回来。
 """
 
 from __future__ import annotations
@@ -16,8 +19,6 @@ from bladex_core.profile import detect_rule_files
 from bladex_proxy.models import Identity, ToolEvent, Turn, TurnStatus
 from bladex_proxy.storage.memory_hub import MemoryHub
 from bladex_proxy.storage.memory_index import MemoryIndex
-
-# （原 `_pin_index_recall_on` 夹具随 2026-09-03 S1 删除：该开关与主动检索路径已不存在。）
 
 
 class MockEmbedder:
@@ -74,44 +75,40 @@ def _make_hub(tmpdir: str) -> MemoryHub:
     return ledger
 
 
-def test_profile_capture_and_render(monkeypatch: pytest.MonkeyPatch):
+def _stats(index: MemoryIndex, base: str) -> dict[str, int]:
+    """U10 工具计数器（`profile/agent/<base>` 的 tools 表）；E7.4 结果维度统计另有 `get_tool_stats`。"""
+    tools = index._profile_get(f"profile/agent/{base}").get("tools", {})  # noqa: SLF001
+    return {k: int(v) for k, v in tools.items()}
+
+
+def test_profile_capture_writes_rulefile_and_tool_stats(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("BLADEX_PROFILE_CARDS", "1")
     with tempfile.TemporaryDirectory() as tmpdir:
         ledger = _make_hub(tmpdir)
         index = MemoryIndex(Path(tmpdir) / "index", embedder=MockEmbedder(), read_only=False)
         index.open()
         index.rebuild_from_hub(ledger)
-
-        # User 卡：规则文件捕获
-        cards = index.get_profile_cards("u1", "codex")
-        flat = [ln for card in cards for ln in card]
-        assert any("CLAUDE.md" in ln for ln in flat)
-        # Agent 卡：工具计数（bash 3 次 > read_file 1 次）
-        agent_line = next(ln for ln in flat if ln.startswith("[Agent 习惯: codex]"))
-        assert "bash(3)" in agent_line and "read_file(1)" in agent_line
+        assert "claude.md" in [n.lower() for n in index.get_rule_files("codex")]
+        assert _stats(index, "codex") == {"bash": 3, "read_file": 1}
         index.close()
         ledger.close()
 
 
-def test_profile_audience_isolation(monkeypatch: pytest.MonkeyPatch):
-    """codex 的工具习惯不出现在 hermes 的卡里（audience 隔离）。"""
+def test_tool_stats_are_per_agent(monkeypatch: pytest.MonkeyPatch):
+    """codex 的工具习惯不混进 hermes（audience 隔离在写侧就成立）。"""
     monkeypatch.setenv("BLADEX_PROFILE_CARDS", "1")
     with tempfile.TemporaryDirectory() as tmpdir:
         ledger = _make_hub(tmpdir)
         index = MemoryIndex(Path(tmpdir) / "index", embedder=MockEmbedder(), read_only=False)
         index.open()
         index.rebuild_from_hub(ledger)
-        flat = [ln for card in index.get_profile_cards("u1", "hermes:default") for ln in card]
-        agent_lines = [ln for ln in flat if ln.startswith("[Agent 习惯")]
-        assert agent_lines and "hermes" in agent_lines[0]
-        assert "bash" not in agent_lines[0]
-        assert "web_search(1)" in agent_lines[0]
+        assert _stats(index, "hermes") == {"web_search": 1}
         index.close()
         ledger.close()
 
 
 def test_profile_rebuild_equivalence(monkeypatch: pytest.MonkeyPatch):
-    """两个独立 Memory Index 重放同一 Memory Hub → 画像卡逐字一致（G6）。"""
+    """两个独立 Memory Index 重放同一 Memory Hub → 投影数据源逐字一致（G6）。"""
     monkeypatch.setenv("BLADEX_PROFILE_CARDS", "1")
     with tempfile.TemporaryDirectory() as tmpdir:
         ledger = _make_hub(tmpdir)
@@ -120,26 +117,28 @@ def test_profile_rebuild_equivalence(monkeypatch: pytest.MonkeyPatch):
             index = MemoryIndex(Path(tmpdir) / name, embedder=MockEmbedder(), read_only=False)
             index.open()
             index.rebuild_from_hub(ledger)
-            rendered.append(index.get_profile_cards("u1", "codex"))
+            rendered.append((index.get_rule_files("codex"), _stats(index, "codex"),
+                             index.get_profile_md("u1", "codex")))
             index.close()
-        assert rendered[0] == rendered[1] and rendered[0]
+        assert rendered[0] == rendered[1] and rendered[0][1]
         ledger.close()
 
 
 def test_profile_explicitly_off(monkeypatch: pytest.MonkeyPatch):
-    """显式关闭：不产出画像卡（回退保证）。
-
-    ADR-0027 §5.4 起该机制**默认开**（此前默认关，导致验收过了但发出去的仍是旧行为），
-    所以这条回退保证要显式设开关为 0 —— 回滚通道本身没变，变的是默认值。
-    """
+    """显式关闭：写侧不捕获（回退保证；ADR-0027 §5.4 起默认开，回滚通道不变）。"""
     monkeypatch.setenv("BLADEX_PROFILE_CARDS", "0")
     with tempfile.TemporaryDirectory() as tmpdir:
         ledger = _make_hub(tmpdir)
         index = MemoryIndex(Path(tmpdir) / "index", embedder=MockEmbedder(), read_only=False)
         index.open()
         index.rebuild_from_hub(ledger)
-        assert index.get_profile_cards("u1", "codex") == []
+        assert _stats(index, "codex") == {}
+        assert index.get_rule_files("codex") == []
         index.close()
         ledger.close()
 
 
+def test_injection_renderers_do_not_come_back():
+    """废除清单的可 grep 形态（ADR-0034 §5）：三张常驻卡的注入渲染入口不许回来。"""
+    assert not hasattr(MemoryIndex, "get_profile_cards")
+    assert not hasattr(MemoryIndex, "project_card_for")

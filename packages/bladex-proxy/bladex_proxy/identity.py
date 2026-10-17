@@ -26,6 +26,7 @@ from bladex_core.envelope import ENVELOPE_MAX_OFFSET
 from bladex_core.flags import flag_enabled
 
 from bladex_proxy.agent_bucket import (
+    BARE_SESSION_HEADERS,
     VENDOR_SESSION_SUFFIXES,
     bucket_unknown_agent,
     extract_vendor_ids,
@@ -228,6 +229,48 @@ _AUX_USER_PATTERNS: list[tuple[str, str]] = [
     # 与 `envelope._WHOLE_MESSAGE_MARKERS` 逐字一致（对账测试守）。
     ("codex_history_injection", "The following is the Codex agent history"),
     ("session_resume_recap", "The user stepped away and is coming back"),
+    # ── 批 E · E5（拍板 (41)，2026-09-29；病例与读数见 report-batch-E-20260928.md §E3.1）──
+    # MQ-A85：Claude Code「输入建议生成」——与主对话逐字同形（同 session header / 同 31–32 个
+    # 工具 / 同 metadata），**唯一区别是 user 模板前缀**；全库 10 轮里 4 轮拿到账本面。
+    # 此前 `_AUX_SYSTEM_KEYWORDS` 里有一条 "suggest what the user might naturally type next"
+    # ——放错了侧（它在 user 消息里，不在 system 里），所以从未命中。归完整 aux。
+    ("claude_code_suggestion_mode", "[SUGGESTION MODE:"),
+    # MQ-A84：codex 上下文压缩检查点——codex 把它标成 `thread_source=user`（A82 盖不住），
+    # 零工具（账本面已被 no_tools 挡）但 35 轮全进了蒸馏。与 hermes / CC 的
+    # `summarization_checkpoint` 同口径：归完整 aux。
+    ("codex_context_checkpoint", "You are performing a CONTEXT CHECKPOINT COMPACTION"),
+    # ── 批 Q3A · MQ-S44（2026-09-29）：后台进程完成通知，以 user 角色进来 ──
+    # `[IMPORTANT: Background process proc_<id> completed normally (exit code 0).\nCommand: …`
+    # 是 agent 运行时的机器通知，不是用户说的话；此前判 REAL ⇒ 进蒸馏又拿账本面（归档账
+    # L3233：一条已确凿开了新卡）。Hub 只读副本实查：末条 user 以它开头的 11 轮**全是
+    # hermes:default**（调度提示词写的 Claude Code 是误记）。与 E5 同机制（前缀 + 信封偏移门）。
+    # 🔴 归 **DISTILL_ONLY**，不是 E5 那样的完整 aux：这 11 轮的 assistant 侧在做实事——
+    # 读训练结果、出 1,076 字的模型对比表、接着调工具。完整 aux = 这些结论不进蒸馏 +
+    # 整轮打到便宜档（刚性原则 9 那次 07-28 事故的形状）。user 侧是通知、assistant 侧照收，
+    # 与 `claude_code_task_notification` 同口径。不入 CONTINUATION（不给账本面，保守）。
+    ("hermes_background_process", "[IMPORTANT: Background process"),
+    # ── MQ-A92（2026-10-15，批 HO 回放撞出；病例 report-batch-HO-20261015.md §3.3）──
+    # Claude Code 活动摘要子调用："Describe your most recent action in 3-5 words
+    # using present tense (-ing). Name the file or function, not the branch. …"。
+    # 与 MQ-A85（`[SUGGESTION MODE:`）同一形态——与主对话同 system prompt、同工具面，
+    # 唯一可辨的是末条 user 的机器指令模板。实测 9 轮全未判 aux 且 ledger_face=True
+    # ⇒ 账本候选段照常按它的文字匹配（批 HO 30 天回放「收紧前」无关 21 条里 16 条来自它）。
+    # 归完整 aux（同 A85/A84 口径：蒸馏跳、可降档、无账本面）。
+    # 🔴 取共同前缀 "…action in" 截止，不写到 "3-5 words"——词数/时态是可变的尾巴
+    # （MQ-S45 同课：指纹按一次采样写死，agent 换个变体就复发）。
+    ("claude_code_activity_summary", "Describe your most recent action in"),
+    # ── MQ-A93（2026-10-16）：dsh 上下文压缩引擎请求 ──
+    # dsh 自己压缩上下文时发的请求（末条 user 以 "You are now acting as a compaction
+    # engine for this AI coding assistant. Condense the conversation ABOVE…" 开头）。
+    # 与 MQ-A84（codex CONTEXT CHECKPOINT COMPACTION）同一形态——零工具、末条 user 是
+    # 机器指令模板 ⇒ 此前 auxiliary=False、ledger_face=True，整段压缩摘要被当事实提炼。
+    # 归完整 aux（同 A84/A85/A92 口径）。
+    # 🔴 marker 必须越过 "assistant." 后的 "Condense the conversation ABOVE"：
+    # 我们的任务消息会以 『…以 `You are now acting as a compaction engine for this
+    # AI coding assistant.` 开头』自引（Hub 实测 12 条，off=38），只到 "assistant."
+    # 为止——取短了会把自引当信封（MQ-A19 同课）。Hub 8 条真轮公共前缀 1802 字符，
+    # "Condense the conversation ABOVE" 在其内且与自引截止点错开。
+    ("dsh_compaction_engine", "You are now acting as a compaction engine for this AI coding assistant. Condense the conversation ABOVE"),
     # 注：转录形态 "User: …\n\nAssistant: …" 用结构化匹配（见 classify_auxiliary），
     # 不进本表——"User:" 做子串前缀太泛，会误伤真实用户消息。
 ]
@@ -265,6 +308,8 @@ DISTILL_ONLY_AUX_RULES: frozenset[str] = frozenset({
     "hermes_skill_library_update",
     "codex_history_injection",
     "session_resume_recap",
+    # MQ-S44（批 Q3A）：后台进程完成通知——user 侧是机器通知，assistant 侧接着做实事。
+    "hermes_background_process",
 })
 
 
@@ -311,6 +356,8 @@ DISTILL_ONLY_ENVELOPE_CONTRACT: dict[str, tuple[str, bool]] = {
     "truncated_response_continue": ("truncated_response_continue", True),
     "codex_history_injection": ("codex_history_injection", True),
     "session_resume_recap": ("recap_scaffold", True),
+    # MQ-S44（批 Q3A）：整条就是通知（命令 + 输出），没有用户意图。
+    "hermes_background_process": ("hermes_background_process", True),
 }
 
 
@@ -464,7 +511,8 @@ def is_isolated_subcall(messages: list[dict]) -> bool:
     return len(non_empty) == 1 and non_empty[0].get("role") == "user"
 
 
-def classify_turn_disposition(messages: list[dict]) -> tuple[str, str]:
+def classify_turn_disposition(messages: list[dict], *, agent_id: str = "",
+                              headers: dict[str, str] | None = None) -> tuple[str, str]:
     """一轮在 **rebuild 视角**下的处置三分，返回 `(turn_class, aux_rule)`。
 
     `turn_class` ∈ `bladex_core.task_goal.TURN_CLASSES`：
@@ -488,6 +536,11 @@ def classify_turn_disposition(messages: list[dict]) -> tuple[str, str]:
 
     is_aux, rule = classify_auxiliary(messages)
     if not is_aux:
+        # 批 E（MQ-A82）：codex 自报的内部轮次不在消息里、在 header 快照里——重判同样
+        # 从存下来的 header **重算**（不读冻结的 `identity.auxiliary`，与 R2 纪律一致）。
+        codex_internal = resolve_codex_internal_turn(agent_id, headers) if headers else ""
+        if codex_internal:
+            return TURN_DROPPED, codex_internal
         return TURN_REAL, rule
     return (TURN_SCAFFOLD if rule in DISTILL_ONLY_AUX_RULES else TURN_DROPPED), rule
 
@@ -534,6 +587,13 @@ _AUX_SYSTEM_KEYWORDS: list[str] = [
     # **子调用期待的 schema 对不上**。指纹同样落 system 侧。
     "generate 0 to 3 hyperpersonalized suggestions",
     "you will be presented with a user's message and you need to generate a title",
+    # ── 批 E · E5（拍板 (41)）：MQ-A86 dsh 会话标题生成 ──
+    # 形态：system = "Create a concise title for an AI coding-assistant session from the
+    # supplied human messages…"，user = "Generate the session title from this JSON array…"
+    # （用户原话只以 JSON 片段出现在 user 侧）。全库 17 轮零 aux 指纹、全进蒸馏；其中 3 轮
+    # 被同源粘性错归 hermes:default（A 域读数，另登）。指纹落 system 侧，与 hermes
+    # 「you name chat sessions」同机制。
+    "create a concise title for an ai coding-assistant session",
 ]
 
 
@@ -800,6 +860,106 @@ def resolve_subagent(agent_id: str, headers: dict[str, str] | None) -> str:
     return ""
 
 
+#: ── Codex 内部轮次：按 codex **自己声明**的 `thread_source` 判 aux（批 E · MQ-A82，2026-09-28）──
+#:
+#: 病例（`report-batch-E-20260928.md` §E0）：Jason 让 codex 做**一个**「0.3.0 复核」任务，
+#: Hub 里多了**三本**账本。第二本建在 Codex Desktop 的**会话标题生成子调用**里
+#: （user 文本 "You are a helpful assistant. You will be presented with a user prompt…"），
+#: 它与主会话**同 scope 同秒**开工，建本后把 scope 的激活位从正主 `ldg-79de…` 抢成
+#: 标题本 `ldg-473c…`；主会话下一轮看到一本「生成标题」的账本、候选段为空
+#: （tool 面 + 有激活本 ⇒ 不注候选，MQ-L69 的表），只能再建第三本。
+#:
+#: 🔴 为什么既有的两道结构闸都没拦住它：
+#:   - `brings_no_tools`（MQ-L21）：08-27 的标题/建议生成**零自带工具**，这次 Desktop 的
+#:     `thread_title` 子调用**带了 8 个自带工具**（exec_command / view_image / mcp__node_repl…），
+#:     闸的前提不成立；codex-tui 的同类子调用仍零工具、仍被它挡住（同日 15:30 / 19:44 两例）。
+#:   - `_machine_text_mark`（`agency/notes.py`）：内容启发式，**设计上只告警不拦**——它认的
+#:     "you are a " 开头在真实用户轮里也常见（本库 09-14～09-17 二十余轮 Jason 的
+#:     "You have one bug-fix task…" 批处理提示全是真任务），拦了就是误伤；
+#:     刚性原则 15：启发式否决显式动作之前要先举证，它举不出。
+#:
+#: 判据改用 **codex 在协议里自报的结构字段**：header `x-codex-turn-metadata`（JSON）的
+#: `thread_source`。全库 9,020 轮 codex（07-29～09-28）只见五个值：
+#:
+#:   user（8,833 轮）           真实用户轮，含 `turn_trigger=composer/edit_user_message`
+#:   ambient_suggestions（92）  Desktop「hyperpersonalized suggestions」= **MQ-A23 本体**
+#:   system（44）               标题生成（tui/Desktop 两种模板）· 上下文压缩检查点 · 线程 fork 填表
+#:   thread_title（22）         Desktop 标题+描述生成（本批病例；13 轮带自带工具）
+#:   subagent（18）             guardian 审批子代理（走 `x-openai-subagent` / `codex_history_injection`，**不动**）
+#:
+#: 三个内部值**全部**带 `text.format.type=json_schema`（要一个结构化值，不是做任务），
+#: 历史上从这三类里建出 **9 本**噪声账本（ambient 6 · thread_title 2 · system 1）；
+#: `thread_source=user` 的轮次里 `json_schema` 出现 **0** 次。
+#:
+#: 处置 = **完整 aux**（`is_auxiliary=True`，`aux_source="codex_thread_source:<值>"`，不进
+#: `DISTILL_ONLY_AUX_RULES` / `CONTINUATION_AUX_RULES`）⇒ 账本族与记忆族都不注、蒸馏跳过、
+#: 路由可走 aux 降档（静态策略仍压过它，刚性原则 9）。与 hermes「you name chat sessions」同口径。
+#:
+#: 🔴 只认**白名单**里的三个值：`subagent` 保持原路（它有身份、有记忆价值，MQ-A12）；
+#: 没见过的新值**不拦、打告警** `identity_codex_thread_source_unknown`（可 grep）——
+#: 拦了才发现拦错，库里没有依据可以纠正（原则 15）。header 缺失 / 不是 JSON / 没有该字段 ⇒ ""。
+#: 只看解析出的 agent 是 codex 的请求（与 `resolve_subagent` 同一条纪律：只读自己声明的 header）。
+#: 值来自 header；header 没有时退到请求体 `client_metadata` 里的同名字段（09-28 抽样两处逐字相同；
+#: 08-23 之前入库的 692 轮只有体内那份）。
+CODEX_TURN_METADATA_HEADER = "x-codex-turn-metadata"
+CODEX_THREAD_SOURCE_USER = "user"
+CODEX_INTERNAL_THREAD_SOURCES: frozenset[str] = frozenset(
+    {"thread_title", "ambient_suggestions", "system"})
+CODEX_INTERNAL_TURN_RULE_PREFIX = "codex_thread_source:"
+
+
+def codex_turn_metadata(headers: dict[str, str] | None,
+                        body: dict[str, Any] | None = None) -> dict[str, Any]:
+    """`x-codex-turn-metadata`（JSON）解析成 dict；取不到 / 不是 JSON 对象 ⇒ `{}`。
+
+    唯一解析点（两个消费方：`codex_thread_source` 判内部轮次、
+    `project_identity.codex_workspace_root` 取工作区根）。header 优先，
+    没有时退到请求体 `client_metadata` 里的同名字段。
+    """
+    raw = ""
+    if headers:
+        for k, v in headers.items():
+            if str(k).lower() == CODEX_TURN_METADATA_HEADER and v:
+                raw = str(v)
+                break
+    if not raw and isinstance(body, dict):
+        cm = body.get("client_metadata")
+        if isinstance(cm, dict):
+            raw = str(cm.get(CODEX_TURN_METADATA_HEADER) or "")
+    if not raw:
+        return {}
+    import json  # noqa: PLC0415
+
+    try:
+        meta = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def codex_thread_source(headers: dict[str, str] | None,
+                        body: dict[str, Any] | None = None) -> str:
+    """`x-codex-turn-metadata` 里的 `thread_source`；取不到 ⇒ ""（结构解析，零启发式）。"""
+    return str(codex_turn_metadata(headers, body).get("thread_source") or "").strip()
+
+
+def resolve_codex_internal_turn(agent_id: str, headers: dict[str, str] | None,
+                                body: dict[str, Any] | None = None) -> str:
+    """codex 自报的内部轮次 ⇒ 规则名 `codex_thread_source:<值>`；否则 ""。见上方常量注释。"""
+    if not agent_id or (agent_id.split(":")[0] != "codex"):
+        return ""
+    src = codex_thread_source(headers, body)
+    if not src or src == CODEX_THREAD_SOURCE_USER:
+        return ""
+    if src in CODEX_INTERNAL_THREAD_SOURCES:
+        return f"{CODEX_INTERNAL_TURN_RULE_PREFIX}{src}"
+    if src != "subagent":
+        # 新形态：不拦、可 grep（原则 15：拦之前先举证）。
+        logger.warning("identity_codex_thread_source_unknown", agent_id=agent_id,
+                       thread_source=src)
+    return ""
+
+
 #: 承载"系统指令"的角色。**`developer` 必须在内**（2026-08-19 Pi 实测）。
 #:
 #: 🔴 OpenAI 为 reasoning 系模型引入了 `developer` 角色取代 `system`，Pi 等较新的
@@ -971,13 +1131,15 @@ def resolve_identity(
     headers: dict[str, str],
     request: ChatCompletionRequest,
     registry: Any | None = None,
+    *,
+    body: dict[str, Any] | None = None,
 ) -> tuple[Identity, AgentSource]:
     """从请求头 + 请求体解析 Identity。
 
     分层：
       user_id: 见下（ADR-0021 §2.3，2026-08-16 修订）
       agent_id: X-Agent-ID > 被动指纹(system prompt + tools) > 同源继承 > `unknown-<hash8>`
-      session_id: X-Session-ID / `x-{vendor}-session-id`（同级，G11.3）
+      session_id: X-Session-ID / `x-{vendor}-session-id`（同级，G11.3）/ 裸 `session-id`（MQ-A76，codex）
                   > 尾部接续 > 前缀 hash > user+time_window
 
     **agent_id 末位不再是裸 "unknown"（G11.9，2026-08-18）**：所有未识别 agent 共用
@@ -987,8 +1149,8 @@ def resolve_identity(
 
     **User-Agent 不再用于命名**（同上）：它只作分桶信号之一。理由见
     `agent_bucket` 模块 docstring。
-      turn_index: 用户轮 = role==user 消息数（`ledger_runtime.user_turn_index`，E0.2；
-                  修前 len(messages)//2 是请求数，工具循环里每个调用都算一轮）
+      turn_index: 轮次数（`ledger_runtime.user_turn_index`，ADR-0033 §2.2，批 U · U1.1 起；
+                  09-06 E0.2 → 09-23 为 role==user 消息数；再之前 len(messages)//2 是请求数）
 
     **user_id 三分支**：
 
@@ -1226,6 +1388,14 @@ def resolve_identity(
                     candidates=[name for _v, name, _val in vendor_session_ids],
                 )
             _vendor, session_id_header, explicit_session = vendor_session_ids[0]
+        else:
+            # MQ-A76（批 U · U1.1）：不带 `x-` 前缀的自报会话 header（codex 的 `session-id`）。
+            # 排在前两档之后：更通用的名字只在更具体的都没有时才用。
+            for _name in BARE_SESSION_HEADERS:
+                _val = str(headers.get(_name) or "").strip()
+                if _val:
+                    session_id_header, explicit_session = _name, _val
+                    break
 
     if explicit_session:
         explicit_session, reject_reason = _screen_external_session_id(explicit_session)
@@ -1278,9 +1448,16 @@ def resolve_identity(
     # （_fingerprint_agent 只看 system prompt，漏掉以 user 角色进入的委派/子任务）。
     # 指纹 auxiliary 与 classify_auxiliary 取或；aux_source 记命中规则名供审计 + rebuild 重判。
     classified_aux, aux_rule = classify_auxiliary(request.messages)
+    # 批 E（MQ-A82）：codex 自报的内部轮次（标题 / 建议 / 压缩），结构判据，见常量注释。
+    codex_internal = resolve_codex_internal_turn(agent_id, headers, body)
     if classified_aux:
         is_auxiliary = True
         aux_source = aux_rule
+    elif codex_internal:
+        is_auxiliary = True
+        aux_source = codex_internal
+        logger.info("identity_codex_internal_turn", agent_id=agent_id,
+                    session_id=session_id, aux_source=codex_internal)
     elif is_auxiliary:
         aux_source = f"fp:{agent_trigger}" if agent_trigger else "fp"
     else:

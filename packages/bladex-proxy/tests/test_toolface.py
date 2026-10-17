@@ -195,11 +195,17 @@ class TestSchemas:
         预算按整个工具面算：四个 schema 的 JSON 总长。当前约 5.3K 字符
         （≈1.3K token），上限取 8K，留出账本工具后续补参数的余量；
         真要超，先说明为什么这些字比它挤掉的上下文更值。
+
+        🔴 2026-09-29 批 E · E4（拍板 (40)）：8,000 → **8,200**（数值唯一定义在 `toolface.TOOL_FACE_SCHEMA_BUDGET_CHARS`）。`bladex_ledger_close` 加可选
+        `evidence`（+~100 字符，总长 7,989 → 8,0xx）：它换回来的是关本举证读数——R3「关本
+        对不对」此前只能靠人读 Hub 逐条判（本批 §E0.6 就是人判的），有了它才有可机读的
+        `evidence_ok`；与 switch 的 evidence 同一套校验、只记不拦。描述已压到一句。
         """
         import json
         total = sum(len(json.dumps(t, ensure_ascii=False)) for t in TOOL_SCHEMAS)
-        assert total <= 8000, (
-            f"工具面 schema 总长 {total} 字符，超出注意力预算上限 8000。"
+        from bladex_proxy.toolface import TOOL_FACE_SCHEMA_BUDGET_CHARS
+        assert total <= TOOL_FACE_SCHEMA_BUDGET_CHARS, (
+            f"工具面 schema 总长 {total} 字符，超出注意力预算上限 {TOOL_FACE_SCHEMA_BUDGET_CHARS}。"
             "加字之前先问：它换回来的行为改进，抵得过它挤掉的上下文吗？")
 
 

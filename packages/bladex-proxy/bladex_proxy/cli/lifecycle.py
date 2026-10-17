@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -27,7 +29,6 @@ from bladex_proxy.cli import (  # noqa: E402
     _FLASH_PIDFILE,
     _PROXY_PIDFILE,
     _admin_key,
-    _consolidator_pid,
     _first_client_key,
     _http_json,
     _http_request,
@@ -41,6 +42,17 @@ from bladex_proxy.cli import (  # noqa: E402
     _resolve_distill_concurrency,
     app,
     assets_dir,
+)
+from bladex_proxy.storage.redis_launch import (  # noqa: E402
+    aof_manifest_problem,
+    apply_manifest_repair,
+    launch_refusal,
+    plan_manifest_repair,
+    redis_logfile_path,
+    redis_server_command,
+    redis_servers_on_data_dir,
+    tail_lines,
+    write_launch_record,
 )
 
 
@@ -83,15 +95,71 @@ def _ensure_redis(url: str) -> bool:
         print("  Redis:        redis-server not installed (brew install redis / apt install redis-server)")
         return False
     Path("data").mkdir(exist_ok=True)
-    subprocess.run(  # noqa: S603
-        ["redis-server", "--port", str(port), "--appendonly", "yes",
-         "--appendfsync", "everysec", "--tcp-keepalive", "0",
-         "--dir", "data/", "--daemonize", "yes"],
-        check=False, capture_output=True)
+    # 🔴 MQ-A90：data/ 已有 redis-server（哪怕端口不同）⇒ 不拉第二个。
+    # 两个实例共用一个目录，关机时各写一份 manifest，后退出的那份落盘。
+    refusal = launch_refusal(port)
+    if refusal:
+        print("  Redis:        not started -- the proxy will forward but NOT store anything")
+        print(f"                {refusal}")
+        return False
+    logfile = redis_logfile_path()
+    write_launch_record(logfile, "cli-start", port)
+    proc = subprocess.run(  # noqa: S603
+        redis_server_command(port, logfile),
+        check=False, capture_output=True, text=True, errors="replace")
     time.sleep(1.0)
-    ok = _redis_ping(url)
-    print(f"  Redis:        {'started (AOF, port ' + str(port) + ')' if ok else 'failed to start -- the proxy will forward but NOT store anything'}")
-    return ok
+    if _redis_ping(url):
+        print(f"  Redis:        started (AOF, port {port}, log {_display_path(logfile)})")
+        return True
+    print("  Redis:        failed to start -- the proxy will forward but NOT store anything")
+    for line in _redis_failure_detail(logfile, proc, port):
+        print(f"                {line}")
+    return False
+
+
+#: manifest 坏了时给的下一步。🔴 不再建议"挪开 appendonlydir 回落 dump.rdb"：MQ-A90 那次
+#: dump.rdb 是幽灵实例的快照，比 AOF 旧一周——照做就是静默回退。
+_AOF_REPAIR_HINT = (
+    "Preview a verified fix (changes nothing):  bladex repair-aof",
+    "Then apply it:                             bladex repair-aof --apply",
+    "Do not fall back to data/dump.rdb unless you have checked it is not older than the AOF.",
+)
+
+
+def _display_path(path: str) -> str:
+    """能相对就相对（打印用）。"""
+    try:
+        return str(Path(path).relative_to(Path.cwd()))
+    except ValueError:
+        return path
+
+
+def _redis_failure_detail(logfile: str, proc: subprocess.CompletedProcess | None,
+                          port: int = 6379) -> list[str]:
+    """redis 起不来时**把原因说出来**的那几行。
+
+    优先级：① manifest 对账（最常见、且 redis 日志里只说"打不开文件"不说该有谁）；
+    ② redis 自己的日志尾部；③ 进程 stderr/stdout（logfile 都没来得及建时）。
+    """
+    out: list[str] = []
+    problem = aof_manifest_problem()
+    if problem:
+        out.append(f"AOF manifest is inconsistent: {problem}")
+        out.extend(_AOF_REPAIR_HINT)
+    tail = tail_lines(logfile)
+    if tail:
+        out.append(f"redis log tail ({_display_path(logfile)}):")
+        out.extend(f"  {ln}" for ln in tail)
+    elif proc is not None:
+        captured = (proc.stderr or "") + (proc.stdout or "")
+        lines = [ln.rstrip() for ln in captured.splitlines() if ln.strip()][-8:]
+        if lines:
+            out.append("redis-server said:")
+            out.extend(f"  {ln}" for ln in lines)
+    if not out:
+        out.append(f"redis-server wrote nothing to {_display_path(logfile)}; "
+                   f"check whether the port is taken: lsof -nP -iTCP:{port} -sTCP:LISTEN")
+    return out
 
 
 def _consolidator_command() -> list[str] | None:
@@ -122,8 +190,102 @@ def _flash_command() -> list[str] | None:
         return None
 
 
+def _deployment_home() -> str:
+    """本 CLI 正在操作的部署根（与 InstanceClaim 的身份口径一致）。"""
+    from bladex_proxy.deployment import deployment_root
+    return os.path.realpath(deployment_root())
+
+
+def _home_args() -> list[str]:
+    """子进程命令行里的部署根标记；分 argv 传递，路径带空格也不会被拆错。"""
+    return ["--bladex-home", _deployment_home()]
+
+
+def _home_from_command(command: str) -> str | None:
+    """从命令行文本提取 `--bladex-home`（spawn 侧固定使用“选项 + 值”形态）。"""
+    for marker in ("--bladex-home=", "--bladex-home "):
+        start = command.find(marker)
+        if start < 0:
+            continue
+        value = command[start + len(marker):]
+        if marker.endswith(" "):
+            # macOS 没有 /proc，ps 只给空格拼接的文本。home 路径本身可能带空格，
+            # 因此以下一个“ --选项”为界，而不是按空白拆 argv。
+            value = value.split(" --", 1)[0]
+        else:
+            value = value.split(" ", 1)[0]
+        value = value.strip()
+        if value:
+            return os.path.realpath(os.path.expanduser(value))
+    return None
+
+
+def _process_home(pid: int) -> str | None:
+    """读取 PID 的命令行并返回它声明的 `--bladex-home`（无法判定返回 None）。"""
+    try:
+        # Linux：/proc 是精确 argv，不受 ps 展示宽度影响。
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        argv = [part.decode("utf-8", errors="replace")
+                for part in raw.split(b"\0") if part]
+        for i, arg in enumerate(argv):
+            if arg == "--bladex-home" and i + 1 < len(argv):
+                return os.path.realpath(os.path.expanduser(argv[i + 1]))
+            if arg.startswith("--bladex-home="):
+                return os.path.realpath(os.path.expanduser(arg.partition("=")[2]))
+        return None
+    except OSError:
+        pass
+    try:
+        proc = subprocess.run(  # noqa: S603
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],  # noqa: S607
+            capture_output=True, text=True, timeout=1, check=False)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return _home_from_command(proc.stdout.strip())
+
+
+def _discard_pidfile(path: str, label: str, reason: str) -> None:
+    Path(path).unlink(missing_ok=True)
+    print(f"  {label}: {reason}; removing pidfile and continuing")
+
+
+def _owned_sidecar_pid(path: str, label: str, *, cleanup: bool = True) -> int | None:
+    """pidfile 里的 PID 活着，且身份不是“另一个部署根”，才算本实例在跑。
+
+    MQ-A78 复核修正：
+    - pidfile 位于本部署 `logs/` 下本身就是所有权证据；老版本进程的命令行
+      还没有 `--bladex-home`，因此 **None 不等于外来**，按本实例处理并提示
+      重启后生效（否则 status 误删 pidfile，stop 从此停不掉、start 再起一套）。
+    - 只有命令行**明确声明另一个** BLADEX_HOME 才判外来；start 可清理这类
+      陈旧/异 home 文件，status 是读命令，只汇报、绝不写删。
+    """
+    try:
+        pid = int(Path(path).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        if cleanup and Path(path).exists():
+            _discard_pidfile(path, label, "pidfile has no valid PID")
+        return None
+    if not _pid_alive(pid):
+        if cleanup:
+            _discard_pidfile(path, label, f"stale pidfile (PID {pid} is not running)")
+        return None
+    home = _process_home(pid)
+    if home is not None and home != _deployment_home():
+        if cleanup:
+            _discard_pidfile(
+                path, label,
+                f"PID {pid} belongs to BLADEX_HOME={home}, not this deployment "
+                f"({_deployment_home()})")
+        return None
+    if home is None:
+        print(f"  {label}: PID {pid} was started by an older BladeX version "
+              "(no --bladex-home marker); treating it as this deployment "
+              "-- ownership takes effect after restart")
+    return pid
+
+
 def _flash_pid() -> int | None:
-    return _read_pidfile(_FLASH_PIDFILE)
+    return _owned_sidecar_pid(_FLASH_PIDFILE, "Flash daemon", cleanup=False)
 
 
 def _start_flash(interval: float = 60.0) -> bool:
@@ -132,7 +294,8 @@ def _start_flash(interval: float = 60.0) -> bool:
     # 2026-08-29 起 --interval 语义 = 降级兜底轮询间隔（正常运行为 Redis wake 驱动，
     # 零轮询），15 → 60。
     """拉起 flash 维护进程（仅当 module_enabled("flash")——调用方守门）。"""
-    if (pid := _flash_pid()) is not None:
+    if (pid := _owned_sidecar_pid(
+            _FLASH_PIDFILE, "Flash daemon", cleanup=True)) is not None:
         print(f"  Flash daemon: already running (PID {pid})")
         return True
     cmd = _flash_command()
@@ -144,7 +307,7 @@ def _start_flash(interval: float = 60.0) -> bool:
     logfile = f"logs/flash-{time.strftime('%Y%m%d-%H%M%S')}.log"
     with open(logfile, "w", encoding="utf-8") as lf:
         proc = subprocess.Popen(  # noqa: S603
-            [*cmd, "--interval", str(interval)],
+            [*cmd, *_home_args(), "--interval", str(interval)],
             stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
     Path(_FLASH_PIDFILE).write_text(str(proc.pid))
     time.sleep(1.0)
@@ -157,34 +320,41 @@ def _start_flash(interval: float = 60.0) -> bool:
 
 
 def _embed_pid() -> int | None:
-    """embedding 模块 PID（PID 文件优先 + 进程名兜底，与 consolidator 同款）。"""
-    pid = _read_pidfile(_EMBED_PIDFILE)
-    if pid is not None and _pid_alive(pid):
-        return pid
-    Path(_EMBED_PIDFILE).unlink(missing_ok=True)
-    try:
-        out = subprocess.run(  # noqa: S603
-            ["pgrep", "-f", "bladex_proxy.embed_server"],  # noqa: S607
-            capture_output=True, text=True, timeout=3)
-        for line in out.stdout.split():
-            if line.strip().isdigit():
-                return int(line.strip())
-    except Exception:  # noqa: BLE001
-        pass
-    return None
+    """embedding 模块 PID（只认本部署根的 pidfile，不做全机进程名兜底）。"""
+    return _owned_sidecar_pid(_EMBED_PIDFILE, "Embedding", cleanup=False)
 
 
-def _embed_wanted() -> bool:
+def _embed_wanted(cfg=None) -> bool:  # noqa: ANN001
     """是否该起 embedding 模块：`BLADEX_MODULE_EMBED` 开、或 backend 已配 ipc。
 
     🔴 判据取**两者之一**而不是只看模块开关：用户可能先配 `backend=ipc` 试水
     却忘了翻模块开关，那样 proxy 会连不上 socket 然后回落 local（还多占一份内存）
     ——起不该起的进程只是浪费，不起该起的进程是静默降级。
+
+    🔴 `backend=api` 恒不起模块（G18.2，MQ-W9 断点②）：模块的存在意义是加载
+    **本地**模型；api 档的向量来自线上供应商，本地起一个模型服务端没有任何消费方，
+    只白占内存。冲突（api ∧ 模块开关开着）从静默改成 stderr 一行——不打断启动，
+    但用户必须看得见"你开的那个开关没生效、为什么"。
+
+    🔴 backend 读**生效配置**（`resolve_embed_settings`：env > routing.toml > 默认），
+    不是裸 env（MQ-W11）：README 主推的 toml 配法配 `backend = "api"` 时，裸读 env
+    的旧判据看不见它——模块照起、上面那行 skip 提示也不打，G18.2 在文档教的那条
+    路上整个不成立。"这是不是 api 档"全 CLI 只许有这一种问法。
     """
+    from bladex_proxy.embedding import resolve_embed_settings
     from bladex_proxy.modules import module_enabled
+    if cfg is None:
+        from bladex_proxy.config import ProxyConfig
+        cfg = ProxyConfig()
+    backend = resolve_embed_settings(cfg).backend
+    if backend == "api":
+        if module_enabled("embed"):
+            print('embed_module_skipped backend=api hint="embedding module serves a '
+                  'local model; api backend does not use it"', file=sys.stderr)
+        return False
     if module_enabled("embed"):
         return True
-    return (os.environ.get("BLADEX_EMBED_BACKEND", "").strip().lower() == "ipc")
+    return backend == "ipc"
 
 
 def _embed_listening() -> bool:
@@ -204,16 +374,17 @@ def _embed_listening() -> bool:
     return False
 
 
-def _start_embed() -> bool:
+def _start_embed(cfg=None) -> bool:  # noqa: ANN001
     """拉起 embedding 模块（V-A6）。未启用时直接返回 True（不是失败）。"""
-    if not _embed_wanted():
+    if not _embed_wanted(cfg):
         return True
-    if (pid := _embed_pid()) is not None:
+    if (pid := _owned_sidecar_pid(
+            _EMBED_PIDFILE, "Embedding", cleanup=True)) is not None:
         print(f"  Embedding:    already running (PID {pid})")
         return True
     try:
         import bladex_proxy.embed_server  # noqa: F401
-        cmd = [sys.executable, "-m", "bladex_proxy.embed_server"]
+        cmd = [sys.executable, "-m", "bladex_proxy.embed_server", *_home_args()]
     except ImportError:
         print("  Embedding:    failed to start -- no bladex_proxy.embed_server entry "
               "point. Reinstall bladex-proxy.")
@@ -228,21 +399,44 @@ def _start_embed() -> bool:
     # 🔴 判活不能只看进程活着（2026-08-25 live：bind 失败进程秒退，而 sleep 期间
     # 它"还活着" ⇒ CLI 打了 "started" 但 status 立刻说没起——**"started" 骗人**）。
     # 判据改为**服务真的在监听**：uds 看 socket 文件出现，tcp 试连一次。
+    # MQ-A42：模块首启同样要下模型 ⇒ 同一个下载感知（标记来自本模块进程自己）。
+    cache_dir = getattr(cfg, "fastembed_cache_path", "") if cfg is not None else ""
+    download = _DownloadWatch(cache_dir, proc.pid, "Embedding")
     deadline = time.monotonic() + 20.0
     listening = False
+    next_dl_check = 0.0
     while time.monotonic() < deadline:
         if not _pid_alive(proc.pid):
             break
         if _embed_listening():
             listening = True
             break
+        if time.monotonic() >= next_dl_check:
+            next_dl_check = time.monotonic() + 1.0
+            dl = download.poll()
+            if dl in ("failed", "stalled"):
+                break
+            if dl == "downloading":
+                deadline = max(deadline, time.monotonic() + 20.0)
         time.sleep(0.3)
     if listening:
         print(f"  Embedding:    started (PID {proc.pid}, log {logfile})")
         return True
+    if download.poll() in ("failed", "stalled"):
+        with contextlib.suppress(OSError):
+            os.kill(proc.pid, signal.SIGTERM)
+        Path(_EMBED_PIDFILE).unlink(missing_ok=True)
+        print(f"  Embedding:    failed to start -- embedding model download failed: "
+              f"{download.error} (log {logfile})")
+        return False
     Path(_EMBED_PIDFILE).unlink(missing_ok=True)
     print(f"  Embedding:    failed to start, see {logfile}")
     return False
+
+
+def _consolidator_pid() -> int | None:
+    """consolidator PID（start/status 共用 `_owned_sidecar_pid` 这一个判据）。"""
+    return _owned_sidecar_pid(_CONS_PIDFILE, "Consolidator", cleanup=False)
 
 
 def _start_consolidator(interval: int, concurrency: int | None = None) -> bool:
@@ -256,7 +450,8 @@ def _start_consolidator(interval: int, concurrency: int | None = None) -> bool:
     Memory Index 积压 720 轮持续不降（新记忆写不进去 = 召不回）。
     参数含义与取值依据见 `flags.MEMORY_NUMERIC_DEFAULTS`。
     """
-    if (pid := _consolidator_pid()) is not None:
+    if (pid := _owned_sidecar_pid(
+            _CONS_PIDFILE, "Consolidator", cleanup=True)) is not None:
         print(f"  Consolidator: already running (PID {pid})")
         return True
     cmd = _consolidator_command()
@@ -271,7 +466,7 @@ def _start_consolidator(interval: int, concurrency: int | None = None) -> bool:
     logfile = f"logs/consolidator-{time.strftime('%Y%m%d-%H%M%S')}.log"
     with open(logfile, "w", encoding="utf-8") as lf:
         proc = subprocess.Popen(  # noqa: S603
-            [*cmd, "--interval", str(interval), "--concurrency", str(concurrency)],
+            [*cmd, *_home_args(), "--interval", str(interval), "--concurrency", str(concurrency)],
             stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
     Path(_CONS_PIDFILE).write_text(str(proc.pid))
     time.sleep(1.5)
@@ -302,6 +497,11 @@ def _start_proxy(host: str, port: int, foreground: bool) -> int:
         return 0
     Path(_PROXY_PIDFILE).unlink(missing_ok=True)
     print(f"  Proxy:        failed to start, see {logfile}")
+    # 批 Z1（MQ-A38 拒绝路径）：2 秒内就退出的形态（配置错误 / 实例冲突）同样把错误段
+    # 原样打到终端——"see logfile" 让用户自己去翻，等于把失败原因藏起来（刚性原则 12 ③）。
+    tail = _log_error_tail(logfile)
+    if tail:
+        print(f"\n  Last error in {logfile}:\n{tail}")
     return 1
 
 
@@ -331,9 +531,19 @@ def start(
     proxy_only: bool = typer.Option(False, "--proxy-only", help="Start only the proxy (skip redis/consolidator)"),
     host: str = typer.Option("", help="Override BLADEX_HOST"),
     port: int = typer.Option(0, help="Override BLADEX_PORT"),
+    force: bool = typer.Option(False, "--force",
+                               help="Start even if the embedding preflight fails (engine "
+                                    "mismatch with the stamped index, or api probe failure). "
+                                    "Config errors that can never work (empty model, "
+                                    "unresolved key env) still abort."),
 ) -> int:
     """Start BladeX (redis + consolidator + proxy).
 
+    Exit codes: 0 = ready; 1 = failed (processes this start launched are stopped again);
+    3 = degraded (the proxy is up and forwarding, but part of the memory pipeline is missing --
+    run `bladex doctor`).
+
+    \f
     收编 run_proxy.sh 的启动逻辑。
     """
     root = _require_config_root()
@@ -348,6 +558,11 @@ def start(
     port = port or cfg.port
 
     print("=== BladeX start ===")
+    # G18.5（MQ-W10）：embedding 配置预检在拉起**任何**进程之前——
+    # 配置错误中止启动并指认原因，不起一个记忆已死的 proxy。
+    if not _preflight_embedding(cfg, force=force):
+        print("=== start aborted (embedding preflight failed) ===")
+        return 1
     _prune_logs()
     # 🔴 MQ-L62 ②（2026-09-08）：先记下**进来之前**谁已经在跑。
     # proxy 启动失败时只回收**本次拉起的**那些——已经在跑的（用户自己起的、
@@ -363,7 +578,7 @@ def start(
         redis_ok = _ensure_redis(cfg.redis_url)
         # V-A6：embedding 模块要在 proxy/consolidator **之前**起——它俩启动时
         # 就会解析传输并尝试连接；晚起会让首个请求走一次回落 local（多占内存）。
-        _start_embed()
+        _start_embed(cfg)
         consolidator_ok = _start_consolidator(
             int(os.environ.get("BLADEX_CONSOLIDATOR_INTERVAL", "60") or 60))
         # V-F2：flash 维护进程随 start 拉起——module 门在此守（默认关=不起）。
@@ -377,8 +592,10 @@ def start(
     if foreground or rc != 0:
         return rc
     rc = _report_startup_state(host, port, redis_ok, consolidator_ok,
-                               proxy_pid=_read_pidfile(_PROXY_PIDFILE))
-    if rc != 0:
+                               proxy_pid=_read_pidfile(_PROXY_PIDFILE),
+                               cache_dir=cfg.fastembed_cache_path)
+    # 降级 ≠ 失败：proxy 在跑，旁挂进程是它的一部分，不回收（只有 rc=1 才回收）
+    if rc not in (START_RC_READY, START_RC_DEGRADED):
         _rollback_sidecars(pids_before, _SIDECARS)
     return rc
 
@@ -402,27 +619,57 @@ def _rollback_sidecars(pids_before: dict[str, int | None],
         _stop_by_pidfile(pf, f"  {name}")
 
 
+_LOG_REF_RE = re.compile(r"[A-Za-z0-9_.-]+\.log\b")
+
+
+def _referenced_logs(docs_dir: Path) -> set[str]:
+    """`docs/` 下任何 Markdown 里出现过的日志文件名（basename）。
+
+    MQ-V21：签收 / 结算稿引用的是具体日志文件，清掉它读数就不可复算。
+    扫全部 `docs/`（planning / reviews / benchmarks 之外 ADR 也引日志）——宁多留不误删。
+    读不了的文件跳过：少保护一个文件的代价是回到旧行为，不该让 `bladex start` 失败。
+    """
+    names: set[str] = set()
+    if not docs_dir.is_dir():
+        return names
+    for md in docs_dir.rglob("*.md"):
+        try:
+            names.update(_LOG_REF_RE.findall(md.read_text(encoding="utf-8", errors="replace")))
+        except OSError:
+            continue
+    return names
+
+
 def _prune_logs(keep: int | None = None) -> int:
     """启动时清理旧日志（ADR-0027 §4.4）。
 
     每次启动新建一个时间戳日志文件、从不清理 —— 审查时实测已积到 157 个。
     Memory Hub 无限增长是设计（ADR-0009），日志堆积不是。默认保留最近 20 个，
     `BLADEX_LOG_KEEP=0` 关闭清理。返回删除数量。
+
+    MQ-V21（批 Q3B）：被 `docs/` 引用过的日志**永不清理，也不占 keep 名额**——
+    `BLADEX_LOG_KEEP=N` 的含义是"每类再留最近 N 个**未被引用的**"。
+    取舍（对比"归档进 docs/benchmarks/"）：引用即保护零操作、不会忘；归档要求
+    写稿的人记得跑一步，而这次出事正是因为没人记得。代价是 logs/ 会随被引用的
+    文件慢慢长——那些文件本来就该留着。
     """
     if keep is None:
-        try:
-            keep = int(os.environ.get("BLADEX_LOG_KEEP", "20"))
-        except ValueError:
-            keep = 20
+        # 默认值单一真相源在 flags.py（批 Q3C）；写坏回落默认值，与此前同。
+        from bladex_core.flags import flag_number
+        keep = int(flag_number("BLADEX_LOG_KEEP"))
     if keep <= 0:
         return 0
-    log_dir = Path(_repo_root()) / "logs"
+    root = Path(_repo_root())
+    log_dir = root / "logs"
     if not log_dir.is_dir():
         return 0
+    referenced = _referenced_logs(root / "docs")
     removed = 0
     # 按前缀分组保留（proxy / consolidator / sync 各留 keep 个，互不挤占）
     groups: dict[str, list[Path]] = {}
     for path in log_dir.glob("*.log"):
+        if path.name in referenced:
+            continue
         groups.setdefault(path.name.split("-")[0], []).append(path)
     for files in groups.values():
         files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -433,8 +680,8 @@ def _prune_logs(keep: int | None = None) -> int:
             except OSError:
                 pass
     if removed:
-        print(f"  Logs:         pruned {removed} old log file(s) (keeping {keep} per kind; "
-              f"set BLADEX_LOG_KEEP=0 to disable)")
+        print(f"  Logs:         pruned {removed} old log file(s) (keeping {keep} per kind, "
+              f"plus any log referenced under docs/; set BLADEX_LOG_KEEP=0 to disable)")
     return removed
 
 
@@ -458,18 +705,120 @@ def _log_error_tail(logfile: str, max_lines: int = 30) -> str:
         lines = Path(logfile).read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return ""
+    # 优先从**最后一个 traceback** 起：uvicorn 在 lifespan 的 traceback 之后还会补一行
+    # `ERROR:    Application startup failed. Exiting.`，只按"最后一个 ERROR:"取尾部就只剩
+    # 这句无信息的收尾（批 Z1 实测：MQ-A38 的拒绝原因整段被它挡在终端外）。
     start = 0
+    last_tb: int | None = None
     for i, ln in enumerate(lines):
+        if ln.startswith("Traceback") or (ln.startswith("ERROR:") and "Traceback" in ln):
+            last_tb = i
         if ln.startswith("ERROR:") or ln.startswith("Traceback"):
             start = i
+    if last_tb is not None:
+        start = last_tb
     tail = [ln for ln in lines[start:] if ln.strip()]
     if len(tail) > max_lines * 2:      # 极长的 traceback：留头留尾
         tail = tail[:max_lines] + ["  ... (truncated; see the full log) ..."] + tail[-max_lines:]
     return "\n".join("    " + ln for ln in tail)
 
 
+#: MQ-A42：下载期间缓存目录**连续这么久没有长一个字节** ⇒ 判下载停滞、按失败报。
+#: 不设总时长上限（2 GB 模型在慢网上下 20 分钟是正常的），只判"不动了"。
+_DOWNLOAD_STALL_S = 120.0
+#: 下载进度行的打印间隔（秒）。
+_DOWNLOAD_PROGRESS_EVERY_S = 10.0
+
+
+class _DownloadWatch:
+    """MQ-A42（批 Z1）：等某个进程就绪时，识别"它正在首次下载 embedding 模型"。
+
+    🔴 **信号来源（原则 13 层 4）**：只读 `embedding.read_download_state(cache_dir, pid)`
+    ——即被等的那个进程自己在 `ensure_local_model` 里写的
+    按 pid 分文件的下载标记（路径只由 embedding 模块拼）。不看日志文本、不看缓存目录"有没有东西"
+    （那答不了"是不是**这个**进程在下"）。缓存字节数只用来画进度与判停滞。
+
+    `poll()` 每秒调一次，返回：
+      - `"downloading"`：在下且还在长 ⇒ 调用方把等待截止时间顺延一个完整窗口；
+      - `"failed"` / `"stalled"`：下载失败（原文在 `self.error`）/ 停滞超过 `_DOWNLOAD_STALL_S`；
+      - `None`：没在下（**真失败的阴性对照走这条**：窗口照旧，不因下载逻辑放大）。
+    """
+
+    def __init__(self, cache_dir: str, pid: int | None, label: str) -> None:
+        self._cache_dir = cache_dir
+        self._pid = pid
+        self._label = label
+        self.announced = False
+        self.error = ""
+        self.model = ""
+        self._last_bytes = -1
+        self._last_growth = 0.0
+        self._last_print = 0.0
+        self._started = 0.0
+
+    def state(self) -> dict | None:
+        if not self._cache_dir or not self._pid:
+            return None
+        from bladex_proxy.embedding import read_download_state
+        return read_download_state(self._cache_dir, self._pid)
+
+    def poll(self) -> str | None:
+        st = self.state()
+        if st is None:
+            if self.announced and not self.error:
+                self.announced = False  # 标记已删 = 下完了；只报一次
+                print(f"  {self._label}: embedding model download finished "
+                      f"({self._elapsed():.0f}s); waiting for startup to complete ...")
+            return None
+        self.model = str(st.get("model") or "")
+        if st.get("state") == "failed":
+            self.error = str(st.get("error") or "unknown error")
+            return "failed"
+        if st.get("state") != "downloading":
+            return None
+        from bladex_proxy.embedding import cache_bytes
+        now = self._now()
+        size = st.get("size_gb")
+        if not self.announced:
+            self.announced = True
+            self._started = self._last_growth = self._last_print = now
+            size_txt = f" (~{size} GB)" if size else ""
+            print(f"  {self._label}: downloading embedding model {self.model}{size_txt} -- "
+                  f"first start only, from {st.get('source') or 'huggingface'}; "
+                  "this can take a few minutes ...")
+        b = cache_bytes(self._cache_dir)
+        if b != self._last_bytes:
+            self._last_bytes, self._last_growth = b, now
+        elif now - self._last_growth > _DOWNLOAD_STALL_S:
+            self.error = (f"no download progress for {int(_DOWNLOAD_STALL_S)}s "
+                          f"({b / 1e6:.0f} MB in {self._cache_dir})")
+            return "stalled"
+        if now - self._last_print >= _DOWNLOAD_PROGRESS_EVERY_S:
+            self._last_print = now
+            total = f" of ~{float(size) * 1e3:.0f}" if size else ""
+            print(f"    ... {b / 1e6:.0f}{total} MB so far ({self._elapsed():.0f}s)")
+        return "downloading"
+
+    @staticmethod
+    def _now() -> float:
+        return time.monotonic()
+
+    def _elapsed(self) -> float:
+        return self._now() - self._started if self._started else 0.0
+
+
+#: `bladex start` 的退出码（批 Q3B：此前降级也返回 0，脚本无从判断记忆管线死了没有）。
+#: 1 = 失败（本次拉起的旁挂进程已回收）；3 = 降级（proxy 能转发、旁挂进程**保留**，
+#: 但记忆管线不完整）。降级不与 1 共用：调用方要能区分"没起来"和"起来了但缺一块"——
+#: 前者重试 start，后者该去看 doctor。
+START_RC_READY = 0
+START_RC_FAILED = 1
+START_RC_DEGRADED = 3
+
+
 def _report_startup_state(host: str, port: int, redis_ok: bool, consolidator_ok: bool,
-                          timeout_s: float = 30.0, proxy_pid: int | None = None) -> int:
+                          timeout_s: float = 30.0, proxy_pid: int | None = None,
+                          cache_dir: str = "") -> int:
     """轮询 /ready，把真实状态回给 console（ADR-0027 §3.1 契约 A）。
 
     旧行为：打印"Proxy 已启动"就 rc=0 收工。冷启动实测下这意味着——Redis 缺席
@@ -485,20 +834,49 @@ def _report_startup_state(host: str, port: int, redis_ok: bool, consolidator_ok:
     —— **"process is up" 是错的**，而且措辞把人引向就绪探测/网络，不是配置。
     实测代价：白等 30 秒 + 一句误导性结论，真正的报错要自己去翻日志。
     ⇒ 传进 `proxy_pid` 后每轮探活；死了立刻停等，并把日志尾部的错误段**原样打到终端**。
+
+    🔴 **MQ-A42（批 Z1）：窗口感知首次下载。** 本地档首启要在 proxy lifespan 里阻塞下
+    embedding 模型，下载期间 /ready 必然不答 ⇒ 旧行为是每个新装用户首启都看到一次
+    `state: failed`。现在 `_DownloadWatch` 读**被等的 proxy 进程自己写的下载标记**
+    （信号来源见其 docstring）：在下且在长 ⇒ 打进度、把截止时间顺延一个完整窗口；
+    下完后照常判 ready / degraded；下载失败或停滞 ⇒ `failed` 且点名是下载失败，
+    并停掉这个 proxy（它会带着"没有 Memory Index"降级跑起来——记忆已死的 proxy
+    不留着，与 G18.5 预检同一原则）。**没有下载标记时窗口一秒不多**（阴性对照）。
     """
     probe_host = "127.0.0.1" if host in ("0.0.0.0", "") else host  # noqa: S104
     base = f"http://{probe_host}:{port}"
     deadline = time.monotonic() + timeout_s
     ready: dict | None = None
     died = False
+    download = _DownloadWatch(cache_dir, proxy_pid, "Proxy")
+    download_failed = False
     while time.monotonic() < deadline:
         ready = _probe_ready(f"{base}/ready")
         if ready is not None:
+            # 下载失败时 proxy 会降级起来、/ready 照答——先看一眼标记再下结论
+            download_failed = download.poll() == "failed"
             break
         if proxy_pid is not None and not _pid_alive(proxy_pid):
             died = True
+            download_failed = download.poll() == "failed"
             break
+        dl = download.poll()
+        if dl in ("failed", "stalled"):
+            download_failed = True
+            break
+        if dl == "downloading":
+            deadline = max(deadline, time.monotonic() + timeout_s)
         time.sleep(1.0)
+
+    if download_failed:
+        print(f"\n  state: failed -- the embedding model download failed"
+              f"{f' ({download.model})' if download.model else ''}: {download.error}")
+        print("  fix: check network access to huggingface.co (or set HF_ENDPOINT to a "
+              "reachable mirror), or pre-populate BLADEX_FASTEMBED_CACHE_PATH; then "
+              "`bladex start` again.")
+        if not died and _read_pidfile(_PROXY_PIDFILE) is not None:
+            _stop_by_pidfile(_PROXY_PIDFILE, "Proxy")
+        return 1
 
     if ready is None:
         logfile = _newest_proxy_log()
@@ -535,15 +913,17 @@ def _report_startup_state(host: str, port: int, redis_ok: bool, consolidator_ok:
         for d in degraded:
             print(f"    ⚠ {d}")
         print("  Run `bladex doctor` for a per-item check, or `bladex doctor --e2e` to verify the memory loop.")
-    else:
-        print("  state: ready -- memory pipeline is up (`bladex doctor --e2e` verifies it end to end)")
-    return 0
+        print(f"  (exit code {START_RC_DEGRADED}: started, but degraded)")
+        return START_RC_DEGRADED
+    print("  state: ready -- memory pipeline is up (`bladex doctor --e2e` verifies it end to end)")
+    return START_RC_READY
 
 
 @app.command()
 def stop() -> int:
     """Stop the proxy and consolidator (local Redis is left running).
 
+    \f
     Redis 是 Pipeline 数据面且被懒恢复依赖（ADR-0017），停它无收益。
     """
     print("=== BladeX stop ===")
@@ -557,12 +937,43 @@ def stop() -> int:
     return 0
 
 
+@app.command("repair-aof")
+def repair_aof(
+    apply: bool = typer.Option(False, "--apply",
+                               help="Actually rewrite the manifest (default is a preview that changes nothing)"),
+) -> int:
+    """Fix a Redis AOF manifest that points at files which no longer exist.
+
+    Only moves forward: it rewrites the manifest to the newer files actually on disk,
+    after checking that no redis-server is using data/ and that redis-check-aof accepts
+    the result. Anything else is refused with the reason. The old manifest is kept
+    next to data/appendonlydir.
+    """
+    plan = plan_manifest_repair()
+    for c in plan.checks:
+        print(f"  ✓ {c}")
+    if not plan.ok:
+        print(f"  ✗ not repairing: {plan.reason}")
+        return 1
+    print("  candidate manifest:")
+    for ln in plan.new_manifest.splitlines():
+        print(f"    {ln}")
+    if not apply:
+        print("\n  Preview only. Apply it with:  bladex repair-aof --apply")
+        return 0
+    kept = apply_manifest_repair(plan)
+    print(f"  ✓ manifest rewritten; the old one is kept at {_display_path(str(kept))}")
+    print("  Next: bladex start")
+    return 0
+
+
 @app.command()
 def embed(
     action: str = typer.Argument("status", help="start | stop | status | restart"),
 ) -> int:
     """Manage the embedding module (V-A6; independent process, IPC + hot/bulk queue).
 
+    \f
     单独一条命令的理由与 consolidator 同：它是独立进程，换嵌入模型或调让路粒度
     （`BLADEX_EMBED_BULK_SLICE`）后**只重启它**即可，不必打断正在跑的会话。
     """
@@ -574,12 +985,14 @@ def embed(
     root = _require_config_root()
     if root is not None and root != os.getcwd():
         os.chdir(root)
+    from bladex_proxy.config import ProxyConfig
+    cfg = ProxyConfig()
 
     if action == "status":
         from bladex_proxy import embed_transport
         d = embed_transport.resolve()
         pid = _embed_pid()
-        if not _embed_wanted():
+        if not _embed_wanted(cfg):
             print("  Embedding:    off (module disabled; set BLADEX_MODULE_EMBED=1 "
                   "or BLADEX_EMBED_BACKEND=ipc)")
             return 0
@@ -601,7 +1014,7 @@ def embed(
         if action == "stop":
             return 0
 
-    return 0 if _start_embed() else 1
+    return 0 if _start_embed(cfg) else 1
 
 
 @app.command()
@@ -611,8 +1024,9 @@ def consolidator(
         -1, "--concurrency",
         help="Distillation concurrency (1=serial; defaults to BLADEX_DISTILL_CONCURRENCY, or 4)"),
 ) -> int:
-    """Manage the Memory Index consolidator on its own (independent process, ADR-0009 §7).
+    """Manage the Memory Index consolidator on its own (it runs as an independent process).
 
+    \f
     单独一条命令的理由：consolidator 是独立进程，改了配置或代码后**只重启它**
     是高频动作（重启 proxy 会打断正在跑的会话）。此前只能连 proxy 一起重启，
     或者去记 run_consolidator.sh 的路径。
@@ -874,6 +1288,31 @@ def _format_queue(admin: dict | None, consolidator_running: bool) -> str:
     return line
 
 
+def _format_backlog_trend(samples: dict[str, float]) -> str:
+    """Queue 行下面那行：两段积压在最近窗口里的**走向**（MQ-W4）。
+
+    数据来自 proxy `/metrics` 的 `bladex_backlog_*`（proxy 后台每分钟采一次）。
+    某一段没有序列 = 样本还不够（proxy 刚起不到三分钟）——明说 "n/a"，不当成持平。
+    B10 的判读就看这一行：任一段出现 "rising, sustained" 即为持续上升（判据见 metrics.BacklogTrend）。
+    """
+    def _get(metric: str, stage: str) -> float | None:
+        return samples.get(f'{metric}{{stage="{stage}"}}')
+
+    parts: list[str] = []
+    for stage, label in (("hub", "Hub"), ("index", "Index")):
+        delta = _get("bladex_backlog_delta_turns", stage)
+        trend = _get("bladex_backlog_trend", stage)
+        if delta is None or trend is None:
+            parts.append(f"-> {label} n/a (not enough samples yet)")
+            continue
+        span = _get("bladex_backlog_window_span_seconds", stage) or 0.0
+        word = "rising" if trend > 0 else "falling" if trend < 0 else "flat"
+        if trend > 0 and _get("bladex_backlog_monotonic_rise", stage) == 1.0:
+            word = "rising, sustained"
+        parts.append(f"-> {label} {int(delta):+d} over {_ago(span).removesuffix(' ago')} ({word})")
+    return " / ".join(parts)
+
+
 def _flash_status_line() -> str:
     """Memory Flash 那一行。从**本机文件系统**读，不经 /admin。
 
@@ -905,13 +1344,34 @@ def _flash_status_line() -> str:
     s = summarize_tree(root)
     if not s.principals:
         return daemon_prefix + f"nothing materialized yet ({root}) -- bladex-flash writes it"
-    parts = [f"{s.ledgers} ledgers"]
+    # MQ-F4 ②：数的是**投影文件**，不是 Hub 里的账本数——措辞如实。
+    parts = [f"{s.ledgers} ledgers projected"]
     # 用户手写文件单列：它是"你改过什么"的入口，也是我们**永不覆盖**的那部分
     parts.append(f"{s.user_files} yours" if s.user_files else "no overrides yet")
     line = daemon_prefix + f"{' / '.join(parts)} ({root})"
     if s.newest_mtime:
         line += f", newest change {_ago(time.time() - s.newest_mtime)}"
+    line += ", " + _flash_lag_part(root)
     return line
+
+
+def _flash_lag_part(root: str) -> str:
+    """`flash_lag_s` 那一截（MQ-F4 ①，补遗 G7 口径；daemon 写 `.flash_state.json`）。
+
+    三种形态分开说：没读数（daemon 没跑过画像轨道）/ 在界内 / 越界（ADR-0034 §3.4 上界）。
+    "没读数"**不显示成 0**——原则 13 层 4。
+    """
+    from bladex_core.behavior import FLASH_LAG_BOUND_S
+    from bladex_core.flash import read_behavior_status
+
+    st = read_behavior_status(root)
+    if not st or "flash_lag_s" not in st:
+        return "lag n/a (no behavior pass yet)"
+    lag = int(st.get("flash_lag_s", 0))
+    bound = int(st.get("lag_bound_s", FLASH_LAG_BOUND_S))
+    at = str(st.get("computed_at", ""))[:16].replace("T", " ")
+    tail = f" ⚠ over {bound}s bound" if lag > bound else ""
+    return f"lag {lag}s{tail} (behavior pass {at}Z)"
 
 
 def _ago(seconds: float) -> str:
@@ -985,8 +1445,18 @@ def status(
     cons_pid = _consolidator_pid()
     print(f"  Consolidator: {'✓ running (PID ' + str(cons_pid) + ')' if cons_pid else '✗ not running'}"
           + _consolidator_activity(admin))
-    # V-A6：embedding 模块（未启用时明说"未启用"，与"挂了"区分开）
-    if _embed_wanted():
+    # V-A6：embedding 模块（未启用时明说"未启用"，与"挂了"区分开）。
+    # G18.3：api 档单列——它没有本地进程可谈，打模型名 + profile 的 dim；
+    # 走老分支会打出误导的 "set BLADEX_MODULE_EMBED=1"（那个开关在 api 档下被
+    # `_embed_wanted` 明确拒绝，见 G18.2）。
+    from bladex_proxy.embedding import resolve_embed_settings as _embed_settings
+    _es = _embed_settings(cfg)
+    if _es.backend == "api":
+        prof = _es.profiles.get(_es.model or "") or {}
+        dim_part = f", dim={prof['dim']}" if prof.get("dim") else ""
+        model_part = _es.model or "model unset -- set BLADEX_EMBED_MODEL"
+        print(f"  Embedding:    api ({model_part}{dim_part}; remote, no local process)")
+    elif _embed_wanted(cfg):
         epid = _embed_pid()
         # 判据与 `_start_embed` 同款：**在监听**才算 running（进程活着不等于服务可用）
         if epid and _embed_listening():
@@ -1017,6 +1487,7 @@ def status(
         print(f"  {'Memory Index:':<14}{index.get('facts', '?')} facts"
               f" / {index.get('matters', '?')} matters")
         print(f"  {'Queue:':<14}{_format_queue(admin, cons_pid is not None)}")
+        print(f"  {'Queue trend:':<14}{_format_backlog_trend(_scrape_metrics(f'{base}/metrics'))}")
         disk = admin.get("disk") or {}
         if any(v for v in disk.values()):
             print(f"  Disk:         Memory Hub {_fmt_bytes(disk.get('hub_bytes'))}"
@@ -1047,7 +1518,7 @@ def restart(
     """Restart (stop + start)."""
     stop()
     # 直调需给全参数：typer 命令函数的缺省值是 OptionInfo 哨兵，不经 click 不解析
-    return start(foreground=foreground, proxy_only=proxy_only, host="", port=0)
+    return start(foreground=foreground, proxy_only=proxy_only, host="", port=0, force=False)
 
 
 # ── init ────────────────────────────────────────────────────────────────────
@@ -1153,6 +1624,7 @@ def init(
 ) -> int:
     """Generate config/.env, config/routing.toml and the model-facing assets.
 
+    \f
     「模型面资产」= `config/system/{AGENT,TOOLS,SKILLS}.md` + `config/ledger-template.md`
     （MQ-A41，见 `_ASSET_TARGETS`）。首行必须英文——typer 拿它当命令 help
     （`test_user_facing_english.py` 守着，本次改动当场被它抓到一次）。
@@ -1334,6 +1806,18 @@ def doctor(
     _check("config/.env", Path("config/.env").is_file(),
            fix="bladex init")
 
+    # 批 Z · Z2.1（MQ-A34 ①）：本地模型没配 context_window 只**提示**，不替用户填——
+    # 窗口是硬件常量（`ollama show <model>` 的 num_ctx），BladeX 不猜、不探测。
+    _rc = getattr(cfg, "routing_config", None)
+    _no_window = (_rc.local_models_without_context_window()
+                  if _rc is not None and hasattr(_rc, "local_models_without_context_window") else [])
+    if _no_window:
+        print(f"  ! Local models without context_window: {', '.join(_no_window)}")
+        print("    hint: add `context_window = <tokens>` (e.g. from `ollama show <model>` num_ctx) to "
+              "those [[models]] in config/routing.toml so BladeX can route around them when a "
+              "request does not fit and trim its own injected surface to the budget; "
+              "without it nothing changes for that model.")
+
     # 🔴 MQ-A41：模型面资产在位（system notes 三份 + 账本模板）。
     # 缺了不致命但是**降级**：`load_system_notes()` 返回 "" ⇒ 自我介绍整块不注 ⇒
     # 模型不知道 BladeX 存在、不知道有工具面。G7 冷安装实跑时这件事只在启动日志里
@@ -1358,6 +1842,27 @@ def doctor(
     _check("Redis", _redis_ping(cfg.redis_url), cfg.redis_url,
            fix="`bladex start` launches a local Redis; or run redis-server --appendonly yes yourself")
 
+    # AOF manifest 对账（2026-09-19 事故）：manifest 列的文件缺一个 ⇒ redis 加载 AOF
+    # 失败即退出，而 start 只说得出 "failed to start"。这条在 redis 起不来**之前**
+    # 就点名是哪个文件不在——判据不能窄于被检查的对象。
+    _aof_problem = aof_manifest_problem()
+    _check("Redis AOF manifest", _aof_problem is None,
+           _aof_problem or "consistent with data/appendonlydir/",
+           fix=" / ".join(_AOF_REPAIR_HINT))
+
+    # 🔴 MQ-A90：data/ 上只许有一个 redis-server，且就是配置里那个端口。
+    # 第二个实例平时不出声，关机时才把自己那份过期 manifest 写回盘。
+    _owners = redis_servers_on_data_dir()
+    _cfg_port = _redis_hostport(cfg.redis_url)[1]
+    _stray = [o for o in _owners if o.port != _cfg_port]
+    _check("Redis servers on data/", len(_owners) <= 1 and not _stray,
+           ", ".join(o.describe() for o in _owners) or "none running",
+           fix=("more than one redis-server (or one on a port BladeX is not configured for) is "
+                "using data/; they overwrite each other's AOF manifest on shutdown. Stop the "
+                "stray one: " + "; ".join(
+                    f"redis-cli -p {o.port} shutdown" if o.port is not None else f"kill {o.pid}"
+                    for o in (_stray or _owners[1:]))))
+
     # Memory Hub RocksDB：secondary 只读探测（不与运行中的 proxy 抢主锁）
     ledger_dir = Path(cfg.rocksdb_path)
     if not ledger_dir.exists():
@@ -1374,27 +1879,9 @@ def doctor(
             _check("Memory Hub RocksDB", False, str(e),
                    fix="directory corrupted or version mismatch; back up, then check permissions under data/")
 
-    # embedding 模型
+    # embedding 模型（盖章对账 + 按档分流，见 _doctor_embedding）
     try:
-        from bladex_proxy.embedding import (
-            _model_cached,
-            resolve_embed_settings,
-        )
-        settings = resolve_embed_settings(cfg)
-        if settings.backend == "local":
-            model = settings.model or "(default)"
-            cached = _model_cached(settings.model, cfg.fastembed_cache_path) if settings.model else False
-            if warmup:
-                from bladex_proxy.embedding import build_embedder
-                print(f"  … loading embedding model {model} (downloaded automatically if missing; please wait)")
-                emb = build_embedder(cfg, role="proxy")
-                emb.embed(["warmup"])
-                _check("Embedding", True, f"local/{model} ready")
-            else:
-                _check("Embedding", True,
-                       f"local/{model} {'cached' if cached else 'not cached (downloaded on first start, or run doctor --warmup)'}")
-        else:
-            _check("Embedding", True, f"{settings.backend} backend (remote; no local cache check)")
+        _doctor_embedding(cfg, warmup, _check)
     except Exception as e:  # noqa: BLE001
         _check("Embedding", False, str(e),
                fix="check BLADEX_EMBED_* and the [embedding] section of routing.toml; set HF_ENDPOINT for a mirror if the network is blocked")
@@ -1432,6 +1919,202 @@ def doctor(
     if e2e:
         return _run_e2e_check(cfg, timeout_s=e2e_timeout)
     return 0
+
+
+def _embed_api_probe(settings) -> tuple[int, float]:  # noqa: ANN001
+    """一次真实 api 探活（doctor 与 start 预检共用一份实现）。
+
+    返回 (dim, rtt_ms)；失败原样抛，措辞与去留由调用方决定。
+    """
+    from bladex_proxy.embedding import RouterEmbedAdapter
+    adapter = RouterEmbedAdapter(model=settings.model, api_base=settings.api_base,
+                                 api_key=settings.api_key, query_cache_size=0)
+    t0 = time.perf_counter()
+    vecs = adapter.embed_query(["probe"])
+    rtt_ms = (time.perf_counter() - t0) * 1000.0
+    dim = len(vecs[0]) if vecs and vecs[0] else 0
+    return dim, rtt_ms
+
+
+def _preflight_embedding(cfg, force: bool = False) -> bool:  # noqa: ANN001
+    """G18.5（MQ-W10，Jason 2026-09-18 拍板）：embedding 配置预检，错误中止启动。
+
+    记忆是护城河——配置错误不许降级成"proxy 活着但记忆死了"（MQ-L61 同族）。
+    预检只判**配置错误** + api 档一次真探活；运行时故障的降级路径
+    （app_factory 的 except Exception）保持不动，那条线是 MQ-L61 划的。
+
+    - ①模型名空 / ②key 声明未解析：**恒中止**（这两种配置下记忆必死，--force 无意义）；
+    - ③引擎与盖章不符：中止 + 三条出路（回退配置 / reembed+重标定 / --force 强启）；
+    - api 探活失败：中止，--force 可放行（网络临时不通时允许带病起）。
+    ③只对 local/api 档判（proxy/ipc 档身份要握手后才知道，预检不做负面判定——
+    与 memory_index 「空身份不作负面判定」同则）。
+    """
+    from bladex_proxy import router_sdk
+    from bladex_proxy.embedding import (
+        _sensitivity_enabled,
+        embed_model_identity,
+        resolve_embed_settings,
+    )
+    s = resolve_embed_settings(cfg)
+    # 敏感层开着时 api 档在运行时被强制回本地（fail-closed 既有行为）——
+    # 预检跟随**生效**形态：不按声明的 api 检查、不探活，只做③的本地身份对账。
+    api_effective = s.backend == "api" and not _sensitivity_enabled(cfg)
+
+    if api_effective:
+        if not s.model:
+            print("✗ Embedding preflight: backend=api but no embedding model configured.")
+            print('  fix: set [embedding].model in config/routing.toml (e.g. '
+                  '"openai/text-embedding-3-small") or BLADEX_EMBED_MODEL')
+            return False
+        key_env = getattr(getattr(getattr(cfg, "routing_config", None), "embedding", None),
+                          "api_key_env", "") or ""
+        if key_env and not s.api_key:
+            print(f"✗ Embedding preflight: api key env {key_env!r} is declared in "
+                  "routing.toml but resolves to empty.")
+            print(f"  fix: export {key_env}=<key> in the environment that runs bladex "
+                  "(keys never go into routing.toml itself)")
+            return False
+
+    if s.backend in ("local", "api"):
+        expected = embed_model_identity(cfg, role="proxy")
+        sidecar = Path(getattr(cfg, "index_path", "") or "") / "embed_model_id"
+        stored = sidecar.read_text(encoding="utf-8").strip() if sidecar.is_file() else ""
+        if stored and stored != expected:
+            if not force:
+                print(f"✗ Embedding preflight: engine changed -- Memory Index is stamped "
+                      f"{stored!r} but current config resolves to {expected!r}.")
+                print("  Starting like this would silently disable vector search (proxy) "
+                      "and make the consolidator refuse to write. Pick one:")
+                print("  1) keep your data: revert the [embedding] config (backend/model) "
+                      "to the stamped engine;")
+                print("  2) switch engines for real: rebuild the vector index with "
+                      "`python scripts/reembed_index.py` (full re-embed; with backend=api "
+                      "this sends ALL memory content to the provider) and re-calibrate "
+                      "thresholds on real traffic (non-e5 profiles ship uncalibrated defaults);")
+                print("  3) start anyway: `bladex start --force` (memory degraded as above).")
+                return False
+            print(f"⚠ Embedding preflight: engine mismatch (store={stored!r} "
+                  f"current={expected!r}) -- continuing due to --force; vector search "
+                  "disabled, consolidator will refuse to write.")
+
+    if api_effective:
+        try:
+            dim, rtt_ms = _embed_api_probe(s)
+        except Exception as exc:  # noqa: BLE001 — 探活失败=配置/网络问题，按 --force 决定去留
+            print(f"✗ Embedding preflight: api probe failed: {router_sdk.error_text(exc)}")
+            print("  fix: check [embedding] model / api_base and the api key; the model "
+                  "name must be a Router embedding id like provider/model")
+            if not force:
+                print("  (start anyway with `bladex start --force`; memory writes will "
+                      "fail until this is fixed)")
+                return False
+            print("  -- continuing due to --force")
+            return True
+        print(f"  Embedding:    embed_api_probe_ok dim={dim} rtt_ms={rtt_ms:.0f}")
+    return True
+
+
+def _doctor_embedding(cfg, warmup: bool, check) -> None:  # noqa: ANN001
+    """doctor 的 embedding 段：**先**盖章对账，**再**按档分流（MQ-W14）。
+
+    对账放在 api/local 分支**之外**、且在分流**之前**，与 `_preflight_embedding` 同序同判据：
+    `expected = embed_model_identity(cfg, role="proxy")`（唯一来源——内部已处理敏感层
+    fail-closed 强制回本地与 proxy 档的 role 折算），对 `<index>/embed_model_id` 侧车。
+    两者都非空且不等 ⇒ 报，并**跳过分流**（与 preflight 一样，章不对时不去探活/查缓存）。
+
+    为什么必须在分支之外（2026-09-18 复核真跑）：local 分支从来不对账（只 `_model_cached`），
+    ⇒ 纯 local + 章不一致 = doctor ✓ / start ✗；W12 把"敏感层 + api"挪进 local 分支后，
+    该形态也从"报错误的警"变成"不报警"。**doctor 说健康、start 说起不来** ——
+    ADR-0027 §2「红灯不许骗人」的镜像面：绿灯也不许骗人。
+
+    🔴 只对 local / api 两档对账；proxy / ipc 的身份要握手后才知道，不作负面判定
+    （与 preflight「空身份不作负面判定」同则）。
+    """
+    from bladex_proxy.embedding import (
+        _local_model_for,
+        _model_cached,
+        _sensitivity_enabled,
+        embed_model_identity,
+        resolve_embed_settings,
+    )
+    settings = resolve_embed_settings(cfg)
+    if settings.backend == "api" and _sensitivity_enabled(cfg):
+        # MQ-W12：敏感层 fail-closed 在运行时把 api 档强制回本地
+        # （build_embedder / embed_model_identity 同判据）。doctor 按**生效**
+        # 形态走 local 分支：不外呼探活（敏感层的语义就是不外发）。
+        print("  · Embedding: backend=api is overridden by the sensitivity layer "
+              "(fail-closed forces local) -- checking the effective local backend")
+        settings.backend = "local"
+        settings.model = _local_model_for(settings, forced=True)
+
+    if settings.backend in ("local", "api"):
+        expected = embed_model_identity(cfg, role="proxy")
+        sidecar = Path(getattr(cfg, "index_path", "") or "") / "embed_model_id"
+        stored = sidecar.read_text(encoding="utf-8").strip() if sidecar.is_file() else ""
+        if stored and stored != expected:
+            check("Embedding", False,
+                  f"Memory Index embed model mismatch: store={stored!r} current={expected!r} "
+                  "-- `bladex start` will refuse to start like this",
+                  fix="keep your data: revert the [embedding] config (backend/model) to the "
+                      "stamped engine; or switch engines for real: `python scripts/reembed_index.py` "
+                      "(full re-embed; with backend=api this sends ALL memory content to the provider)")
+            return
+
+    if settings.backend == "local":
+        model = settings.model or "(default)"
+        cached = _model_cached(settings.model, cfg.fastembed_cache_path) if settings.model else False
+        if warmup:
+            from bladex_proxy.embedding import build_embedder
+            print(f"  … loading embedding model {model} (downloaded automatically if missing; please wait)")
+            emb = build_embedder(cfg, role="proxy")
+            emb.embed(["warmup"])
+            check("Embedding", True, f"local/{model} ready")
+        else:
+            check("Embedding", True,
+                  f"local/{model} {'cached' if cached else 'not cached (downloaded on first start, or run doctor --warmup)'}")
+    elif settings.backend == "api":
+        _doctor_embed_api(cfg, settings, warmup, check)
+    else:
+        check("Embedding", True, f"{settings.backend} backend (remote; no local cache check)")
+
+
+def _doctor_embed_api(cfg, settings, warmup: bool, check) -> None:  # noqa: ANN001
+    """G18.4：`backend=api` 的 doctor 路径（MQ-W9 断点④）。
+
+    三条失败各自点名配置（模型名空 / key 声明了但解析为空 / 与已盖章库不同源），
+    成功路径报一次真实探活的维度与 RTT。`--warmup` 在本档下没有东西可下载，
+    明说跳过而不是装作做了。
+    """
+    from bladex_proxy import router_sdk
+
+    if warmup:
+        print("  · Embedding warmup: nothing to download for backend=api "
+              "(the probe below hits the remote endpoint instead)")
+    if not settings.model:
+        check("Embedding", False, "backend=api but no embedding model configured",
+              fix='set [embedding].model in config/routing.toml (e.g. '
+                  '"openai/text-embedding-3-small") or BLADEX_EMBED_MODEL')
+        return
+    key_env = getattr(getattr(getattr(cfg, "routing_config", None), "embedding", None),
+                      "api_key_env", "") or ""
+    if key_env and not settings.api_key:
+        check("Embedding", False,
+              f"api key env {key_env!r} is declared in routing.toml but resolves to empty",
+              fix=f"export {key_env}=<key> in the environment that runs bladex "
+                  "(keys never go into routing.toml itself)")
+        return
+
+    try:
+        dim, rtt_ms = _embed_api_probe(settings)
+    except Exception as exc:  # noqa: BLE001 — 探活失败要指配置，不能让整段 doctor 崩
+        check("Embedding", False, router_sdk.error_text(exc),
+              fix="check [embedding] model / api_base and the api key; the model name "
+                  "must be a Router embedding id like provider/model")
+        return
+
+    # 盖章对账不在这里做——已提到 `_doctor_embedding` 的分流之前（MQ-W14），
+    # 全 doctor 只许有那一处判定；能走到这里说明章已对上（或还没盖章）。
+    check("Embedding", True, f"embed_api_probe_ok dim={dim} rtt_ms={rtt_ms:.0f}")
 
 
 def _hidden_pth_files() -> list[str]:
@@ -1527,7 +2210,9 @@ def _run_e2e_check(cfg, timeout_s: float = 180.0) -> int:
     # ② turn 是否入库（Pipeline → Memory Hub）。入不了库，后面全都不可能发生。
     stored = False
     for _ in range(15):
-        idx = _http_json(f"{base}/admin/turns?limit=20", key=_admin_key())
+        # MQ-A91：/admin/turns 是全 Hub scan_meta 再排序，17.7k 轮 ≈ 4 s；默认 3 s 超时
+        # 会把"已入库"读成 None ⇒ 本步假红。超时放宽只修判读，端点的 O(N) 另账。
+        idx = _http_json(f"{base}/admin/turns?limit=20", key=_admin_key(), timeout=30.0)
         if idx:
             for item in idx.get("turns", []):
                 from urllib.parse import quote

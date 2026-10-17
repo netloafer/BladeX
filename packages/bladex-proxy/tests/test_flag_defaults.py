@@ -73,12 +73,16 @@ def test_all_memory_flags_and_defaults():
         "BLADEX_MATTER_LIFECYCLE": True,
         # E4：Prompt Cache TTL 感知 + 冷启相关性裁剪
         "BLADEX_CACHE_TTL_AWARE": True,
+        # 批 U · U1.3：ADR-0033 §2.5 一级复核（embedding）开关
+        "BLADEX_ASSEMBLY_REVIEW_EMBED": True,
         # E7.1：文件内容索引
         "BLADEX_FILE_INDEX": True,
         # M1-2：蒸馏 v4 两级路由（关掉 = 回落 v3 三条独立流水线）
         "BLADEX_DISTILL_V4": True,
         # M2-2：写入时裁决（关掉 = 回落 supersede 精确键 + 冲突检测的旧形态）
         "BLADEX_ADJUDICATE_ENABLED": True,
+        # 批 S · S2.1（MQ-I20）：库内邻居补齐坐标 + 判决真正落到库内目标
+        "BLADEX_ADJUDICATE_LIBRARY_HYDRATE": True,
         # 2026-08-31（MQ-S32 病 B 第五环）：全量重建重放取代判决。
         # **默认开**——恢复 ADR-0018 §4.1 明写声称过的行为，不是新功能。
         "BLADEX_SUPERSEDE_REPLAY_ENABLED": True,
@@ -86,6 +90,9 @@ def test_all_memory_flags_and_defaults():
         "BLADEX_ENTITY_CANON": True,
         # V-L5：账本锚归属层。2026-09-02 翻默认开（4a/4b 口径签收；=0 是回滚通道）。
         "BLADEX_LEDGER_ANCHOR": True,
+        # 批 Z · Z3.2（Y1b）：账本自述完结即停锚。**默认关**——09-24 读数：清 17/25 条目标错边，
+        # 却让 793 轮离开 ANCHOR，抽 60 轮 56 轮本属于那本（report-batch-Z3-20260923.md §⑤）。
+        "BLADEX_LEDGER_DONE_PAUSE": False,
         # V-P3 硬点 8 播报：默认关。协议事件序列只能靠真实客户端证伪
         # （2026-08-27 第一版不合协议、Codex 一次请求即断），沙盒测不出来。
         "BLADEX_NARRATE_INTERCEPT": False,
@@ -102,6 +109,11 @@ def test_all_memory_flags_and_defaults():
         # 默认开 = 生产形态；关掉逐字回到 09-09 之前（每请求都注完整原文），
         # 兼作回滚通道——codex / Pi 的 face 分布仍是 NO-DATA。
         "BLADEX_LEDGER_FACE_SPLIT": True,
+        # MQ-W17 修法①（批 X，2026-09-22）：consolidator 空载退避。
+        # 默认**开**——它修的是一个自 v0.1.0 起就在的成本缺陷（空载轮占空比 54.1%、
+        # ≈13h CPU/天），不是加特性；=0 逐字回到每轮固定 sleep 的旧行为，
+        # 既是回滚通道也是本批判据④(a) 的阴性对照。
+        "BLADEX_CONSOLIDATOR_IDLE_BACKOFF": True,
     }
     assert "BLADEX_KEYWORD_CHANNEL" not in MEMORY_FLAG_DEFAULTS
     # 2026-09-03 S4：四个退役开关连代码一起删，表里不得再出现（僵尸回归断言）。
@@ -115,16 +127,24 @@ def test_all_memory_flags_and_defaults():
 def test_numeric_defaults_table():
     """数值型参数同样集中默认值（ADR-0028 E2.1）。"""
     assert MEMORY_NUMERIC_DEFAULTS == {
-        # Flash 保鲜四窗口（2026-08-29 Jason 拍板：贵在精；默认值暂定按真实
-        # 流量再调，0=禁用；规则权威 docs/planning/flash-content-rules-20260829.md）
+        # 批 Z · Z2（MQ-A34 ①②）：字符→token 换算（Z2.0 读数④ p10 一侧）与输出预留下限。
+        "BLADEX_CHARS_PER_TOKEN": 2.5,
+        "BLADEX_CONTEXT_OUTPUT_FLOOR_TOKENS": 2048,
+        # （Flash 保鲜四窗口已于 2026-09-23 批 F4 随目录树删除。）
+        # Z1.2（MQ-W18）：硬规则热加载对账周期（秒；0 = 关，改规则需重启）。
+        "BLADEX_HARD_RULES_RELOAD_S": 5,
         # 账本并发标注窗口（2026-08-29「两 agent 同激活一本」批；0=关）
         "BLADEX_LEDGER_COAUTHOR_WINDOW_S": 1800,
-        "BLADEX_FLASH_SESSIONS_PER_PROJECT": 10,
-        "BLADEX_FLASH_PROJECTS_PER_AGENT": 10,
-        "BLADEX_FLASH_PROJECT_ACTIVE_DAYS": 30,
-        "BLADEX_FLASH_AGENT_RETIRE_DAYS": 90,
         # MQ-L50（2026-09-07）：flash daemon 等 proxy /health 的上限（秒）。
         "BLADEX_FLASH_WAIT_PROXY_S": 20,
+        # MQ-A81（2026-09-29）：flash daemon 等 proxy 创建 Memory Hub 的窗口（秒）。
+        "BLADEX_HUB_STARTUP_WAIT_S": 20,
+        # MQ-I30（2026-09-29）：长耗时 admin 写命令的客户端等待上限（秒）。
+        "BLADEX_ADMIN_LONG_TIMEOUT_S": 900,
+        # Z4（MQ-P33）：外部工具回流的大面积删除闸（超过即一条都不删）。
+        "BLADEX_BACKFLOW_MAX_DELETES": 5,
+        # Z4b：空载期间探 Postgres 收件表的周期（秒；inbox 关时零 SQL）。
+        "BLADEX_BACKFLOW_PG_PROBE_S": 30,
         # M0-8（复核 G3）：三时钟落地前不做重要性驱逐 —— 门槛回 0。
         "BLADEX_MIN_IMPORTANCE": 0.0,
         "BLADEX_LIFECYCLE_INTERVAL_S": 21600.0,
@@ -182,8 +202,7 @@ def test_numeric_defaults_table():
         # V-P3（agent-compat-survey D4 实测标定）：内循环墙钟与轮数硬顶。
         "BLADEX_INNER_LOOP_BUDGET_S": 120.0,
         "BLADEX_INNER_LOOP_MAX_ROUNDS": 6.0,
-        # V-L2/L4：切换防抖与陈旧标记阈值。
-        "BLADEX_LEDGER_SWITCH_DEBOUNCE": 3.0,
+        # V-L4：陈旧标记阈值（V-L2 切换防抖已于批 Y1c 删除，MQ-L91）。
         "BLADEX_LEDGER_STALE_TURNS": 20.0,
         # V-P3：内循环 keepalive 间隔。收进本表的理由同 DISTILL_CONCURRENCY——
         # 它原本是 agency.py 里一个硬编码 `_KEEPALIVE_INTERVAL_S = 10.0`，
@@ -198,6 +217,22 @@ def test_numeric_defaults_table():
         # V-C1 / MQ-S47：会话前缀候选槽数。1 = 退回旧单槽行为（回滚通道）。
         # 取 4 = 主会话 1 槽 + 小请求 1 槽 + 2 槽余量；理由与 live 读数在 flags.py。
         "BLADEX_PREFIX_SLOTS": 4.0,
+        # （装配 L1 三个数值旋钮已于批 U · U1.4 随 L1 删除，ADR-0033 §2.8。）
+        # 批 U · U1.2：ADR-0033 §2.3 触发门轮次阈值（待 U2 标定，保守取 10）。
+        "BLADEX_ASSEMBLY_MIN_UNITS": 10.0,
+        # 批 U · U1.3：ADR-0033 §2.5 / §2.9（HI / LO 不标定，U2 的事）
+        "BLADEX_ASSEMBLY_SCORE_HI": 0.82,
+        "BLADEX_ASSEMBLY_SCORE_LO": 0.72,
+        "BLADEX_ASSEMBLY_COLD_BUDGET_MS": 5000.0,
+        # MQ-W17 修法①（批 X）：空载退避的两个参数。收进本表的理由与
+        # DISTILL_CONCURRENCY 完全同型——消费方有两条拉起路径
+        # （`bladex start` / `run_consolidator.sh`），任何一个就地默认值
+        # 都会让"生产在跑哪个值"变得不可回答（刚性原则 12 第二条判据）。
+        "BLADEX_CONSOLIDATOR_IDLE_AFTER": 3.0,
+        "BLADEX_CONSOLIDATOR_IDLE_MAX_S": 1800.0,
+        # 批 Q3C：`bladex start` 每类日志保留数（0 = 关闭清理）。此前是
+        # `cli/lifecycle.py` 里就地的 `os.environ.get(..., "20")`，不受本对账约束。
+        "BLADEX_LOG_KEEP": 20.0,
     }
 
 
@@ -252,6 +287,8 @@ def test_assembly_agents_consumer_reads_flag_table(monkeypatch):
     from bladex_proxy.assembly import assembly_enabled_for
 
     monkeypatch.delenv("BLADEX_ASSEMBLY_AGENTS", raising=False)
+    assert assembly_enabled_for("claude-code") is False  # MQ-CA19：默认空清单
+    monkeypatch.setenv("BLADEX_ASSEMBLY_AGENTS", "claude-code")
     assert assembly_enabled_for("claude-code") is True
     monkeypatch.setenv("BLADEX_ASSEMBLY_AGENTS", "")
     assert assembly_enabled_for("claude-code") is False
@@ -340,6 +377,30 @@ def test_env_example_declares_numeric_defaults():
         assert float(m.group(1)) == default, (
             f"{name}: .env.example 写 {m.group(1)!r}，flags.py 默认 {default} —— 两侧必须一致"
         )
+
+
+def test_env_example_exports_have_a_consumer():
+    """反向对账（批 F4，2026-09-23）：模板里 `export` 的每个 `BLADEX_*` 都要有代码消费方。
+
+    上面三条只查"flags.py 有的，模板也有"。反方向没人查 ⇒ 删了旋钮的代码、忘了删模板，
+    对账照样全绿，用户照着模板配一个**已经没人读**的旋钮（原则 12：配置面与实现脱节）。
+    F4 删 Flash 保鲜四旋钮时提示词预期"对账红一次"，实测**不红** —— 这条就是为此补的。
+    消费方 = 生产包源码 / 启动脚本里出现该名字（字面量即可；动态拼名的旋钮今天为 0 个，
+    将来出现就把它列进下面的豁免表并写理由）。
+    """
+    root = Path(__file__).resolve().parents[3]
+    text = _repo_env_example().read_text(encoding="utf-8")
+    exported = set(re.findall(r'^\s*export\s+(BLADEX_[A-Z0-9_]+)=', text, re.MULTILINE))
+    sources = [*root.glob("packages/*/bladex_*/**/*.py"),
+               *root.glob("packages/*/bladex_*/**/*.toml"),
+               *root.glob("config/*.sh"), *root.glob("scripts/*.sh")]
+    corpus = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in sources)
+    exempt: dict[str, str] = {}      # 名字 -> 为什么没有字面量消费方
+    dead = sorted(n for n in exported if n not in corpus and n not in exempt)
+    assert not dead, (
+        f"config/.env.example 导出了没有代码消费方的旋钮：{dead}。"
+        "删旋钮要两侧一起删（flags.py 与模板），否则用户会去配一个没人读的值。"
+    )
 
 
 # ── 4. C1 三档登记（2026-09-03 批 B）────────────────────────────────────────

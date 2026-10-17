@@ -36,6 +36,7 @@ class _SyncLog:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._f = open(path, "a", encoding="utf-8")  # noqa: SIM115 —— 生命周期随 CLI
         self._last_file_write = 0.0
+        self._last_phase = ""
 
     def line(self, msg: str) -> None:
         print(msg)
@@ -45,8 +46,12 @@ class _SyncLog:
     def progress(self, msg: str) -> None:
         print(f"\r  {msg:<76}", end="", flush=True)
         now = time.monotonic()
-        if now - self._last_file_write >= 1.0:  # 文件里 1 行/秒，防日志膨胀
+        # 文件里 1 行/秒，防日志膨胀；但**换阶段那一行必写**（MQ-I25 ②：否则
+        # 嵌入 / novelty 这种一秒内就切走的阶段在日志里整段看不见）
+        phase = msg.split("]", 1)[0] if msg.startswith("[") else ""
+        if now - self._last_file_write >= 1.0 or phase != self._last_phase:
             self._last_file_write = now
+            self._last_phase = phase
             self._f.write(f"{time.strftime('%H:%M:%S')}   {msg}\n")
             self._f.flush()
 
@@ -63,6 +68,11 @@ def _fmt_progress(st: dict) -> str:
     extra = ""
     if st.get("new_facts"):
         extra = f" new_facts={st['new_facts']}"
+    # MQ-I25 ②：嵌入 / novelty 段带速率与剩余时间——"在跑还是卡死"、"要等多久"
+    if st.get("rate"):
+        extra += f" {st['rate']}/s"
+    if st.get("eta_s") not in (None, ""):
+        extra += f" eta {st['eta_s']}s"
     if total and total not in ("0", ""):
         try:
             pct = 100.0 * float(done) / float(total)
@@ -494,6 +504,7 @@ def config_show(
 def config_check() -> int:
     """Validate configuration the same way startup does.
 
+    \f
     报错尽量带定位（TOML 解析错误含行号）与修法。
     """
     problems: list[str] = []
@@ -584,7 +595,10 @@ def sync_run(
     concurrency: int = typer.Option(
         -1, "--concurrency",
         help="Distillation concurrency (1=serial; defaults to BLADEX_DISTILL_CONCURRENCY, or 4)"),
-    max_turns: int = typer.Option(0, "--max-turns", help="Max turns to process (0=unlimited)"),
+    max_turns: int = typer.Option(
+        0, "--max-turns",
+        help="Max turns to distill in this pass (0=unlimited). Limits which turns are consumed; "
+             "not allowed with --full, which always replays every turn"),
     since: str = typer.Option("", "--since", help="Only turns with ts >= this (ISO prefix)"),
     until: str = typer.Option("", "--until", help="Only turns with ts <= this (ISO prefix, inclusive)"),
     agents: str = typer.Option("", "--agents", help="Only these agents (comma separated)"),
@@ -594,6 +608,13 @@ def sync_run(
     log: str = typer.Option("", "--log", help="Log file path (default logs/sync-<ts>.log)"),
 ) -> int:
     """Run one sync pass (delegate first, falling back to direct)."""
+    # MQ-I25 ③（批 Q3B）：`rebuild_from_hub` 在 full 下把 max_turns 静默归零——
+    # 用户以为跑的是 5 轮冒烟、实际是全量重建（T2a 事故形状）。两个一起给 = 用法错误，当场说清。
+    if full and max_turns > 0:
+        print("--full and --max-turns cannot be combined: a full rebuild clears Memory Index and "
+              "always replays every turn, so --max-turns would be silently ignored. "
+              "Drop --max-turns for a full rebuild, or drop --full for a limited incremental pass.")
+        return 2
     # main() 已 chdir 到部署根；命令行上给的相对路径要钉回用户敲命令的目录。
     log = deployment.resolve_user_path(log)
     if concurrency < 0:
@@ -942,6 +963,9 @@ def export_cmd(
 ) -> int:
     """Export a memory snapshot to JSONL (facts, matters, edges, hard rules, admin events).
 
+    Tombstoned (deleted) data is never exported. Read-only: the proxy and the
+    consolidator can keep running.
+    \f
     墓碑数据不出现在导出中（删除语义，ADR-0012）。
     只读操作：Memory Hub secondary + Memory Index 只读句柄，proxy/consolidator 无需停。
     """
@@ -985,6 +1009,10 @@ def import_cmd(
 ) -> int:
     """Import a memory snapshot (idempotent merge by id; manual overrides auto).
 
+    Conflicts are flagged, not fatal. Imported items are stored as Memory Hub admin
+    events, so they survive a full rebuild. Stop the proxy and the consolidator first
+    (they hold the Memory Hub / Memory Index write locks).
+    \f
     冲突非阻断标注；
     导入实体以管理事件入 Memory Hub（full rebuild 后不丢失）。
 

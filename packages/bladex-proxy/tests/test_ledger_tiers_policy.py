@@ -184,7 +184,7 @@ class TestContentionNeedsConcurrency:
 
     def _table(self):
         from bladex_core.ledger_runtime import ActivationTable
-        return ActivationTable(debounce_turns=0)
+        return ActivationTable()
 
     def test_first_switch_has_no_age(self):
         from bladex_core.ledger_runtime import activation_scope

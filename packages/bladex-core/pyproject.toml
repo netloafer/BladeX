@@ -1,6 +1,6 @@
 [project]
 name = "bladex-core"
-version = "0.2.0"
+version = "0.3.0"
 description = "BladeX core - memory orchestration (the moat): prefetch, consolidation, consistency. Agent-neutral."
 requires-python = ">=3.11"
 # v4 记忆编排核心（护城河，agent 中立）：prefetch 相关性注入 + consolidation 增量蒸馏 +
@@ -13,7 +13,7 @@ dependencies = ["pydantic>=2"]
 [project.optional-dependencies]
 # pip install bladex-core[semantic]
 # fastembed: ONNX·CPU·多语 embedding（multilingual-e5-large），无 GPU 依赖，向量推理全本地。
-semantic = ["fastembed>=0.3", "numpy>=1.24"]
+semantic = ["fastembed>=0.3,<0.9", "numpy>=1.24"]
 
 [build-system]
 requires = ["hatchling"]

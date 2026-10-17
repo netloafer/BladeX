@@ -1,0 +1,30 @@
+{
+  "turn_key": "local/hermes:default/fp:1a2b2c60dc79/1790152065736-0",
+  "ts": "2026-09-23 08:27:45.734960+00:00",
+  "source": "批 Y1c A 段自 Memory Hub 取的病例形状；2026-09-28 批 H 发版审计已占位化（用户原话、称呼替换，消息条数 / 角色 / 顺序 / 时刻不变）",
+  "note": "原始 request_messages 共 54 条；只存最后三条 role=user（逐字、未剥信封，原文即无信封）+ 一条 system 占位。assistant/tool 内容未存。无凭证类字段，未做脱敏。agent 侧记用户发出时刻 16:27:37 本地；Hub 该轮 key 时刻 16:27:45 本地（首个请求）。",
+  "hub_message_indices": [
+    49,
+    51,
+    53
+  ],
+  "expected_user_query": "小助手，排查一下最近网关服务的连接情况，看看还有没有超时的问题存在。",
+  "messages": [
+    {
+      "role": "system",
+      "content": "<omitted: Hermes system prompt>"
+    },
+    {
+      "role": "user",
+      "content": "确定账本更新了？"
+    },
+    {
+      "role": "user",
+      "content": "你再深入复核一下。"
+    },
+    {
+      "role": "user",
+      "content": "小助手，排查一下最近网关服务的连接情况，看看还有没有超时的问题存在。"
+    }
+  ]
+}

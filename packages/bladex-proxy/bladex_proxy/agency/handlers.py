@@ -16,20 +16,25 @@ import structlog
 from bladex_core.flags import flag_number
 from bladex_core.ledger import (
     ACTOR_MODEL,
+    LIFECYCLE_ORIGIN_MODEL,
+    LIFECYCLE_ORIGINS,
+    STATUS_CLOSED,
     Ledger,
     LedgerEntry,
     LedgerError,
     add_entry,
+    close_ledger,
     new_ledger,
     render_ledger_md,
+    reopen_ledger,
 )
 from bladex_core.ledger_runtime import (
-    activation_scope,
     apply_tool_update,
     bind_matter,
     ledger_anchor_matter_id,
     update_edit_ops,
     update_is_add_only,
+    verify_switch_evidence,
 )
 from bladex_core.sensitivity import exposure_allows
 
@@ -48,6 +53,16 @@ _DESPITE_MATCH_SCORE = 0.5
 #: 用户点名账本的 title 最短长度（E0.3 / MQ-L41）：短于此的标题（"任务"、"调研"）
 #: 出现在用户话里不算点名——那是日常词，不是指代。
 USER_NAMED_TITLE_MIN_CHARS = 6
+
+
+def _turn_user_text(context: dict) -> str:
+    """本轮用户原话（**已剥信封**）——切换侧一切"按用户原话"判定的**唯一取值点**。
+
+    = `tool_context()["user_query"]`（`_last_user_text(for_goal=True)`）。`_user_named_ledger`
+    与举证校验 `verify_switch_evidence` 都只从这里取（Y1c 判据 5）：改成读模型给的任何参数，
+    校验就退化成模型自报（刚性原则 13 层 4）。守卫 `test_switch_evidence.py`。
+    """
+    return str(context.get("user_query", ""))
 
 
 #: 日志里单个自由文本字段的长度上限（错误消息等）。**截断必须带显式标记**。
@@ -72,9 +87,27 @@ def _clip(text: str, limit: int = _LOG_TEXT_MAX) -> str:
     return s if len(s) <= limit else s[:limit] + TRUNCATED_MARK
 
 
+def _writer_fields(context: dict | None) -> dict[str, Any]:
+    """账本事件载荷里的**写者**四格（agent / project / session / turn_index）。
+
+    与 `LEDGER_SWITCH` 载荷同源同值（都取自 `tool_context`）——不是第二把尺子。
+    没有工具上下文（admin 端点 / CLI）⇒ 空 dict：那些事件的写者是 `origin`，不编造会话。
+    消费方：完结停锚的写者用户轮豁免（`bladex_core.ledger.DoneSpan.writers`）。
+    """
+    if not context:
+        return {}
+    return {"agent_id": str(context.get("agent_id", "")),
+            "project_id": str(context.get("project_id", "")),
+            "session_id": str(context.get("session_id", "")),
+            "turn_index": int(context.get("turn_index", 0) or 0)}
+
+
 def _user_named_ledger(user_text: str, ledger: Any) -> tuple[bool, str]:
     """本轮用户原话是否点名了这本账本（按 id 或 ≥6 字符的 title 词面命中）。
-    返回 (命中, "id" | "title" | "")。纯函数；`ledger` 为 None ⇒ 不命中。"""
+    返回 (命中, "id" | "title" | "")。纯函数；`ledger` 为 None ⇒ 不命中。
+
+    批 Y1c 起它**不再豁免任何东西**（轮数防抖已删），只作 `agency_switch_evidence`
+    的一个字段 `user_named`：用户按名字点了这本 ⇒ 与模型摘录的 evidence 是两条独立证据。"""
     if ledger is None or not user_text:
         return (False, "")
     lid = str(getattr(ledger, "ledger_id", "") or "")
@@ -103,6 +136,14 @@ class ToolFaceHandlersMixin:
         fact_id 单条取。优先级 fact_id > matter_id > keyword > query。
         不可见与不存在**同文案**——不向低 exposure 目的地泄露条目存在性。"""
         if self._index is None:
+            # 🔴 MQ-L80 / G19.2（2026-09-20）：本文件所有 `return "Error: …"` 分支
+            # **全扫一遍**补日志——只修撞见的那一条是刚性原则 12 的变体
+            # （把缺陷写进文档 ≠ 处理了缺陷）。扫到 11 条，修前 4 条有日志
+            # （`agency_ledger_update_refused` ×2 / `agency_ledger_rev_conflict` /
+            # `agency_ledger_update_rejected`），7 条零日志 ⇒ 工具面失败率与失败成因
+            # 在存量日志里整体不可判定（刚性原则 13「静默丢数据比丢数据更糟」同族）。
+            logger.warning("agency_memory_search_refused", reason="index_unavailable",
+                           agent=str(context.get("agent_id", "")))
             return "Error: memory index unavailable."
         from bladex_core.topic_keys import canonical_entity_key
         fact_id = str(args.get("fact_id", "")).strip()
@@ -145,6 +186,9 @@ class ToolFaceHandlersMixin:
             return f"Keyword {keyword!r}:\n" + "\n".join(parts)
 
         if not query:
+            logger.warning("agency_memory_search_refused", reason="no_selector",
+                           agent=str(context.get("agent_id", "")),
+                           args=",".join(sorted(str(k) for k in (args or {}))))
             return ("Error: pass exactly one of query (semantic), "
                     "keyword (exact), matter_id, or fact_id.")
         facts = self._index.search(query, top_k=top_k * 2,
@@ -159,32 +203,6 @@ class ToolFaceHandlersMixin:
         if not out:
             return f"No memory found for {query!r}."
         return f"Memory hits for {query!r}:\n" + "\n".join(out)
-
-    def _maybe_migrate_binding(self, agent_id: str, project_id: str) -> None:
-        """惰性作用域迁移（2026-08-29 Jason 拍板，MQ-L30 收尾）。
-
-        规则（窄）：项目键无绑定 ∧ 同 agent Global 键有绑定 ∧ 本请求有项目
-        信号 ⇒ 把绑定搬到项目键。立论：项目键时代之前的 Global 绑定本就是
-        "项目无关混用"，搬到当前项目 = 维持键改造前的连续性；无项目信号的
-        agent（Pi/hermes）查的就是 Global，本函数对它们是空操作。
-        实测依据：自发自愈 0/2（模型信历史不信注入）、codex desktop 会话
-        指纹跨天不换（"新会话自愈"不可用）；且卡死期间每轮注入"无账本请新建"
-        有诱发重复建本的风险（doctor duplicate_title 前科）。
-        """
-        if not project_id or not self.ledger_on:
-            return
-        dst = activation_scope(agent_id, project_id)
-        if self.activation.active(dst):
-            return
-        src = activation_scope(agent_id, "")
-        lid = self.activation.migrate(src, dst)
-        if not lid:
-            return
-        logger.warning("agency_scope_binding_migrated", agent=agent_id,
-                       project=project_id, ledger=lid)
-        self._emit(AdminEventType.LEDGER_SCOPE_MIGRATE,
-                   {"agent_id": agent_id, "from_project": "",
-                    "to_project": project_id, "ledger_id": lid})
 
     def session_owns_active_ledger(self, agent_id: str, project_id: str,
                                    session_id: str) -> bool:
@@ -214,6 +232,17 @@ class ToolFaceHandlersMixin:
         if not bound or bound != session_id:
             return False
         return self._active_ledger(scope) is not None
+
+    def session_active_ledger(self, agent_id: str, project_id: str,
+                              session_id: str) -> Ledger | None:
+        """本会话绑着的激活账本（只读，无迁移副作用）；未绑 / 继承来的绑定 ⇒ None。
+
+        批 U · U1.3：ADR-0033 §2.4 装配复核的 goal 锚点（"会话未绑激活账本时退化为只用 request"）。
+        判据复用 `session_owns_active_ledger`（MQ-L28 单一定义），不另拼一遍。
+        """
+        if not self.session_owns_active_ledger(agent_id, project_id, session_id):
+            return None
+        return self._active_ledger(self.scope_of(agent_id, project_id))
 
     def _active_ledger(self, scope: str) -> Ledger | None:
         lid = self.activation.active(scope)
@@ -245,7 +274,8 @@ class ToolFaceHandlersMixin:
     def _ledger_for(self, context: dict) -> Ledger | None:
         agent_id = context.get("agent_id", "")
         project_id = context.get("project_id", "")
-        self._maybe_migrate_binding(agent_id, project_id)
+        # 批 Y · Y1d（拍板 (30)，MQ-L93）：此处曾先做惰性作用域迁移再查绑定；
+        # 迁移已停产（见 `runtime.py` 候选段注释），项目键落空就是落空。
         return self._active_ledger(self.scope_of(agent_id, project_id))
 
     def _mark_subtask_on_parent(self, parent_id: str, child: Ledger, *,
@@ -259,6 +289,15 @@ class ToolFaceHandlersMixin:
         """
         parent = self.pool.get(parent_id)
         if parent is None:
+            return
+        if parent.status == STATUS_CLOSED:
+            # 🔴 批 L100（MQ-L100）：已关的父本**不记 awaiting**。「awaiting sub-task」是说
+            # 父本在等这件子任务——关掉的本没有在等任何事；记上去等于往一件做完的事里塞一条
+            # 永远不会被划掉的 Next（`ledger_is_done` 也随之判它没做完）。父子关系不因此丢：
+            # 子本的 `parent_ledger_id`（create 事件）与子本 Next 里的回写义务都照常落 Hub。
+            # 不拒绝「以已关账本作父」——那是启发式拦截，没有病例证明拦了更好（刚性原则 15）。
+            logger.info("agency_subtask_parent_mark_skipped", reason="parent_closed",
+                        parent=parent_id, child=child.ledger_id, writer=writer)
             return
         try:
             new = add_entry(
@@ -288,12 +327,17 @@ class ToolFaceHandlersMixin:
         **那份列表从来没被用起来过，因为用不了**。
         """
         if not self.ledger_on:
+            logger.warning("agency_ledger_read_refused", reason="module_off",
+                           agent=str(context.get("agent_id", "")))
             return "Error: ledger module is disabled."
         wanted = str(args.get("ledger_id", "")).strip()
         if wanted:
             led = self.pool.get(wanted)
             if led is None:
                 known = ", ".join(sorted(self.pool)) or "(none)"
+                logger.warning("agency_ledger_read_refused", reason="unknown_ledger",
+                               target=wanted, pool_size=len(self.pool),
+                               agent=str(context.get("agent_id", "")))
                 return f"Error: unknown ledger {wanted!r}. Known: {known}"
             return render_ledger_md(led)
         led = self._ledger_for(context)
@@ -396,7 +440,11 @@ class ToolFaceHandlersMixin:
         self._turns_since_update[new.ledger_id] = 0   # V-L4：更新即归零
         # 🔴 批量整批**一次** rev+1、**一条** LEDGER_UPDATE 事件（状态式重放：
         # payload 是整本 dump，逐条发事件既冗余又会让 rev 与事件数对不上）。
-        self._emit(AdminEventType.LEDGER_UPDATE, {"ledger": new.model_dump()})
+        # 🔴 批 Z · Z3.2：载荷补**写者用户轮**（`_writer_fields`）。完结停锚要知道
+        # "完结写入发生在哪个用户轮"——那一轮是任务的收尾，照常锚；此前 update 载荷只有
+        # 整本 dump，写者从存量事件不可判定（原则 13：采到的元数据入 Hub 无损）。
+        self._emit(AdminEventType.LEDGER_UPDATE,
+                   {"ledger": new.model_dump(), **_writer_fields(context)})
         # MQ-L49 判据的读数点：`n_edits≥2` 占比 = 批量形态被用起来了没有。
         # 分母挂"落地成功的 update 调用"（被 rev 锁拒的、报错的都不到这里）。
         _ops = update_edit_ops(args)
@@ -423,13 +471,16 @@ class ToolFaceHandlersMixin:
     async def _h_ledger_switch(self, args: dict, *, allowed_exposure: str,
                                context: dict) -> str:
         if not self.ledger_on:
+            logger.warning("agency_ledger_switch_refused", reason="module_off",
+                           agent=str(context.get("agent_id", "")))
             return "Error: ledger module is disabled."
         session_id = context.get("session_id", "")
         agent_id = context.get("agent_id", "")
         project_id = context.get("project_id", "")
         scope = self.scope_of(agent_id, project_id)
         target = str(args.get("ledger_id", "")).strip()
-        created_now = not target          # 本次调用是否新建（防抖豁免判据）
+        created_now = not target          # 本次调用是否新建（举证来源 = new_ledger）
+        _prev_active = self._active_ledger(scope)   # 切换前的激活本（子本回写判据）
         if not target:
             # 🔴 2026-08-26 拍板（Jason）：Goal 由**模型提炼**，不再原样引用用户原话。
             # 证伪来自 live：jydesignhk 那 5 本账本的 Goal 全都以 agent 自己的
@@ -454,9 +505,13 @@ class ToolFaceHandlersMixin:
             # 子任务是 LLM 的决策（三红线：BladeX 不做作者），所以它得自己说。
             _parent = str(args.get("parent_ledger_id", "")).strip()
             if _parent and _parent not in self.pool:
+                logger.warning("agency_ledger_switch_refused",
+                               reason="unknown_parent", target=_parent,
+                               pool_size=len(self.pool), agent=agent_id,
+                               scope=self.scope_of(str(agent_id), str(project_id)))
                 return (f"Error: unknown parent_ledger_id {_parent!r}. "
                         "Omit it if this is not a sub-task.")
-            _verbatim = str(context.get("user_query", "")).strip()
+            _verbatim = _turn_user_text(context).strip()
             _refined = str(args.get("goal", "")).strip()
             led = new_ledger(title=str(args.get("title", "")).strip() or "New task",
                              goal=_refined or _verbatim,
@@ -527,51 +582,115 @@ class ToolFaceHandlersMixin:
                                candidates_shown=self._candidates_shown)
             self.pool[led.ledger_id] = led
             self._turns_since_update[led.ledger_id] = 0   # V-L4：新账本不陈旧
-            self._emit(AdminEventType.LEDGER_CREATE, {"ledger": led.model_dump()})
+            # 🔴 载荷补 scope（批 T0，2026-09-22）：`ledger_create` 历史上只带
+            # `{"ledger": …}`，**没有任何 scope 信号**（`last_writer` 也 85/85 为空，
+            # MQ-L85）⇒ "这本是谁在哪个 project 下建的" 从存量事件不可判定，
+            # `switch_timeline` 的「建本即激活」起点也就无从落轴（MQ-I22 连带）。
+            # 两个值与紧随其后的 switch 事件**同源同值**（同一个 agent_id /
+            # project_id 变量），不是第二把尺子。
+            # 🔴 MQ-L85（批 Q3A，2026-09-29）：补齐写者四格——`session_id` / `turn_index`
+            # 此前只在 update 上有（Z3.2 `_writer_fields`），create 只有批 T0 补的 agent/project。
+            # 同一个 `_writer_fields(context)`，与 update / switch 同源同值；存量不回填。
+            self._emit(AdminEventType.LEDGER_CREATE,
+                       {"ledger": led.model_dump(), **_writer_fields(context),
+                        "agent_id": agent_id, "project_id": project_id})
             target = led.ledger_id
         elif target not in self.pool:
             known = ", ".join(sorted(self.pool)) or "(none)"
+            # 🔴 MQ-L80：这条此前零日志，而**同一个函数**的防抖分支走 `logger.warning`
+            # ⇒ 切换失败率与失败成因（猜 id / 已删 / 模块关）在存量日志里不可判定，
+            # 只能靠 `agency_stream_mixed_stripped` 反推、且反推不出目标 id。
+            # live 病例 00:27:57 那次失败的 switch 就是这样消失的。
+            logger.warning("agency_switch_unknown_ledger", target=target,
+                           pool_size=len(self.pool), agent=agent_id,
+                           scope=self.scope_of(str(agent_id), str(project_id)))
             return f"Error: unknown ledger {target!r}. Known: {known}"
-        # E0.3（MQ-L41）：`user_requested` 的**唯一生产者**。判据来自本轮用户原话
-        # （`context["user_query"]`，已剥信封）是否点名目标账本——按 id 或 title
-        # （≥6 字符，防 "任务" 这类短词误命中）。**不接受模型自报**（schema 无该参数，
-        # 保持）：豁免若由模型说了算，防抖形同虚设。
-        user_requested = False
-        if not created_now:
-            user_requested, _by = _user_named_ledger(
-                str(context.get("user_query", "")), self.pool.get(target))
-            if user_requested:
-                logger.info("agency_switch_user_requested", ledger=target, by=_by,
-                            scope=scope, session=session_id)
+        # ── 批 Z · Z3：切到一本已关的账本 = 先重开再切 ──
+        # 重开本身不激活（`reopen_ledger`），激活只有 switch 这一条路；模型显式切过去就是
+        # "这件事又要办了"——两件事各落一条事件（reopen 在前），重放与运行时同序。
+        # 不开独立的 reopen 工具：模型侧重开的唯一正当场景就是回到那件事，那正是 switch；
+        # 多一个工具多一份注入（ADR-0029 加注入者举证）。
+        # 子本回写判据（批 Y · Y1c）：切换前的激活本是子本，它 Next 里那条回写义务的 ref
+        # 正是目标。🔴 批 L100 起它先于重开判定算——回写不重开父本（见下）。
+        _child_ref = ""
+        if _prev_active is not None and not created_now:
+            for _e in _prev_active.entries("next"):
+                if getattr(_e, "ref", "") == target and SUBTASK_TAG in (_e.text or ""):
+                    _child_ref = _e.text
+                    break
+        _reopened = False
+        _kept_closed = False
+        if not created_now and self.pool[target].status == STATUS_CLOSED:
+            if _child_ref:
+                # 🔴 批 L100（MQ-L100）：子任务回写**不改变父本的开 / 关状态**。回写一条状态
+                # ≠「这件事又要办了」——10-16 dsh 病例：按子本义务切到已关父本 ⇒ 重开，写完切回
+                # 子本、关子本，父本从此停在 active，一件早已做完的事回到「最近在做」。
+                # 这里只激活不重开：父本保持 closed，`closed_at` / 关闭者原样（池对象不动，
+                # 之后的 update 载荷是整本 dump，带着原关闭信息重放）。回写本身照常经
+                # `bladex_ledger_update` 落 LEDGER_UPDATE（谁写的、写了什么）。
+                # 模型若真要重开那件事：从别处（非它的子本）切过去仍走下面的重开分支。
+                _kept_closed = True
+                logger.info("agency_ledger_writeback_kept_closed", ledger=target,
+                            child=_prev_active.ledger_id if _prev_active else "",
+                            agent=agent_id, session=session_id,
+                            closed_at=self.pool[target].closed_at)
+            else:
+                self.lifecycle_reopen(target, origin=LIFECYCLE_ORIGIN_MODEL,
+                                      reason="switch", context=context)
+                _reopened = True
+        # ── 举证（批 Y · Y1c，MQ-L91，2026-09-24）── 观测阶段**只记不拦**。
+        # 轮数防抖已删：它把 ADR-0031「要证明是新的事才切换」的证据从内容换成了轮数计数。
+        # 证据来源见 `ledger_runtime.EVIDENCE_SOURCES`；`user_text` 一类由 BladeX 对照
+        # 本轮用户原话校验（`_turn_user_text` 单取值点），不是模型自报。
+        _evidence_raw = str(args.get("evidence", "") or "")
+        _user_text = _turn_user_text(context)
+        if created_now:
+            _ev_source, _ev_text = "new_ledger", self.pool[target].goal
+            _ev_ok: bool | None = bool(_ev_text.strip())
+        elif _child_ref:
+            _ev_source, _ev_text, _ev_ok = "child_writeback", _child_ref, True
+        elif _evidence_raw.strip():
+            _ev_source, _ev_text = "user_text", _evidence_raw
+            _ev_ok = verify_switch_evidence(_evidence_raw, _user_text)
+        else:
+            _ev_source, _ev_text, _ev_ok = "", "", None
+        _named, _named_by = ((False, "") if created_now
+                             else _user_named_ledger(_user_text, self.pool.get(target)))
         verdict = self.activation.request_switch(
             scope, target, agent_id=agent_id, session_id=session_id,
             project_id=project_id,
-            turn_index=int(context.get("turn_index", 0)),
-            newly_created=created_now, user_requested=user_requested)
+            turn_index=int(context.get("turn_index", 0)))
         if not verdict.allowed:
-            if verdict.reason == "noop":
-                return f"Ledger {target} is already active."
-            logger.warning("agency_switch_debounced", scope=scope, session=session_id,
-                           target=target, turn_index=int(context.get("turn_index", 0)),
-                           last_switch_turn=self.activation.last_switch_turn(scope),
-                           last_switch_session=self.activation.last_switch_turn_session(scope),
-                           debounce=self.activation.debounce_turns)
-            # C6c（2026-09-04）：旧回文 "debounced (switched too recently). Stay on the
-            # current ledger" 被模型读成"已经切过了"（09:10 病例：把"switch 回同题账本 ✅"
-            # 写成 Verified，实际 5 次全拒），且"stay on the current ledger"直接把它引向
-            # 错本去写。改成明确否定态 + 说清还差几轮；不改判定。
-            _cur = self._active_ledger(scope)
-            _cur_id = _cur.ledger_id if _cur else ""
-            _cur_title = (_cur.title or "") if _cur else ""
-            _last = self.activation.last_switch_turn(scope)
-            _ti = int(context.get("turn_index", 0))
-            _wait = (max(0, self.activation.debounce_turns - (_ti - _last))
-                     if _last is not None else self.activation.debounce_turns)
-            return (f"NOT switched (debounce): the active ledger is still {_cur_id} "
-                    f"({_cur_title!r}). Do NOT record the new task's progress into it "
-                    "and do not report the switch as done. Answer the user without "
-                    f"ledger updates this turn; switching to {target} will be allowed "
-                    f"after {_wait} more turn(s).")
+            # 唯一的拒绝是 noop（同本重复激活，幂等）——不属于防抖，保留。
+            return f"Ledger {target} is already active."
+        _cand = {m.ledger_id: m.score for m in self._last_candidates}
+        # 字段对着卡 §5「步骤 1」逐项列（步骤 2 开闸问题的读数源，离线脚本
+        # `scripts/probe_switch_evidence.py` 按键名取）。evidence 原文只进 Hub（无损），
+        # 日志给字数——console 渲染的自由文本带空格会破坏按键解析。
+        logger.info("agency_switch_evidence",
+                    scope=scope, session=session_id, agent=agent_id,
+                    from_ledger=verdict.event_payload.get("from_ledger_id", ""),
+                    to_ledger=target,
+                    evidence_ok=_ev_ok, source=_ev_source or "none",
+                    evidence_chars=len(_ev_text),
+                    user_named=_named_by or "no",
+                    turn_index=int(context.get("turn_index", 0)),
+                    delta_turns=verdict.delta_turns,
+                    delta_s=(round(verdict.prev_age_s, 1)
+                             if verdict.prev_age_s >= 0 else None),
+                    switch_in_turn=verdict.switch_in_turn,
+                    back_to_prev=verdict.back_to_prev,
+                    in_candidates=target in _cand,
+                    candidate_score=_cand.get(target),
+                    candidates_shown=self._candidates_shown,
+                    child_writeback=bool(_child_ref),
+                    created=created_now)
+        if _ev_ok is False:
+            # 可 grep：模型给了摘录但本轮用户原话里没有（编造 / 摘自上文 / 摘自工具结果）。
+            logger.warning("agency_switch_evidence_mismatch", scope=scope,
+                           session=session_id, to_ledger=target,
+                           evidence_chars=len(_ev_text),
+                           user_text_chars=len(_user_text))
         # scope 争用告警：project 信号未落地前，同一 agent 的**并发**会话共用一个
         # scope（两个 CC 窗口开在不同仓库 ⇒ 互相切走对方的账本）。**不静默**——
         # 刚性原则 9 的"硬约束可以推翻静态配置，但必须留可 grep 的告警"同款。
@@ -592,6 +711,151 @@ class ToolFaceHandlersMixin:
                                 "session; project signal extraction is V-F2")
         # ③ 事件载荷补 `ledger_id`（2026-08-25 live：switch 事件的 ledger_id 为空，
         # 重放靠 to_ledger_id 能恢复但审计读起来是空的——两个字段同源同值，冗余无害）。
+        # 🔴 举证进 Hub，不只进日志（Y1c 调度补）：防抖的拒绝只在日志里，历史错边因此
+        # 无从在库里纠正——同样的事不许发生第二次。三字段加法式、老事件缺省；
+        # evidence 原文无损（刚性原则 13：不静默截断）。
+        # 批 L100：`kept_closed` 只在「回写切到已关父本」那一格出现（加法字段，开父本路径
+        # 载荷逐字等于修前）——激活一本 closed 的账本是有意的，不是重放漏了 reopen。
         self._emit(AdminEventType.LEDGER_SWITCH,
-                   {**verdict.event_payload, "ledger_id": target})
-        return f"Active ledger is now {target}."
+                   {**verdict.event_payload, "ledger_id": target,
+                    "evidence": _ev_text, "evidence_ok": _ev_ok,
+                    "evidence_source": _ev_source,
+                    **({"kept_closed": True} if _kept_closed else {})})
+        return (f"Active ledger is now {target}."
+                + (" (It was closed; switching reopened it.)" if _reopened else "")
+                + (" (It is closed and stays closed: this is a sub-task write-back.)"
+                   if _kept_closed else ""))
+
+    # ── 批 Z · Z3：生命周期 close / supersede / reopen ──────────────────────
+    #
+    # 唯一执行点：工具（`bladex_ledger_close` / 切到已关的本）与 admin 端点
+    # （CLI `bladex ledger close|reopen|supersede`）都走这两个方法——状态变换是 core 的
+    # `close_ledger` / `reopen_ledger`（重放同一对函数），事件在这里落 Hub。
+    # 🔴 三红线：只动 status / superseded_by，不碰 Goal 与正文（红线 1、2）。
+
+    def lifecycle_close(self, ledger_id: str, *, origin: str, superseded_by: str = "",
+                        reason: str = "", context: dict | None = None,
+                        evidence_fields: dict[str, Any] | None = None) -> tuple[str, dict]:
+        """关本（`superseded_by` 非空 = supersede）。返回 `(结果, 详情)`，结果 ∈
+        `closed` / `superseded` / `noop` / `unknown_ledger` / `unknown_successor` / `self_successor`。
+
+        关的若是某些 scope 的激活账本 ⇒ 这些 scope 的激活随之解除（`forget_ledger`：
+        变成无激活账本，**不回退**到上一本）；时间轴上由重放插"切到空"（core）。"""
+        if origin not in LIFECYCLE_ORIGINS:
+            raise ValueError(f"unknown lifecycle origin {origin!r}")
+        led = self.pool.get(ledger_id)
+        if led is None:
+            return ("unknown_ledger", {})
+        if superseded_by:
+            if superseded_by == ledger_id:
+                return ("self_successor", {})
+            if superseded_by not in self.pool:
+                return ("unknown_successor", {})
+        if led.status == STATUS_CLOSED and (not superseded_by
+                                            or led.superseded_by == superseded_by):
+            return ("noop", {"freed_scopes": []})
+        import datetime as _dt  # noqa: PLC0415
+
+        _writer = _writer_fields(context)
+        # E4（MQ-L98）/ 批 HO（MQ-L99）：池里记「谁在何时关的」，与事件载荷（session_id /
+        # agent_id + 事件时刻）同源；admin / CLI 关本没有会话与 agent ⇒ 空（渲染为不带 "by"）。
+        _closed_at = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
+        self.pool[ledger_id] = close_ledger(
+            led, superseded_by=superseded_by,
+            closed_by_session=str(_writer.get("session_id", "") or ""),
+            closed_by_agent=str(_writer.get("agent_id", "") or ""),
+            closed_at=_closed_at)
+        freed = self.activation.forget_ledger(ledger_id)
+        etype = (AdminEventType.LEDGER_SUPERSEDE if superseded_by
+                 else AdminEventType.LEDGER_CLOSE)
+        payload: dict[str, Any] = {"ledger_id": ledger_id, "origin": origin,
+                                   "reason": reason, **_writer}
+        if superseded_by:
+            payload["superseded_by"] = superseded_by
+        if evidence_fields:
+            # 拍板 (40)：关本举证三字段进 Hub，原文无损（刚性原则 13），只记不拦。
+            payload.update(evidence_fields)
+        self._emit(etype, payload)
+        logger.info("agency_ledger_closed", ledger=ledger_id, origin=origin,
+                    superseded_by=superseded_by or None, freed_scopes=len(freed),
+                    reason=_clip(reason, 80),
+                    agent=str((context or {}).get("agent_id", "")),
+                    session=str(_writer.get("session_id", "") or ""),
+                    evidence_ok=(evidence_fields or {}).get("evidence_ok"),
+                    evidence_source=(evidence_fields or {}).get("evidence_source") or "none")
+        return ("superseded" if superseded_by else "closed", {"freed_scopes": freed})
+
+    def lifecycle_reopen(self, ledger_id: str, *, origin: str, reason: str = "",
+                         context: dict | None = None) -> str:
+        """重开：只恢复状态，**不激活**。返回 `reopened` / `noop` / `unknown_ledger`。"""
+        if origin not in LIFECYCLE_ORIGINS:
+            raise ValueError(f"unknown lifecycle origin {origin!r}")
+        led = self.pool.get(ledger_id)
+        if led is None:
+            return "unknown_ledger"
+        if led.status != STATUS_CLOSED:
+            return "noop"
+        self.pool[ledger_id] = reopen_ledger(led)
+        self._emit(AdminEventType.LEDGER_REOPEN,
+                   {"ledger_id": ledger_id, "origin": origin, "reason": reason,
+                    **_writer_fields(context)})
+        logger.info("agency_ledger_reopened", ledger=ledger_id, origin=origin,
+                    reason=_clip(reason, 80),
+                    agent=str((context or {}).get("agent_id", "")))
+        return "reopened"
+
+    async def _h_ledger_close(self, args: dict, *, allowed_exposure: str,
+                              context: dict) -> str:
+        """`bladex_ledger_close`：关本（可带 `superseded_by` = supersede）。缺省关激活本。
+
+        开给模型的理由：close / supersede 都只动账本对象（三红线之 1 之内）、不碰 Goal；
+        做完不关是 Y0 第一红线错边的最大一块（54 / 141），而判"做完"的是作者（模型）。
+        reopen **不单开工具**——见 `_h_ledger_switch` 的「切到已关的本」。"""
+        if not self.ledger_on:
+            logger.warning("agency_ledger_close_refused", reason="module_off",
+                           agent=str(context.get("agent_id", "")))
+            return "Error: ledger module is disabled."
+        target = str(args.get("ledger_id", "") or "").strip()
+        if not target:
+            led = self._ledger_for(context)
+            if led is None:
+                logger.warning("agency_ledger_close_refused", reason="no_active_ledger",
+                               agent=str(context.get("agent_id", "")))
+                return "Error: no active ledger; pass ledger_id to close a specific one."
+            target = led.ledger_id
+        successor = str(args.get("superseded_by", "") or "").strip()
+        # 拍板 (40)：关本举证——与 `bladex_ledger_switch` 的 evidence 同一套校验
+        # （`verify_switch_evidence` 单实现点，对照剥信封后的本轮用户原话），只记不拦：
+        # 不带 ⇒ evidence_ok=None，照常关；对不上 ⇒ False + 可 grep 告警，照常关。
+        _evidence_raw = str(args.get("evidence", "") or "")
+        _user_text = _turn_user_text(context)
+        if _evidence_raw.strip():
+            _ev_source, _ev_text = "user_text", _evidence_raw
+            _ev_ok: bool | None = verify_switch_evidence(_evidence_raw, _user_text)
+        else:
+            _ev_source, _ev_text, _ev_ok = "", "", None
+        if _ev_ok is False:
+            logger.warning("agency_close_evidence_mismatch", target=target,
+                           agent=str(context.get("agent_id", "")),
+                           session=str(context.get("session_id", "")),
+                           evidence_chars=len(_ev_text), user_text_chars=len(_user_text))
+        result, detail = self.lifecycle_close(
+            target, origin=LIFECYCLE_ORIGIN_MODEL, superseded_by=successor, context=context,
+            evidence_fields={"evidence": _ev_text, "evidence_ok": _ev_ok,
+                             "evidence_source": _ev_source})
+        if result == "self_successor":
+            logger.warning("agency_ledger_close_refused", reason=result, target=target,
+                           agent=str(context.get("agent_id", "")))
+            return "Error: a ledger cannot supersede itself."
+        if result in ("unknown_ledger", "unknown_successor"):
+            bad = successor if result == "unknown_successor" else target
+            known = ", ".join(sorted(self.pool)) or "(none)"
+            logger.warning("agency_ledger_close_refused", reason=result, target=bad,
+                           pool_size=len(self.pool), agent=str(context.get("agent_id", "")))
+            return f"Error: unknown ledger {bad!r}. Known: {known}"
+        if result == "noop":
+            return f"Ledger {target} is already closed."
+        tail = (" It is no longer active here; switch to or create a ledger for the next task."
+                if detail.get("freed_scopes") else "")
+        what = f"superseded by {successor}" if successor else "closed"
+        return f"Ledger {target} {what}.{tail}"

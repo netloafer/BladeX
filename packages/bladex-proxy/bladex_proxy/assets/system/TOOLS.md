@@ -14,9 +14,15 @@ ledger. So:
   If the user already stated constraints or you already know the first steps,
   pass `core` / `open` / `next` in the same call rather than updating right after.
 - Resuming something you can see in the injected list → `bladex_ledger_switch`
-  with that id. Read it first if you are unsure it is the right one:
-  `bladex_ledger_read(ledger_id=...)` inspects without switching.
+  with that id, and put in `evidence` the user's own words from this turn that
+  show the move (copied, not paraphrased). Read it first if you are unsure it
+  is the right one: `bladex_ledger_read(ledger_id=...)` inspects without switching.
 - Already on the right ledger → just `bladex_ledger_update`. No switch needed.
+- Finished, or the user dropped it → `bladex_ledger_close`, with `evidence` =
+  the user's own words from this turn that say so (copied). If the user later
+  comes back to a task you closed, it is listed among the matching ledgers,
+  marked "[closed …]": switch to it (that reopens it) instead of creating
+  a new ledger.
 
 ## When not to call
 
@@ -60,7 +66,6 @@ Every tool returns plain text. Failures start with `Error:` and say what to do:
 | `Error: unknown ledger 'x'. Known: ...` | The id is wrong; the message lists valid ones. |
 | `Error: unknown parent_ledger_id 'x'.` | Same, for `parent_ledger_id`. |
 | `Ledger ldg-... is already active.` | No-op, not a failure. Proceed. |
-| `NOT switched (debounce): the active ledger is still …` | The switch did **not** happen. You are still on the ledger named in the message — do not record the new task's work there, and do not report the switch as done. Answer without ledger updates this turn; the message says how many turns until switching is allowed. If the user named the ledger (by id or title) in this turn, the switch is not debounced. |
 | `Error: edit 3 of 4 failed (...); NOTHING was written` | A batch is all-or-nothing. **None** of the edits landed and the ledger is unchanged. Fix the one named and resend the *whole* batch, not just that one. |
 | `Error: match '...' matches 2 entries (...)` | Ambiguous. The message lists the candidates; make `match` longer, or pass `index`. |
 | `Error: match '...' matches entries in 2 sections (...)` | You removed by `match` without a `section` and it hit more than one section. The message names them; pass `section`, or make `match` longer. |

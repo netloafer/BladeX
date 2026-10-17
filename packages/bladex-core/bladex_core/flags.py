@@ -61,6 +61,16 @@ MEMORY_FLAG_DEFAULTS: dict[str, bool] = {
     # 开关保留作回滚通道（=0 ⇒ 零 ANCHOR 边，`test_flag_off_is_regression_channel`）。
     "BLADEX_LEDGER_ANCHOR": True,
 
+    # ── 账本自述完结即停锚（批 Z · Z3.2 / Y1b，2026-09-24）──
+    # 开 ⇒ `switch_timeline` 算出 `done_spans`，`turn_active_ledger` 在完结区间里返回空
+    # （判据：某次写入后 Open 与 Next 都空、Verified 非空；恢复：Open/Next 重新非空或显式切回）。
+    # 🔴 **默认关，读数驱动**：它清掉 Y0/Y1a 的 25 条目标错边中的 17 条（余 8 条在模型显式切回
+    # 那本之后，按原则 15 不许否决），代价是 793 轮 / 774 条 fact 离开 ANCHOR；按账本分层抽 60 轮
+    # 判读，**56 轮本就属于那本账本**（bench 模型做到一半清空 Next、调研账本只记 Verified 的
+    # 日志式用法）——"Open∧Next 空 ∧ Verified 非空"不是完结信号。开不开归 Jason 拍
+    # （report-batch-Z3-20260923.md §⑤）；关着时机制与测试原样在，翻开只改这一个值。
+    "BLADEX_LEDGER_DONE_PAUSE": False,
+
     # ── 账本准入闸（ADR-0032 §4.5，2026-09-02）──
     # DPL 边落**账本锚卡**前过两道因果闸：① 轮次不得早于账本 created_at；
     # ② 轮次明确属于别的账本 ⇒ 拒。判定在 `ledger_runtime.ledger_gate`。
@@ -88,6 +98,13 @@ MEMORY_FLAG_DEFAULTS: dict[str, bool] = {
     # （记账 0 段首 / 26 段中），**codex 与 Pi 的 face 分布仍是 NO-DATA**。
     # 万一那两个 agent 形态不同，回滚是改一个 env，不是回滚代码。
     "BLADEX_LEDGER_FACE_SPLIT": True,
+
+    # ── MQ-W17 修法①（批 X，2026-09-22）：consolidator 空载退避总开关 ──
+    # 默认**开**：它修的是一个自 v0.1.0 起就在的成本缺陷，不是加特性。
+    # =0 逐字回到 09-22 之前的行为（每轮固定 sleep `--interval`），
+    # 既是回滚通道、也是本批判据④(a) 的阴性对照（关掉 ⇒ 周期回到 ~134s）。
+    # 参数见 `BLADEX_CONSOLIDATOR_IDLE_AFTER` / `_IDLE_MAX_S`。
+    "BLADEX_CONSOLIDATOR_IDLE_BACKOFF": True,
 
     # ── V-P3 硬点 8：拦截播报（ADR-0032 §3.2 #8）──
     # 内循环期间以 reasoning/thinking 流播报 BladeX 在做什么，让用户感知工作进行中。
@@ -218,6 +235,8 @@ MEMORY_FLAG_DEFAULTS: dict[str, bool] = {
     # 冷启期：装配正常跑 + 相关性裁剪（cache 反正要重建，裁剪只赚不赔）。
     # `=0` 回退到"每轮都按冷处理"，即本卡之前的行为。
     "BLADEX_CACHE_TTL_AWARE": True,
+    # ADR-0033 §2.5 一级复核（embedding）开关（批 U · U1.3）。关 + 二级也关 = 只观测不裁。
+    "BLADEX_ASSEMBLY_REVIEW_EMBED": True,
 
     # ── ADR-0028 §5（E7）：C 类新能力 ──
     # 文件内容索引：读写类工具的 result 正文 → 摘要 + 关键词 → 独立检索通道。
@@ -238,6 +257,15 @@ MEMORY_FLAG_DEFAULTS: dict[str, bool] = {
     # supersede 精确键（降为快路径）与冲突检测器（输出本就无人消费）。
     # 关掉 = 回到"novelty 阈值独自决定入不入库"的旧形态。
     "BLADEX_ADJUDICATE_ENABLED": True,
+    # 裁决邻居的**库内视图补齐坐标 + 进 by_id**（2026-09-18 批 S · S2.1，MQ-I20）。
+    #   缺陷：LanceDB facts 表无 subject/attribute 列，库内邻居拼出的 Fact 坐标恒空 ⇒
+    #   同键快路径对库内从不命中；且 `existing` 在增量+LanceDB 形态下恒空 ⇒
+    #   `apply_verdict` 对库内目标查不到 ⇒ UPDATE/NOOP **一律降级 ADD**、台账却记着判决
+    #   （live 快照：09-02 全量重建后 1,830 / 2,031 条判决被降级）。
+    #   开 = 用 meta 的完整 Fact 补齐库内邻居并让判决真正落到它身上（同键新值仍交裁决器，
+    #   不强制取代——见 `adjudication.fast_path_verdict` 的 library_ids 段）。
+    #   置 0 = 旧形态（A/B 仪器 + 回滚通道）。
+    "BLADEX_ADJUDICATE_LIBRARY_HYDRATE": True,
     # 全量重建时按 judgment 台账重放取代关系（MQ-S32 病 B 第五环，2026-08-31）。
     #   为什么默认开：它**恢复的是 ADR-0018 §4.1 明写声称过的行为**
     #   （"台账让 rebuild 重放零 LLM"），不是新功能——而该行为自建成起零消费者，
@@ -249,31 +277,53 @@ MEMORY_FLAG_DEFAULTS: dict[str, bool] = {
 
     # （BLADEX_FLASH_RENDER / BLADEX_FLASH_MATTERS 已于 2026-09-03 S5 删除：ADR-0031
     #  时代 consolidator 侧老渲染器的两个旋钮，默认关、live 未设、渲染器代码已删；
-    #  Flash 树的唯一写者是 flash_daemon，模块门 = BLADEX_MODULE_FLASH。）
+    #  Flash 投影的唯一写者是 flash_daemon，模块门 = BLADEX_MODULE_FLASH。）
 }
 
 # 数值型参数的默认值（同样与 .env.example 对账）。
 # 布尔开关走 MEMORY_FLAG_DEFAULTS，这里放"默认值本身有含义"的阈值。
 MEMORY_NUMERIC_DEFAULTS: dict[str, float] = {
-    # ── Flash 保鲜（2026-08-29 Jason 拍板：Flash 贵在精，目录数量也要维护；
-    #    默认值暂定、按真实流量再调，全部用户可配）──
-    # 每 project 保留最近 N 个 session 目录（清单同窗，滑出整删——文件是投影，
-    # 历史在 Hub/Index 永远可查）。
+    # ── 批 Z · Z2（MQ-A34 ①②，2026-09-24）：窗口感知路由 + 注入面按预算裁剪 ──
+    # 字符 → token 换算（chars/token）。**不是拍的**：Z2.0 读数④ 在 Hub 8,410 轮上按
+    # `估算字符 / 上游回报 prompt_tokens` 算得各主力模型 p50 = 2.9–3.4、p10 = 2.5–2.9
+    # （`docs/benchmarks/surface-budget-z2/20260924-z2.0.md`）。取 **2.5**（p10 一侧）：
+    # 两个消费方——"放不放得下"与"注入面还剩多少预算"——都是低估 token 就出事的方向
+    # （MQ-A34 病例正是输出预算被挤爆），宁可多裁一点。按模型不同用 [[models]].chars_per_token 覆盖。
+    "BLADEX_CHARS_PER_TOKEN": 2.5,
+    # 给输出预留的下限（token）。"放不下" = 估算 prompt + 这个数 > context_window；
+    # 注入面预算 = (context_window − 这个数) × chars/token − agent prompt。只在配了
+    # context_window 的模型上生效。2048：MQ-A34 病例里被挤到 30–211 token 的那一轮
+    # 要写一次账本更新（几百 token）+ 正文回答；Z2.0 读数 completion p90 见同一份读数文件。
+    "BLADEX_CONTEXT_OUTPUT_FLOOR_TOKENS": 2048,
+    # （Flash 保鲜四旋钮 BLADEX_FLASH_{SESSIONS_PER_PROJECT,PROJECTS_PER_AGENT,
+    #  PROJECT_ACTIVE_DAYS,AGENT_RETIRE_DAYS} 已于 2026-09-23 批 F4 随目录树删除：
+    #  它们只管树的目录回收，树没了旋钮也就没有被测对象。ADR-0034 §3.1。）
+    # Z1.2（MQ-W18，2026-09-23）：硬规则热加载的对账周期（秒）。proxy / consolidator /
+    # flash_daemon 各起一个线程，每周期 stat 一次 config/.env + 反向 seek 一次 Hub 的
+    # `hard_rules_set`（后写者赢，见 `bladex_proxy/hard_rules.py`）。0 = 关（只在启动时读一次，
+    # 改规则要重启——即 0.3.0 之前的行为）。5 秒：改完规则到三个进程全部生效的最坏延迟。
+    "BLADEX_HARD_RULES_RELOAD_S": 5,
     # 账本并发标注窗口（秒）：另一写者在窗口内动过激活账本 ⇒ 注入头加一行
     # 提示（2026-08-29 拍板；0=关）。写冲突的硬保护是 rev 乐观锁，这行只管可见。
     "BLADEX_LEDGER_COAUTHOR_WINDOW_S": 1800,
-    "BLADEX_FLASH_SESSIONS_PER_PROJECT": 10,
-    # 每 agent 保留的 project 目录上限（按最近活跃排序）。
-    "BLADEX_FLASH_PROJECTS_PER_AGENT": 10,
-    # project 活跃窗口（天）：窗口外的项目目录回收（PROJECTS.md 清单同窗）。
-    "BLADEX_FLASH_PROJECT_ACTIVE_DAYS": 30,
-    # agent 目录回收（天）：超期无流量删目录；AGENTS.md 名册行保留。
-    "BLADEX_FLASH_AGENT_RETIRE_DAYS": 90,
     # MQ-L50（2026-09-07）：flash daemon 启动自检前等 proxy `/health` 的上限（秒）。
     # cli 的起进程顺序是 …→ flash → proxy，于是 `startup_check()` 的直编补采 POST
     # 5/5 重启撞 `Connection refused`，靠重发通道 30s 后才成。0 = 只探一次不等；
     # 超时**不阻塞**（Flash 物化不依赖 proxy，只有直编采纳依赖，而那一路有重发兜底）。
     "BLADEX_FLASH_WAIT_PROXY_S": 20,
+    # MQ-A81/A89（2026-09-29）：空部署首启时，Hub 消费方等 proxy 创建 Memory Hub 的窗口（秒）。
+    # 只等“缺 CURRENT”这一类瞬态；权限/锁/损坏等其他 RocksDB 错误立即失败。0 = 只尝试一次。
+    "BLADEX_HUB_STARTUP_WAIT_S": 20,
+    # Z4（MQ-P33，2026-09-23）：外部工具回流的大面积删除闸。一次扫描（Obsidian vault）/
+    # 一次轮询（Postgres 收件表）里要删的 fact **超过**此数 ⇒ 一条都不删、只告警。
+    # 挪文件夹、换 vault、同步盘冲突都表现为"很多行同时不见了"——宁可不删。
+    # 整页 / 整文件消失不计入本数：那种情况**无论多少都不删**。
+    "BLADEX_BACKFLOW_MAX_DELETES": 5,
+    # Z4b（2026-09-23）：consolidator 退避 sleep 期间探 Postgres 收件表有没有新行的周期（秒）。
+    # 只在 export.toml 里 `inbox = true` 时探（关着零 SQL）；**不许每秒打一次库**——
+    # 1 秒粒度的 sleep 循环按这个周期限频，一次探测 = 一条 `SELECT max(id)`。
+    # Obsidian vault 不受它管（本机 stat，逐秒探）。
+    "BLADEX_BACKFLOW_PG_PROBE_S": 30,
 
     # 重要性遗忘门槛：importance 低于此值的条目**退出召回**（数据不删、as-of 可查，
     # 保 G6 重建等价性）。0 = 不过滤。
@@ -341,10 +391,9 @@ MEMORY_NUMERIC_DEFAULTS: dict[str, float] = {
     "BLADEX_INNER_LOOP_BUDGET_S": 120.0,
     # 内循环最大轮数（LLM 往返次数硬顶，与墙钟双保险——预算烧不完也不许无限转）。
     "BLADEX_INNER_LOOP_MAX_ROUNDS": 6.0,
-    # ── V-L2/L4（ADR-0032 §4.3/§4.4）──
-    # 切换防抖：同一 session 内距上次落定切换不足 N **用户轮**（role=user 消息数，
-    # E0.2/MQ-L48：工具往返不计）的再切换拒绝（账本抖动 = 注入面抖动）。默认值待 E2 读数标定。
-    "BLADEX_LEDGER_SWITCH_DEBOUNCE": 3.0,
+    # ── V-L4（ADR-0032 §4.4）──
+    # （V-L2 切换防抖 `BLADEX_LEDGER_SWITCH_DEBOUNCE` 已于批 Y · Y1c 删除，MQ-L91：
+    # 改为举证，见 ledger_runtime.verify_switch_evidence。）
     # 陈旧兜底：激活账本落后 ≥N **用户轮**（同口径）即注入陈旧标记（0=关）。默认值待 E2 读数标定。
     "BLADEX_LEDGER_STALE_TURNS": 20.0,
 
@@ -526,6 +575,47 @@ MEMORY_NUMERIC_DEFAULTS: dict[str, float] = {
     # 上游限流时调小；显式 1 保留串行回滚通道（`--concurrency 1`）。
     # 彻底解法（批内合并调用、降低每轮 8–9 次的调用数）另立卡，本值只是止血。
     "BLADEX_DISTILL_CONCURRENCY": 4.0,
+    # MQ-I30（2026-09-29）：长耗时 admin 写命令的客户端等待上限（秒）。
+    # `memory tombstone-project` 非 dry-run 可在服务端跑几分钟；此前固定 15s，
+    # 客户端超时就误报 "proxy unreachable"，而服务端其实还在执行。900s 覆盖
+    # 多 project / 万级轮次扫描 + 墓碑写入；超时后 CLI 会给 dry-run 核对命令。
+    "BLADEX_ADMIN_LONG_TIMEOUT_S": 900,
+
+    # ── MQ-W17 修法①（批 X，2026-09-22）：consolidator 空载退避 ──
+    # 背景：没有任何新 turn 的一轮，consolidator 仍然跑满全套例行作业。
+    # 20,123 key 量级实测每轮空载 ~74s CPU，`--interval 60` ⇒ 周期 134s、
+    # 占空比 54.1%、≈13h CPU/天，全部产出是一行 `candidates=0`。
+    #
+    # 🔴 成因分布（2026-09-23 实测订正，见 MQ-W19）：**库卫生作业 83%**
+    # （`maintain_projects` 那一段 60s）· 全库 `scan_meta` **只占 8%**（5.6s）·
+    # 其余 9%。早先把成因整个归给"全量扫描"是错的。
+    #
+    # 🔴 退避**不修根因**，它只减少空载时跑这套作业的次数；有流量那一轮的成本
+    # 一点没降。修法②③（按 session 游标 / 二级时间索引）只对那 8% 有效
+    # ⇒ 排 0.4.0 前须按 MQ-W19 重估收益。
+    #
+    # 缺陷自 v0.1.0 起一直存在（扫描点三个 tag 源码逐字相同；`maintain_projects`
+    # 的空闲路径调用也在 v0.1.0/v0.2.0/HEAD 都在），随库增长而放大——两段热循环
+    # 都是"全部 Matter × 每条 fact 边"，形状线性（**代码结构 + 两个规模点判定：
+    # 空库 7ms / 20,123 轮 72s；未做多点标定**）。不是某一版引入的回归。
+    #
+    # 连续几轮 `candidates == 0` 之后开始退避（间隔 ×2 封顶）。
+    # 取 3 的理由：一轮 ~134s ⇒ 三轮 ≈ 6.7 分钟真空载才开始省，短暂静默不受影响。
+    "BLADEX_CONSOLIDATOR_IDLE_AFTER": 3.0,
+    # 退避上限（秒）。🔴 **它不是消费延迟的上界**——退避期间 Memory Hub 的
+    # WAL 水位动了会在 ≤1s 内打断 sleep 并立刻回落基准（`_HubWatermark`），所以上限
+    # 只决定"一点流量都没有时多久空转一次"。
+    #
+    # 取 1800 是**从判据①的目标反推的，不是拍的**：
+    #   空载占空比 = busy / (busy + cap)，实测 busy ≈ 75s（同机隔离跑，20,123 key
+    #   快照，周期 135s − sleep 60s）⇒ 要压到 < 5% 需 cap ≥ 19 × 75 ≈ 1425s。
+    #   批 X 提示词建议的 600 只能到 75/675 = **11.1%**，够不着目标。
+    # ⇒ 1800（30 min）给 4.0%，且留了 busy 涨到 ~94s 仍达标的余量
+    #   （busy 随库线性增长，这个余量会被吃掉——那时该做的是修法②③，不是再调大它）。
+    #
+    # 空闲轮的库卫生作业（ANN 维护 / lifecycle 6h / FTS 回填 / KPI）各自带节流，
+    # 最慢 6h，30 分钟的空转节奏对它们绰绰有余。
+    "BLADEX_CONSOLIDATOR_IDLE_MAX_S": 1800.0,
     # V-C1 / MQ-S47：每个 session_prefix 保留多少条前缀候选，供
     # `MemoryHub.check_prefix_changed` 遍历匹配。1 = 退回旧的单槽行为（回滚通道）。
     #
@@ -545,6 +635,30 @@ MEMORY_NUMERIC_DEFAULTS: dict[str, float] = {
     # 🔴 **不要**改成"msg_count 暴跌就不覆盖"那种判据：真压缩的信号形状与小请求
     # 一模一样（都是消息数骤降），那样只是把假阳性换成假阴性，而假阴性是静默的。
     "BLADEX_PREFIX_SLOTS": 4.0,
+    # （装配 L1 的三个数值旋钮 `BLADEX_ASSEMBLY_EVIDENCE_MIN_CHARS / _EVIDENCE_EXCERPT_CHARS /
+    #  _KEEP_RECENT_TOOL_RESULTS`（MQ-CA9 批 Q · Q5 收编）已于 2026-09-23 批 U · U1.4 随 L1 按位置降解
+    #  删除（ADR-0033 §2.8）；更早删掉的：`KEEP_RECENT_CLOSED` 幽灵旋钮、L2 的 MSG_THRESHOLD /
+    #  BUDGET_CHARS / PRESERVE_UNITS / SUMMARY_MAX_CHARS、B 层的 BLADEX_RECONSTRUCT_B*。）
+    # ── ADR-0033 §2.3 触发门（批 U · U1.2，2026-09-23）：轮次数 > N ∧ 上游 cache 已冷 ──
+    # 🔴 **待 U2 标定**。口径 = §2.2 轮次（`task_unit.turn_starts`；旧 `MSG_THRESHOLD=30` 按消息数，作废）。
+    # 取 10 的理由（保守 = 少触发）：Hub 存量 20,157 请求按新口径回放，每请求轮次数
+    # claude-code / codex p99 = 3（agent 自压缩把历史收短）、hermes:default p75 = 18、
+    # dsh p90 = 18 ⇒ 10 让编程 agent 几乎不触发（>10 的请求 CC 0.0% / codex 0.1%），
+    # 只在真正的长多轮会话上动——轮次少时可裁的闭合单元本就少，收益小于误裁风险。
+    "BLADEX_ASSEMBLY_MIN_UNITS": 10.0,
+    # ── ADR-0033 §2.5 / §2.9 两级复核（批 U · U1.3）—— 🔴 HI / LO **不标定**（U2 的事）──
+    # e5 余弦的经验区间：无关 ≈0.70–0.75、相关 ≈0.80+。LO 取偏低（少裁）、HI 取偏低（多留），
+    # 灰区在"开模型"时交二级、"不开模型"时一律保留 ⇒ 默认形态下只有明显无关的才会被裁。
+    "BLADEX_ASSEMBLY_SCORE_HI": 0.82,
+    "BLADEX_ASSEMBLY_SCORE_LO": 0.72,
+    # 冷轮复核总预算（ms）：embed 子预算 = 1/10、模型子预算 = 4/5（§2.9 的 500 / 4000 : 5000）。
+    # 超时 ⇒ 灰区保留 + `assembly_review_timeout`。热轮不进复核路径，200 ms 热路径预算不动。
+    "BLADEX_ASSEMBLY_COLD_BUDGET_MS": 5000.0,
+    # 批 Q3C（刚性原则 12）：`bladex start` 清理 logs/ 时每类（proxy / consolidator / sync …）
+    # 保留最近几个**未被 docs/ 引用的**日志（MQ-V21：被引用的永不清理、不占名额）。
+    # 0 = 关闭清理。20 是审查时的原值（当时实测已积到 157 个），此前就地写在
+    # `cli/lifecycle.py` 的 `os.environ.get(..., "20")` 里、不受 `.env.example` 对账约束。
+    "BLADEX_LOG_KEEP": 20.0,
 }
 
 # 字符串型参数（同样集中默认值；与 `.env.example` 由 test_flag_defaults 对账）。
@@ -559,7 +673,18 @@ MEMORY_TEXT_DEFAULTS: dict[str, str] = {
     # "精确优先于省注入"有意付。正解 = per-agent 阈值（MQ-CA4，0.3.0）。
     # `*` = 对所有 agent 开（回到 09-03 之前的形态）；空 = 全关。
     # 匹配规则：完整 agent_id 或其 base（`hermes:default` 命中清单里的 `hermes`）。
-    "BLADEX_ASSEMBLY_AGENTS": "claude-code",
+    #
+    # 🔴 **2026-09-23 批 U · U0（MQ-CA19）：公开默认值改为空清单 = 只观测不裁**。
+    # MQ-CA10（09-09）实证 L1「每轮常开、按位置裁」在防一个不存在的问题（上游窗口 1M，
+    # CC 未裁前只占 10–15%），代价是重读循环让轮次翻倍——但当时只在本机 `config/.env`
+    # 写了 `""`，**默认值没动** ⇒ v0.2.0 发出去的公开默认仍是 `claude-code`，
+    # 公开用户的 CC 历史仍在被 L1 降解（原则 12 同族：处置停在了自己的机器上）。
+    # 空清单仍走 `skipped=agent_not_enabled` 分支、`assembly_done` 照打（CA10 保下的仪器）。
+    # ADR-0033 标定（批 U2）后按 §2.8 翻到 `all`（批 U3），不在本批。
+    "BLADEX_ASSEMBLY_AGENTS": "",
+    # ADR-0033 §2.5 二级复核（轻量模型，经 Router 网关）：空 = 关；非空 = 模型名。
+    # 默认关：判定质量无 A/B 对照前不开（ADR §6 R1b），U2 标定时再定。
+    "BLADEX_ASSEMBLY_REVIEW_MODEL": "",
 }
 
 #: 注入条目数上限（原 `bladex_core/prefetch.py` 的 `MAX_PREFETCH_K`，2026-09-03 S1 随该

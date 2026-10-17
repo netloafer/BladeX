@@ -179,6 +179,11 @@ class TestTransportResolution:
                             lambda: True)
         monkeypatch.setattr("bladex_proxy.embed_transport._in_container",
                             lambda: False)
+        # 地址钉成短路径：否则判定随"仓库检出在哪"而变——快照 / 深目录下默认路径超 sun_path
+        # ⇒ 按设计退 tcp，本例就红（批 GS2：主仓与快照 passed 不等的唯一一处）。
+        # 路径超长那条分支由 test_long_uds_path_falls_back_to_tcp 专门守。
+        monkeypatch.setattr("bladex_proxy.embed_transport.default_uds_path",
+                            lambda: "/tmp/bx/run/embed.sock")
         d = resolve(env={})
         assert d.transport == TRANSPORT_UDS and d.reason == "auto:posix_host"
 

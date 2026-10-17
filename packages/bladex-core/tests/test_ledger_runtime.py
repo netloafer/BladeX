@@ -1,4 +1,4 @@
-"""V-L2–L5 验收剧本：切换防抖 / 更新通道端到端（含 Goal 双门）/ 陈旧标记 / Matter 锚点。"""
+"""V-L2–L5 验收剧本：切换（Y1c 起：举证、无防抖）/ 更新通道端到端（含 Goal 双门）/ 陈旧标记 / Matter 锚点。"""
 
 from __future__ import annotations
 
@@ -19,87 +19,73 @@ def _ledger(**kw):
     return new_ledger(ledger_id="ldg-t", title="测试任务", **kw)
 
 
-# ── L2 · 防抖 ───────────────────────────────────────────────────────────────
+# ── L2 · 激活与切换（批 Y · Y1c：轮数防抖已删，MQ-L91）──────────────────────
 
 class TestActivation:
-    def test_first_bind_not_debounced(self):
-        t = ActivationTable(debounce_turns=3)
+    def test_first_bind(self):
+        t = ActivationTable()
         v = t.request_switch("s1", "ldg-a", agent_id="hermes", turn_index=1)
         assert v.allowed and t.active("s1") == "ldg-a"
         assert v.event_payload["to_ledger_id"] == "ldg-a"
 
-    def test_rapid_reswitch_refused(self):
-        t = ActivationTable(debounce_turns=3)
+    def test_rapid_reswitch_lands(self):
+        """Y1c 判据 3 的纯函数面：同 session 隔 1 轮、同一轮内再切，全部落定（原防抖在这里拒）。"""
+        t = ActivationTable()
         t.request_switch("s1", "ldg-a", agent_id="h", turn_index=1, session_id="sess")
-        v = t.request_switch("s1", "ldg-b", agent_id="h", turn_index=2, session_id="sess")
-        assert not v.allowed and v.reason == "debounce"
-        assert t.active("s1") == "ldg-a"     # 抖动不生效
+        for turn, lid in ((2, "ldg-b"), (2, "ldg-a"), (2, "ldg-b")):
+            v = t.request_switch("s1", lid, agent_id="h", turn_index=turn, session_id="sess")
+            assert v.allowed and v.reason == "" and t.active("s1") == lid
 
-    def test_newly_created_exempt_from_debounce(self):
-        """🔴 2026-08-25 live 回归：CC 4 秒内建两本（第二本是自我纠正），
-        防抖若拦住新建的切换 ⇒ 会话绑在差的那本、好的成孤儿。"""
-        t = ActivationTable(debounce_turns=3)
-        t.request_switch("s1", "ldg-a", agent_id="cc", turn_index=1)
-        v = t.request_switch("s1", "ldg-b", agent_id="cc", turn_index=1,
-                             newly_created=True)
-        assert v.allowed and t.active("s1") == "ldg-b"
+    def test_only_refusal_is_noop(self):
+        """反向变异（判据 6）：任何轮数/豁免判据加回来 ⇒ 这张网格里必有一格被拒。"""
+        for sess_a, sess_b in (("s", "s"), ("s", "t"), ("", "s"), ("s", "")):
+            for ta, tb in ((5, 5), (5, 6), (5, 7), (18, 2), (0, 0)):
+                t = ActivationTable()
+                t.request_switch("sc", "ldg-a", agent_id="pi", turn_index=ta, session_id=sess_a)
+                v = t.request_switch("sc", "ldg-b", agent_id="pi", turn_index=tb, session_id=sess_b)
+                assert v.allowed, (sess_a, sess_b, ta, tb, v.reason)
 
-    def test_existing_ledger_still_debounced(self):
-        """豁免只给"新建"——在已有账本间横跳仍要防抖（这才是抖动本体）。"""
-        t = ActivationTable(debounce_turns=3)
-        t.request_switch("s1", "ldg-a", agent_id="cc", turn_index=1, session_id="sess")
-        v = t.request_switch("s1", "ldg-b", agent_id="cc", turn_index=2, session_id="sess",
-                             newly_created=False)
-        assert not v.allowed and v.reason == "debounce"
+    def test_no_debounce_surface_left(self):
+        """删干净（判据 11 的代码面）：构造参数、豁免参数、基点读数都不存在了。"""
+        import inspect
 
-    def test_user_requested_exempt_from_debounce(self):
-        """用户显式指定的切换永远算数（与 Goal 只有用户能改同一条原则）。"""
-        t = ActivationTable(debounce_turns=3)
-        t.request_switch("s1", "ldg-a", agent_id="cc", turn_index=1)
-        v = t.request_switch("s1", "ldg-b", agent_id="cc", turn_index=2,
-                             user_requested=True)
-        assert v.allowed and t.active("s1") == "ldg-b"
+        import bladex_core.ledger as ledger_mod
+        sig = inspect.signature(ActivationTable.request_switch)
+        assert "newly_created" not in sig.parameters and "user_requested" not in sig.parameters
+        assert "switch_turns" not in inspect.signature(ActivationTable.restore).parameters
+        assert "debounce_turns" not in inspect.signature(ActivationTable.__init__).parameters
+        for gone in ("last_switch_turn", "last_switch_turn_session", "debounce_turns"):
+            assert not hasattr(ActivationTable, gone), gone
+        assert not hasattr(ledger_mod, "binding_switch_turns")
 
-    def test_switch_after_debounce_window(self):
-        t = ActivationTable(debounce_turns=3)
-        t.request_switch("s1", "ldg-a", agent_id="h", turn_index=1)
-        v = t.request_switch("s1", "ldg-b", agent_id="h", turn_index=5)
-        assert v.allowed and v.event_payload["from_ledger_id"] == "ldg-a"
+    def test_observation_fields_in_turn_and_back_to_prev(self):
+        """「一轮里 A→B→A」放行但看得见：本轮第几次 / 距上次几轮 / 是否切回上一本。"""
+        t = ActivationTable()
+        v = t.request_switch("s1", "ldg-a", agent_id="h", turn_index=3, session_id="sess")
+        assert (v.switch_in_turn, v.delta_turns, v.back_to_prev) == (1, None, False)
+        v = t.request_switch("s1", "ldg-b", agent_id="h", turn_index=3, session_id="sess")
+        assert (v.switch_in_turn, v.delta_turns, v.back_to_prev) == (2, 0, False)
+        v = t.request_switch("s1", "ldg-a", agent_id="h", turn_index=3, session_id="sess")
+        assert (v.switch_in_turn, v.delta_turns, v.back_to_prev) == (3, 0, True)
+        v = t.request_switch("s1", "ldg-c", agent_id="h", turn_index=5, session_id="sess")
+        assert (v.switch_in_turn, v.delta_turns, v.back_to_prev) == (1, 2, False)
+        # 跨 session：不相减（不同尺子），轮内计数重开
+        v = t.request_switch("s1", "ldg-a", agent_id="h", turn_index=1, session_id="other")
+        assert (v.switch_in_turn, v.delta_turns) == (1, None)
 
-    def test_lower_turn_index_is_a_new_session_not_a_bounce(self):
-        """🔴 MQ-L44（2026-09-05 live）：`turn_index` 会话内单调、新会话归零，
-        而 `last_switch_turn` 按 `(agent, project)` 跨会话持久 —— 两把尺子相减无意义。
+    def test_observation_trace_not_restored_from_hub(self):
+        """判据 9：重启（restore）后没有任何轮位基点——首次切换的 Δ轮次为空，不做跨口径相减。"""
+        t = ActivationTable()
+        t.restore({"s1": "ldg-a"}, sessions={"s1": "sess"})
+        assert t.active("s1") == "ldg-a" and t.last_session("s1") == "sess"
+        v = t.request_switch("s1", "ldg-b", agent_id="pi", turn_index=11, session_id="sess")
+        assert v.allowed and v.delta_turns is None and v.switch_in_turn == 1
 
-        修前：`2 - 18 = -16 < 3` ⇒ 拦。live 代价（`proxy-20260904-210657.log` 13:06:09）：
-        Pi 新会话读完目标账本、**正确地**调了 switch 被拒，此后新会话在攒到约
-        `(last+3)×2` 条消息前完全不能切账本。
-
-        修前的代码注释还把这件事论证成"方向安全"（"差值为负 ⇒ 判定更宽松"）——
-        判据是"小于就拦"，负值必然被拦，那段推理写反了（刚性原则 12 升级形态）。
-        """
-        t = ActivationTable(debounce_turns=3)
-        t.request_switch("s1", "ldg-a", agent_id="pi", turn_index=18)
-        v = t.request_switch("s1", "ldg-b", agent_id="pi", turn_index=2)
-        assert v.allowed, "turn_index 低于 last_switch_turn = 跨会话，不是抖动"
-        assert t.active("s1") == "ldg-b"
-
-    def test_same_session_bounce_still_refused_after_l44(self):
-        """判别力对照：L44 只放行**负差值**（跨会话），同会话内的真抖动照拦。
-        少了这条，把 `turn_index >= last` 写成恒真也能让上一条绿。"""
-        t = ActivationTable(debounce_turns=3)
-        t.request_switch("s1", "ldg-a", agent_id="pi", turn_index=18, session_id="sess")
-        v = t.request_switch("s1", "ldg-b", agent_id="pi", turn_index=19, session_id="sess")
-        assert not v.allowed and v.reason == "debounce"
-        assert t.active("s1") == "ldg-a"
-
-    def test_equal_turn_index_still_debounced(self):
-        """边界：差值 0（同一轮内连切两本）仍是抖动本体，不许被 `>=` 放过。"""
-        t = ActivationTable(debounce_turns=3)
-        t.request_switch("s1", "ldg-a", agent_id="pi", turn_index=7, session_id="sess")
-        v = t.request_switch("s1", "ldg-b", agent_id="pi", turn_index=7, session_id="sess")
-        assert not v.allowed and v.reason == "debounce"
-
-    # ── E0.2（MQ-L44 根治 + MQ-L48）：参照系 = (session_id, 用户轮) ─────────
+    def test_payload_still_carries_turn_index(self):
+        """Hub 原始数据不因防抖删除而少一格（刚性原则 13 无损）。"""
+        t = ActivationTable()
+        v = t.request_switch("s1", "ldg-a", agent_id="cc", turn_index=8, session_id="sess")
+        assert v.event_payload["turn_index"] == 8 and v.event_payload["session_id"] == "sess"
 
     def test_user_turn_index_counts_user_messages_only(self):
         msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"},
@@ -117,70 +103,8 @@ class TestActivation:
             def __init__(self, role): self.role = role
         assert user_turn_index([_M("user"), _M("assistant"), _M("user")]) == 2
 
-    def test_same_session_one_user_turn_apart_refused_three_allowed(self):
-        t = ActivationTable(debounce_turns=3)
-        t.request_switch("s1", "ldg-a", agent_id="cc", turn_index=5, session_id="sess")
-        v = t.request_switch("s1", "ldg-b", agent_id="cc", turn_index=6, session_id="sess")
-        assert not v.allowed and v.reason == "debounce"
-        v = t.request_switch("s1", "ldg-b", agent_id="cc", turn_index=8, session_id="sess")
-        assert v.allowed and t.active("s1") == "ldg-b"
-        assert v.event_payload["turn_index"] == 8
-
-    def test_cross_session_any_delta_allowed(self):
-        """不同 session 的两个 user_turn 不是同一把尺子量的：差为正/零/负都不判。"""
-        for other in (6, 5, 2, 40):
-            t = ActivationTable(debounce_turns=3)
-            t.request_switch("s1", "ldg-a", agent_id="pi", turn_index=5, session_id="A")
-            v = t.request_switch("s1", "ldg-b", agent_id="pi", turn_index=other, session_id="B")
-            assert v.allowed, f"跨 session Δ={other - 5} 被判成抖动"
-
-    def test_missing_session_never_debounces(self):
-        """任一方缺 session ⇒ 没有参照系可比 ⇒ 不判（宽松方向只漏不误）。"""
-        t = ActivationTable(debounce_turns=3)
-        t.request_switch("s1", "ldg-a", agent_id="pi", turn_index=5, session_id="A")
-        assert t.request_switch("s1", "ldg-b", agent_id="pi", turn_index=6).allowed
-        t2 = ActivationTable(debounce_turns=3)
-        t2.request_switch("s1", "ldg-a", agent_id="pi", turn_index=5)
-        assert t2.request_switch("s1", "ldg-b", agent_id="pi", turn_index=6, session_id="A").allowed
-
-    def test_l44_negative_delta_implied_by_same_session_rule(self):
-        """L44 最小修（负差不判）被新判据蕴含：同 session 压缩归零 ⇒ Δ<0 ⇒ 不判。"""
-        t = ActivationTable(debounce_turns=3)
-        t.request_switch("s1", "ldg-a", agent_id="pi", turn_index=18, session_id="sess")
-        assert t.request_switch("s1", "ldg-b", agent_id="pi", turn_index=2, session_id="sess").allowed
-
-    def test_restore_switch_turns_reinstates_debounce_baseline(self):
-        """重启恢复 (session, turn)：同 session 隔 1 轮被拒；无字段 ⇒ 放行。"""
-        t = ActivationTable(debounce_turns=3)
-        t.restore({"s1": "ldg-a"}, switch_turns={"s1": ("sess", 10)})
-        assert t.last_switch_turn("s1") == 10 and t.last_switch_turn_session("s1") == "sess"
-        v = t.request_switch("s1", "ldg-b", agent_id="pi", turn_index=11, session_id="sess")
-        assert not v.allowed and v.reason == "debounce"
-        assert t.request_switch("s1", "ldg-b", agent_id="pi", turn_index=11, session_id="new").allowed
-        t2 = ActivationTable(debounce_turns=3)
-        t2.restore({"s1": "ldg-a"})                       # 历史事件无 turn_index
-        assert t2.last_switch_turn("s1") is None
-        assert t2.request_switch("s1", "ldg-b", agent_id="pi", turn_index=1, session_id="sess").allowed
-
-    def test_binding_switch_turns_projection(self):
-        from bladex_core.ledger import binding_switch_turns
-        from bladex_core.ledger_runtime import activation_scope
-        sc = activation_scope("pi", "")
-        events = [
-            {"type": "ledger_switch", "payload": {"agent_id": "pi", "session_id": "old",
-                                                 "to_ledger_id": "ldg-a"}},            # 历史：无字段
-        ]
-        assert binding_switch_turns(events) == {}
-        events.append({"type": "ledger_switch", "payload": {
-            "agent_id": "pi", "session_id": "sess", "to_ledger_id": "ldg-b", "turn_index": 7}})
-        assert binding_switch_turns(events) == {sc: ("sess", 7)}
-        # last-wins；切到空（墓碑改写）清基点
-        events.append({"type": "ledger_switch", "payload": {
-            "agent_id": "pi", "session_id": "sess", "to_ledger_id": "", "turn_index": 9}})
-        assert binding_switch_turns(events) == {}
-
     def test_same_ledger_is_noop_no_event(self):
-        t = ActivationTable(debounce_turns=3)
+        t = ActivationTable()
         t.request_switch("s1", "ldg-a", agent_id="h", turn_index=1)
         v = t.request_switch("s1", "ldg-a", agent_id="h", turn_index=99)
         assert not v.allowed and v.reason == "noop" and v.event_payload == {}
@@ -191,10 +115,32 @@ class TestActivation:
         assert t.active("s9") == "ldg-z"
 
     def test_sessions_independent(self):
-        t = ActivationTable(debounce_turns=3)
+        t = ActivationTable()
         t.request_switch("s1", "ldg-a", agent_id="h", turn_index=1)
         v = t.request_switch("s2", "ldg-b", agent_id="h", turn_index=1)
         assert v.allowed
+
+
+class TestSwitchEvidence:
+    """`verify_switch_evidence` 纯函数（Y1c 判据 4 的内核）。"""
+
+    def test_none_when_not_given(self):
+        from bladex_core.ledger_runtime import verify_switch_evidence
+        assert verify_switch_evidence("", "任何话") is None
+        assert verify_switch_evidence("   ", "任何话") is None
+
+    def test_verbatim_fragment_ok_and_fabricated_false(self):
+        from bladex_core.ledger_runtime import verify_switch_evidence
+        user = "小黑，排查一下最近Hermes飞书网关的连接情况，看看还有没有超时的问题存在。"
+        assert verify_switch_evidence("排查一下最近Hermes飞书网关", user) is True
+        assert verify_switch_evidence("“Hermes飞书网关的连接情况”", user) is True    # 引号不计
+        assert verify_switch_evidence("hermes飞书网关", user) is True                # 大小写不计
+        assert verify_switch_evidence("用户要求切换到飞书排查账本", user) is False     # 转述 = 编造
+        assert verify_switch_evidence("排", user) is False                           # 太短不成证据
+
+    def test_whitespace_folding(self):
+        from bladex_core.ledger_runtime import verify_switch_evidence
+        assert verify_switch_evidence("go back to\nthe  router  bug", "ok, go back to the router bug now") is True
 
 
 # ── L3 · 更新通道 ───────────────────────────────────────────────────────────

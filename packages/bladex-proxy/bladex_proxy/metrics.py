@@ -235,3 +235,199 @@ def record_degradation(name: str) -> None:
         DEGRADATION.record(name)
     except Exception:  # noqa: BLE001
         pass
+
+
+# ── 积压趋势（MQ-W4，批 Q3B）──────────────────────────────────────────
+#
+# 为什么要趋势而不只是当前值：`bladex status` 的 `-> Index 720 waiting` 是一个点，
+# 回答不了"它在追上还是在落后"。08-22 那次积压 20 小时才被人手敲 status 撞见，
+# 而 Beta gate B10「三 agent 并行跑真实流量，backlog 不得单调上升」要的正是一条
+# 线——**单调**只能在一个窗口的多个样本上判，拿两次手敲的 status 判不出来。
+#
+# 采样放在 proxy 进程里（它同时持有 pipeline / Hub / Index 三个句柄），
+# 后台每 BACKLOG_SAMPLE_INTERVAL_S 一次；判读只看最近 BACKLOG_TREND_WINDOW_S。
+# 样本不足 BACKLOG_MIN_SAMPLES 时**不出趋势**（"没读数"不许显示成"持平"——原则 13 层 4）。
+
+BACKLOG_SAMPLE_INTERVAL_S = 60.0
+BACKLOG_TREND_WINDOW_S = 1800.0
+BACKLOG_MIN_SAMPLES = 3
+# 「单调上升」要的是**持续积压**，不是一两轮正常排队（MQ-W20，批 Q3D）。
+# 旧判据只要求 delta > 0 ∧ 从不下降 ⇒ 一串 0 之后单个样本变 1 就成立：
+# `proxy-20261001-145513.log` 10-07～10-09 五次 `backlog_rising` 全是 current=1|2，
+# 1–9 分钟内自行清零。而「从不下降」又放过了真正的消费跟不上——锯齿上行
+# （进得多、批处理消化一点、又进更多）每两步就回落一次，旧判据永远不报。
+# ⇒ 改看**底线**（后缀最小值 = 此后再没低于过的水位）：锯齿的谷底在抬升 = 底线在涨；
+# 回落到把爬升抹掉（消费方追上了）= 底线归位。底线上的两条下限：
+#   步数 ≥ 3：live 病例 delta ≤ 2 ⇒ 至多 2 步；持续积压在真实流量下每进一轮就多一步。
+#   时长 ≥ 900 s：consolidator 单次 pass 耗时 p99 = 610 s（同期 consolidator 日志 287 次，
+#                 p90 128 s；max 1056 s 为上游超时长尾；`scripts/probe_backlog_trend_replay.py` 复算）——一次 pass 期间积压照涨、pass 结束
+#                 一次清掉，这段爬升是排队不是积压；底线连涨超过 p99 pass 才算消费跟不上。
+#                 （live 病例最长 9 分钟清零，也在其内。）
+BACKLOG_RISE_MIN_STEPS = 3
+BACKLOG_RISE_MIN_SPAN_S = 900.0
+BACKLOG_STAGES = ("hub", "index")
+
+TREND_RISING = "rising"
+TREND_FLAT = "flat"
+TREND_FALLING = "falling"
+_TREND_CODE = {TREND_RISING: 1.0, TREND_FLAT: 0.0, TREND_FALLING: -1.0}
+
+
+class BacklogTrend:
+    """两段积压（→ Hub / → Index）在滚动窗口内的趋势（thread-safe）。
+
+    判读规则（B10 读数方法同此，全文见 `report-batch-Q3D-20261013.md` §7——二轮修订，取代同稿 §4；
+    Q3B 的旧规则见 `report-batch-Q3B-20260929.md` §1，已被本规则取代）：
+      delta      = 窗口内最后一个样本 − 第一个样本
+      trend      = rising / flat / falling，按 delta 的符号
+      floor[i]   = min(样本 i … 最后一个样本)：此后再没低于过的水位（底线）
+      up_steps   = 底线上升的次数
+      rise_span  = 底线最后一次上升的时刻 − 第一次上升之前那个样本的时刻
+      monotonic  = delta > 0 ∧ up_steps ≥ BACKLOG_RISE_MIN_STEPS
+                   ∧ rise_span ≥ BACKLOG_RISE_MIN_SPAN_S（B10 的红线：持续上升）
+    从不下降的序列，底线 = 序列本身。一两轮的正常排队（0…0,1 / 0…0,1,2）是 rising 但不是 monotonic；
+    锯齿上行（谷底逐次抬升）是 monotonic；回落到抹掉爬升（底线归位）不是。
+    """
+
+    def __init__(self, window_s: float = BACKLOG_TREND_WINDOW_S,
+                 min_samples: int = BACKLOG_MIN_SAMPLES,
+                 min_rise_steps: int = BACKLOG_RISE_MIN_STEPS,
+                 min_rise_span_s: float = BACKLOG_RISE_MIN_SPAN_S) -> None:
+        self._lock = threading.Lock()
+        self.window_s = window_s
+        self.min_samples = min_samples
+        self.min_rise_steps = min_rise_steps
+        self.min_rise_span_s = min_rise_span_s
+        # 样本上限按"窗口 / 最小合理间隔"估，多留一倍余量；满了丢最旧的
+        self._samples: deque[tuple[float, dict[str, int | None]]] = deque(maxlen=4096)
+
+    def record(self, values: dict[str, int | None], *, now: float | None = None) -> None:
+        ts = time.time() if now is None else now
+        with self._lock:
+            self._samples.append((ts, dict(values)))
+
+    def stage(self, name: str, *, now: float | None = None) -> dict | None:
+        """一段的趋势读数；样本不足返回 None（不是"持平"）。"""
+        cutoff = (time.time() if now is None else now) - self.window_s
+        with self._lock:
+            points = [(ts, v[name]) for ts, v in self._samples
+                      if ts >= cutoff and isinstance(v.get(name), int)]
+        if len(points) < self.min_samples:
+            return None
+        first, last = points[0][1], points[-1][1]
+        delta = last - first
+        trend = TREND_RISING if delta > 0 else TREND_FALLING if delta < 0 else TREND_FLAT
+        floor: list[tuple[float, int]] = []
+        low = last
+        for ts, v in reversed(points):
+            low = min(low, v)
+            floor.append((ts, low))
+        floor.reverse()
+        ups = [(ta, tb) for (ta, a), (tb, b) in zip(floor, floor[1:], strict=False) if b > a]
+        rise_span = ups[-1][1] - ups[0][0] if ups else 0.0
+        return {
+            "current": last,
+            "delta": delta,
+            "trend": trend,
+            "monotonic_rise": (delta > 0 and len(ups) >= self.min_rise_steps
+                               and rise_span >= self.min_rise_span_s),
+            "up_steps": len(ups),
+            "rise_span_s": round(rise_span, 1),
+            "samples": len(points),
+            "span_s": round(points[-1][0] - points[0][0], 1),
+        }
+
+    def snapshot(self, *, now: float | None = None) -> dict[str, dict | None]:
+        return {name: self.stage(name, now=now) for name in BACKLOG_STAGES}
+
+    def export_gauges(self, m: Metrics, *, now: float | None = None) -> None:
+        """写进 /metrics。没读数的段不写（抓取方看到的是"无此序列"，不是 0）。"""
+        for name, st in self.snapshot(now=now).items():
+            if st is None:
+                continue
+            labels = {"stage": name}
+            m.set_gauge("bladex_backlog_turns", float(st["current"]), labels)
+            m.set_gauge("bladex_backlog_delta_turns", float(st["delta"]), labels)
+            m.set_gauge("bladex_backlog_trend", _TREND_CODE[st["trend"]], labels)
+            m.set_gauge("bladex_backlog_monotonic_rise", 1.0 if st["monotonic_rise"] else 0.0, labels)
+            m.set_gauge("bladex_backlog_window_span_seconds", float(st["span_s"]), labels)
+            m.set_gauge("bladex_backlog_samples", float(st["samples"]), labels)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._samples.clear()
+
+
+#: 进程级单例（proxy 的采样循环写、/metrics 读）
+BACKLOG_TREND = BacklogTrend()
+
+
+async def read_backlog(state) -> dict[str, int | None]:  # noqa: ANN001 —— app.state
+    """读两段积压的当前值；与 `bladex status` 的 Queue 行同一口径。
+
+    → Hub = Redis stream 里还会被消费的条目（XLEN − 孤儿）；
+    → Index = Hub 可见轮次 − Index 已消费轮次。读不到的段给 None。
+    """
+    import asyncio
+
+    out: dict[str, int | None] = {"hub": None, "index": None}
+    pipeline = getattr(state, "pipeline", None)
+    if pipeline is not None:
+        try:
+            detail = await pipeline.inspect()
+            out["hub"] = max(0, int(detail["total"]) - int(detail.get("orphan") or 0))
+        except Exception:  # noqa: BLE001 —— 读不到就是 None，下一次再采
+            pass
+    hub, index = getattr(state, "hub", None), getattr(state, "index", None)
+    if hub is not None and index is not None:
+        try:
+            turns = await asyncio.to_thread(hub.count)
+            consumed = await asyncio.to_thread(index.consumed_count)
+            out["index"] = max(0, turns - consumed)
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+async def backlog_sampler_loop(state, stop, trend: BacklogTrend = BACKLOG_TREND,  # noqa: ANN001
+                               interval_s: float = BACKLOG_SAMPLE_INTERVAL_S) -> None:
+    """proxy 后台采样循环：采一次 → 写 /metrics → 持续单调上升时打一条可 grep 的 warning。
+
+    `stop` 是 asyncio.Event：停机时置位、再 await 本协程——**不用 cancel**。
+    cancel 打断的是 `await to_thread(...)`，线程里的 `hub.count()` 仍在跑，
+    随后 lifespan 关 Hub ⇒ 在已关闭的 RocksDB 上迭代。等它自己采完这一次再走。
+
+    warning 只在**进入**单调上升时打一次（`backlog_rising`），离开时打 `backlog_rising_cleared`
+    ——这是 MQ-W4 要的"主动信号"：不用有人去敲 status，日志里就有。
+    """
+    import asyncio
+
+    import structlog
+
+    log = structlog.get_logger("bladex_proxy.metrics")
+    rising: dict[str, bool] = {}
+    # 先等一个间隔再采：启动那一刻不碰 Hub/Index（lifespan 里别的初始化、以及只活
+    # 几百毫秒的测试 app 会在这时关库——批 Q3B gate 实测撞上过）。
+    while True:
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval_s)
+            return
+        except TimeoutError:
+            pass
+        try:
+            trend.record(await read_backlog(state))
+            m = getattr(state, "metrics", None)
+            if m is not None:
+                trend.export_gauges(m)
+            for name, st in trend.snapshot().items():
+                now_rising = bool(st and st["monotonic_rise"])
+                if now_rising and not rising.get(name):
+                    log.warning("backlog_rising", stage=name, current=st["current"],
+                                delta=st["delta"], span_s=st["span_s"], samples=st["samples"],
+                                up_steps=st["up_steps"], rise_span_s=st["rise_span_s"])
+                elif rising.get(name) and not now_rising:
+                    log.info("backlog_rising_cleared", stage=name,
+                             current=(st or {}).get("current"))
+                rising[name] = now_rising
+        except Exception as e:  # noqa: BLE001 —— 采样失败不许拖垮 proxy
+            log.warning("backlog_sample_failed", error=str(e))

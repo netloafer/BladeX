@@ -164,6 +164,19 @@ RESERVED_VENDOR_SEGMENTS: frozenset[str] = frozenset({
 #: 要加一项，先拿真实流量标定它与 session 的粒度关系，别按名字像不像来收。
 VENDOR_SESSION_SUFFIXES: frozenset[str] = frozenset({"session-id"})
 
+#: **不带 `x-` 前缀**的会话 header（MQ-A76，批 U · U1.1，2026-09-23）。
+#:
+#: codex 每条请求都发裸 `session-id`（值 = 该会话 UUID，与 `thread-id` / `x-client-request-id`
+#: 同值），而 `x-session-id` 发的是**空串**。`_VENDOR_RE` 只认 `x-{vendor}-{suffix}`，
+#: 于是 codex 的会话身份被整条忽略、退到指纹 / 尾部接续去猜 ⇒ Hub 存量 116 个 codex 会话
+#: 被塞进 69 个桶，最坏一个桶装 13 个会话（批 U-前置 §4-1）。刚性原则 10：agent 已经在发，
+#: 从 BladeX 侧接。
+#:
+#: 🔴 只收 `session-id` 一项，理由同 `VENDOR_SESSION_SUFFIXES`：`thread-id` 与 session 粒度
+#: 未经标定（codex 上两者同值，不代表别家也是）。优先级在 `x-session-id` 与
+#: `x-{vendor}-session-id` **之后**——裸名更通用，平局时让更具体的那个赢。
+BARE_SESSION_HEADERS: tuple[str, ...] = ("session-id",)
+
 #: 基础设施 / 我方自有的 vendor 段 —— 提取到也丢弃。
 #:
 #: ``stainless`` 是 openai-python / anthropic SDK 的代码生成器，会发一组

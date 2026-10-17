@@ -156,6 +156,8 @@ _WHOLE_MESSAGE_MARKERS: tuple[tuple[str, str], ...] = (
     ("hermes_empty_response_retry",
      "you just executed tool calls but returned an empty response"),
     ("truncated_response_continue", "[system: your previous response was truncated"),
+    # MQ-S44（批 Q3A）：hermes 后台进程完成通知，逐字取自 `identity._AUX_USER_PATTERNS`。
+    ("hermes_background_process", "[important: background process"),
 )
 
 # ── MS-2：hermes 会话转录壳 ──

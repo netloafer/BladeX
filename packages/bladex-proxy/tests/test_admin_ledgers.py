@@ -29,7 +29,7 @@ from bladex_core.ledger_runtime import (
 class _StubAgency:
     def __init__(self, pool, bindings):
         self.pool = pool
-        self.activation = ActivationTable(debounce_turns=0)
+        self.activation = ActivationTable()
         self.activation.restore(bindings)
 
 

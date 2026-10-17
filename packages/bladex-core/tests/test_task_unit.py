@@ -194,14 +194,17 @@ def test_unit_indices_tolerates_truncated_messages():
 
 
 def test_anthropic_tool_result_in_user_lowers_confidence():
+    """ADR-0033 §2.2（批 U · U1.1 改判据）：tool_result 残留的 user **不开轮次**，
+    记为当前轮次的证据，该轮次置信度降为 0.5（修前：每条 user 开单元，残留那条自成一单元）。"""
     msgs = [
         {"role": "user", "content": "q"},
         {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "c1", "content": "r"}]},
     ]
     units = build_task_units(msgs)
-    assert units[0].boundary_confidence == 1.0
-    assert units[1].boundary_confidence < 1.0
+    assert len(units) == 1
+    assert units[0].boundary_confidence < 1.0
+    assert units[0].evidence_count == 1 and units[0].msg_end == 1
 
 
 def test_normal_traffic_keeps_full_confidence():
@@ -240,8 +243,23 @@ def _legacy_infer_turn_metadata(messages):
      {"role": "tool", "name": "t", "content": "r"}],
 ])
 def test_derive_turn_metadata_equivalent_to_retired_impl(msgs):
-    """新旧实现在 (logical_turn, roundtrip) 上逐字等价 —— 退役的前提条件。"""
-    assert derive_turn_metadata(build_task_units(msgs)) == _legacy_infer_turn_metadata(msgs)
+    """(logical_turn, roundtrip) 与退役实现的关系（批 U · U1.1 按新口径改判据、不删）。
+
+    没有插话 / 连续 user 的对话：仍逐字等价。有的（`_msgs_tool_loop()+third` 的 third 落在
+    工具循环里、五条连续 user）：logical_turn 按 ADR-0033 §2.2 轮次计，**有意**少于 user 消息数。
+    """
+    from bladex_core.task_unit import turn_starts
+
+    legacy = _legacy_infer_turn_metadata(msgs)
+    got = derive_turn_metadata(build_task_units(msgs))
+    starts = turn_starts(msgs)
+    n_user = sum(1 for m in msgs if m.get("role") == "user")
+    if len(starts) == n_user:
+        assert got == legacy
+    else:
+        assert got[0] == len(starts) < legacy[0]
+        # roundtrip = open 轮次内全部证据（含被并入的插话之前的往返）≥ 末条 user 之后的 tool 数
+        assert got[1] >= legacy[1]
 
 
 # ── 与 assembly._split_units 的一致性（单一切分算法）──

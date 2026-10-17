@@ -291,7 +291,9 @@ def test_startup_state_reports_degraded_with_consequences(monkeypatch, capsys):
     rc = cli._report_startup_state("127.0.0.1", 38080, redis_ok=False,
                                    consolidator_ok=False, timeout_s=1)
     out = capsys.readouterr().out
-    assert rc == 0, "代理确实能转发 —— degraded 不是启动失败"
+    # 批 Q3B：降级有自己的退出码 3（不是 0 —— 脚本要能看见；也不是 1 —— 代理确实能转发，
+    # 不是启动失败，旁挂进程不回收）
+    assert rc == 3, "degraded 返回专用码 3"
     assert "degraded" in out
     # 后果句必须写出来 —— 一句 "degraded" 用户看不出记忆没了
     assert "no memory will be produced" in out       # Redis 缺席的后果
@@ -349,23 +351,24 @@ def test_repo_script_is_thin_shell():
     assert len(src.splitlines()) < 60, "脚本应是薄壳，实现留在包里"
 
 
-def test_consolidator_pid_matches_module_form(monkeypatch):
-    """包内入口的进程名与老脚本名不同，pgrep 兜底必须两种都认。"""
-    import subprocess
+def test_consolidator_pid_does_not_claim_other_home_processes(
+    tmp_path, monkeypatch
+):
+    """MQ-A78：pidfile 缺失时不再全机 `pgrep -f` 认领进程名相同的实例。"""
+    from bladex_proxy.cli import lifecycle
 
-    from bladex_proxy import cli
+    seen: list[list[str]] = []
 
-    monkeypatch.setattr(cli, "_read_pidfile", lambda *_: None)
-    seen: list[str] = []
+    def _fake_run(argv, **_kwargs):
+        seen.append(list(argv))
+        raise AssertionError("pidfile missing must not trigger a process search")
 
-    def _fake_run(argv, **kw):
-        seen.append(argv[-1])
-        out = "4242\n" if argv[-1] == "bladex_proxy.consolidator" else ""
-        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
-
-    monkeypatch.setattr(cli.subprocess, "run", _fake_run)
-    assert cli._consolidator_pid() == 4242
-    assert "bladex_proxy.consolidator" in seen
+    monkeypatch.delenv("BLADEX_HOME", raising=False)
+    monkeypatch.setenv("BLADEX_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(lifecycle.subprocess, "run", _fake_run)
+    assert lifecycle._consolidator_pid() is None
+    assert seen == []
 
 
 # ══════════════════════════════════════════════════════════════════════════

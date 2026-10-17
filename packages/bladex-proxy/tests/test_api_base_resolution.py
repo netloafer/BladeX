@@ -44,7 +44,7 @@ def test_env_var_name_in_api_base_refuses_startup():
     assert "http://" in msg and "https://" in msg
     # 必须给出两种正确写法，而不是"你是不是想…"式的猜测
     assert "api_base_env" in msg
-    assert "二选一" in msg
+    assert "Use one of" in msg  # 批 Q3B · MQ-L63：报错改英文
 
 
 def test_error_explains_field_semantics_difference():
@@ -53,7 +53,7 @@ def test_error_explains_field_semantics_difference():
         _load(_BASE + 'api_base = "SOME_UPSTREAM_BASE"\n')
     msg = str(ei.value)
     assert "api_key_env" in msg
-    assert "不做环境变量解析" in msg
+    assert "does not expand variables" in msg
 
 
 # ── 两种正确写法 ──
@@ -99,7 +99,7 @@ def test_missing_env_var_refuses_startup(monkeypatch):
         _load(_BASE + 'api_base_env = "DEFINITELY_NOT_SET"\n')
     msg = str(ei.value)
     assert "DEFINITELY_NOT_SET" in msg
-    assert "未设置或为空" in msg
+    assert "unset or empty" in msg
     assert "config/.env" in msg
 
 

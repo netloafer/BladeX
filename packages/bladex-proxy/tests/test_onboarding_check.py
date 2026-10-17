@@ -176,18 +176,24 @@ def test_pending_agrees_with_note_onboarding():
     """
     from bladex_proxy.onboarding import pending
 
-    assert pending(agent_id="dsh", auxiliary=False) is True
+    # MQ-A74（2026-09-22）：键含 project ⇒ 两边**必须传同一个 project_id**，
+    # 否则这条守卫会因为键不同而假绿（`_run` 默认 project_id="p-abc"）。
+    assert pending(agent_id="dsh", auxiliary=False, project_id="p-abc") is True
     assert _run(agent_id="dsh") != []
-    assert pending(agent_id="dsh", auxiliary=False) is False, "报过一次后 pending 转假"
-    assert pending(agent_id="codex", auxiliary=True) is False, "aux 轮不体检"
-    assert pending(agent_id="", auxiliary=False) is False
+    assert pending(agent_id="dsh", auxiliary=False, project_id="p-abc") is False, \
+        "报过一次后 pending 转假"
+    assert pending(agent_id="dsh", auxiliary=False, project_id="p-other") is True, \
+        "换 project ⇒ 重新体检一次（MQ-A74）"
+    assert pending(agent_id="codex", auxiliary=True, project_id="p-abc") is False, "aux 轮不体检"
+    assert pending(agent_id="", auxiliary=False, project_id="p-abc") is False
 
 
 def test_call_site_does_not_restate_dedup_key():
     """批 H 复核：`server/orchestration.py` 不许复述 `agent_id not in _seen`。
 
-    G17.22 要把去重键改成 (agent_id, project_id)；键的定义只在 `onboarding._dedup_key`
-    一处，调用方只问 `pending`。外面复制一份判据 = 改了里面、外面那句静默挡住新行为。
+    键已于 MQ-A74（2026-09-22）改成 (agent_id, project_id)；键的定义只在
+    `onboarding._dedup_key` 一处，调用方只问 `pending`。外面复制一份判据 =
+    改了里面、外面那句静默挡住新行为。
     """
     from _source_probe import package_source
 

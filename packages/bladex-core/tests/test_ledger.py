@@ -332,6 +332,17 @@ class TestEventParity:
         assert AdminEventType.LEDGER_SWITCH.value == EVENT_LEDGER_SWITCH
         assert AdminEventType.LEDGER_USER_EDIT.value == EVENT_LEDGER_USER_EDIT
 
+    def test_every_core_ledger_event_has_a_proxy_enum_value(self):
+        """全集对账（批 Z · Z3 补）：上面逐条列只覆盖了当时的四类，`scope_migrate` 与
+        新增的 close / reopen / supersede 靠它兜——闭集从定义取，不按记忆默写。"""
+        try:
+            from bladex_proxy.models import AdminEventType
+        except ImportError:
+            pytest.skip("bladex_proxy not importable in this environment")
+        from bladex_core.ledger import LEDGER_EVENT_TYPES
+        values = {e.value for e in AdminEventType}
+        assert LEDGER_EVENT_TYPES <= values, sorted(LEDGER_EVENT_TYPES - values)
+
 
 # ── 时区纪律（MQ-L46，2026-09-05）：存 UTC / 比数值 / 显本地 ─────────────────
 #

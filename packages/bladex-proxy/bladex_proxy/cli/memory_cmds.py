@@ -7,10 +7,18 @@
 from __future__ import annotations
 
 import json
+import time
 
 import typer
 
-from bladex_proxy.cli import _admin_call, _print_op_result, _run_repo_script  # noqa: E402
+from bladex_proxy.cli import (  # noqa: E402
+    _admin_call,
+    _admin_long_timeout_s,
+    _print_op_result,
+    _require_dry_run_ack,
+    _require_server_contract,
+    _run_repo_script,
+)
 from bladex_proxy.cli.ops_cmds import sync_run  # noqa: E402
 
 storage_app = typer.Typer(help="Storage operations", no_args_is_help=True)
@@ -134,6 +142,133 @@ def memory_forget(
         return 130
     code, data = _admin_call("DELETE", f"/admin/facts/{fact_id}")
     return _print_op_result(code, data)
+
+
+#: MQ-I30：轮询后台 job 的间隔，与连续多少次读不到状态就放弃等待（服务端仍可能在跑）。
+_JOB_POLL_INTERVAL_S = 1.0
+_JOB_POLL_MAX_MISSES = 30
+
+
+def _wait_admin_job(job_id: str, what: str, check_cmd: str) -> dict | None:
+    """轮询 `GET /admin/jobs/{job_id}` 到 done / failed（MQ-I30）。
+
+    返回 done 时的 `result`；失败 / 丢失联系返回 None（已打印原因与核对命令）。
+    **不设总时长上限**：只要服务端还在答、job 还在 running 就一直等——长任务的
+    "客户端说失败、服务端已成"正是本条要消灭的形状。连续 `_JOB_POLL_MAX_MISSES`
+    次读不到状态才放弃，并如实说"服务端可能仍在执行"。
+    """
+    misses = 0
+    last_done = -1
+    while True:
+        code, data = _admin_call("GET", f"/admin/jobs/{job_id}")
+        job = (data or {}).get("job") if code == 200 else None
+        if not isinstance(job, dict):
+            misses += 1
+            if misses >= _JOB_POLL_MAX_MISSES:
+                print(f"Lost contact with the proxy while waiting for job {job_id} ({what}); "
+                      f"the server may still be executing. Check with: {check_cmd}")
+                return None
+            time.sleep(_JOB_POLL_INTERVAL_S)
+            continue
+        misses = 0
+        state = job.get("state")
+        if state == "done":
+            return job.get("result") or {}
+        if state == "failed":
+            print(f"✗ job {job_id} failed after {job.get('done', '?')}/{job.get('total', '?')} "
+                  f"turns: {job.get('error') or '(no error text)'}")
+            print(f"  Tombstones are append-only and this path is idempotent -- "
+                  f"check what is left with: {check_cmd}")
+            return None
+        if job.get("done") != last_done:
+            last_done = job.get("done")
+            print(f"  ... {what}: {last_done}/{job.get('total', '?')} turns")
+        time.sleep(_JOB_POLL_INTERVAL_S)
+
+
+#: 可变注解（`list[str]`）的默认值不能就地写 typer.Argument(...)——ruff B008
+#: 只豁免 str/bool 这类不可变注解。按它给的第二条路：模块级单例。
+_PROJECT_IDS_ARG = typer.Argument(..., help="One or more p-<sha12> project ids")
+
+
+@memory_app.command("tombstone-project")
+def memory_tombstone_project(
+    project_ids: list[str] = _PROJECT_IDS_ARG,
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Preview only: per-project impact, write nothing"),
+    yes: bool = typer.Option(False, "--yes", help="Skip confirmation"),
+) -> int:
+    """Tombstone every turn whose identity.project_id is one of these projects.
+
+    \f
+    批 T0b 路径②（拍板 (3) 的"按 project 作用域整体清"那条线）。此前**全仓没有任何
+    CLI / 端点能做这件事**：`memory forget` 是 fact 级、`ledger tombstone` 是账本窗口级。
+
+    🔴 **空 project（Global）一律拒绝** —— 那是 project 识别恒空那段时期的全部流量
+    （live ≈17,047 轮），拍板 (3) 明写那一半只能按账本清。服务端与计算层各拒一次。
+
+    🔴 **每个 project 单独出读数**，不只给总数：批量操作最容易出的错是"总数看着对、
+    其中一个 project 选错了"。
+
+    **只墓碑 turn**，一条 LEDGER 墓碑都不打；`ledgers` 列只是影响面读数。
+    **幂等**：窗口来自 `scan_meta_snapshot()`（已滤墓碑）⇒ 连跑两次读数不重复计。
+    """
+    _require_server_contract(f"tombstone-project ({len(project_ids)} project(s))")
+    body = {"project_ids": list(project_ids), "dry_run": bool(dry_run)}
+    if not dry_run and not yes and not typer.confirm(
+            f"Tombstone every turn in {len(project_ids)} project(s)? "
+            f"(append-only; no undo) -- run with --dry-run first if you have not"):
+        print("Cancelled.")
+        return 130
+    if dry_run:
+        code, data = _admin_call("POST", "/admin/turns/tombstone-by-project", body=body)
+    else:
+        code, data = _admin_call(
+            "POST", "/admin/turns/tombstone-by-project", body=body,
+            timeout=_admin_long_timeout_s())
+    if code != 200:
+        return _print_op_result(code, data)
+    if not dry_run:
+        # MQ-I30：真跑是后台 job——服务端先回 submitted，结果轮询取回后照旧渲染。
+        job_id = data.get("job_id")
+        if data.get("status") != "submitted" or not job_id:
+            print(f"Unexpected response from the proxy (expected status=submitted with a "
+                  f"job_id): {json.dumps(data, ensure_ascii=False)[:300]}")
+            return 1
+        import shlex
+        check = "bladex memory tombstone-project " + shlex.join(project_ids) + " --dry-run"
+        print(f"Submitted job {job_id}: tombstoning {data.get('total_turns', '?')} turns "
+              f"in the background; waiting for it to finish ...")
+        result = _wait_admin_job(job_id, "tombstone-project", check)
+        if result is None:
+            return 1
+        data = result
+    if dry_run:
+        _require_dry_run_ack(data, f"tombstone turns in {len(project_ids)} project(s)")
+        print(f"DRY RUN -- nothing written. Would tombstone "
+              f"{data.get('total_turns', '?')} turns across "
+              f"{len(data.get('projects') or [])} project(s).")
+    else:
+        print(f"✓ tombstoned {data.get('total_turns', '?')} turns across "
+              f"{len(data.get('projects') or [])} project(s).")
+    for row in data.get("projects") or []:
+        agents = ", ".join(f"{a}:{n}" for a, n in sorted((row.get("agents") or {}).items()))
+        name = "/".join(row.get("project_names") or []) or "(no name)"
+        print(f"  {row.get('project_id', '?'):16s} {name:24s} turns={row.get('turn_count', '?'):>6} "
+              f"ledgers={row.get('ledgers', '?'):>3}  {row.get('first_ts') or '?'} .. {row.get('last_ts') or '?'}")
+        print(f"      agents: {agents or '(none)'}")
+        mem = row.get("memory")
+        if mem:
+            print(f"      tombstones written: {mem.get('turn_tombstones', '?')} "
+                  f"(index cascaded {mem.get('index_cascaded', '?')}, "
+                  f"deferred {mem.get('index_deferred', '?')})")
+    age = data.get("backup_age_days")
+    if age is None:
+        print("  ⚠ backup: NO-DATA -- no data/backup_* found. This operation is irreversible.")
+    else:
+        print(f"  backup: newest data/backup_* is {age} days old.")
+    print("  📌 ledger objects are NOT touched by this path -- clear those separately.")
+    return 0
 
 
 # ── matter ─────────────────────────────────────────────────────────

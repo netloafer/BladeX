@@ -1,14 +1,16 @@
-"""账本运行时 —— 激活/切换防抖/工具更新映射/陈旧兜底/Matter 锚点（批二卡 V-L2–L5）。
+"""账本运行时 —— 激活/切换举证/工具更新映射/陈旧兜底/Matter 锚点（批二卡 V-L2–L5）。
 
 叶子模块：只依赖 `ledger`（V-L1）与 `flags`。零 IO——绑定表与轮计数由调用方持有
 （Hub 投影语义与 `splice.SpliceLedger` 同构），本模块只做纯判定与纯变换。
 
 # 各段职责
 
-- **L2 激活**：每任务一账本、每会话绑一激活账本；切换=管理事件+防抖
-  （`BLADEX_LEDGER_SWITCH_DEBOUNCE` 轮内重复切换拒绝并可 grep——
-  切换抖动比 sticky 路由修掉的"模型乒乓"更伤：账本是注入面，
-  每换一本就换一份稳定上下文）。
+- **L2 激活**：每任务一账本、每会话绑一激活账本；切换=管理事件+**举证**
+  （批 Y · Y1c，MQ-L91，2026-09-24：原「N 轮内重复切换拒绝」的轮数防抖已删——
+  它是 ADR-0031「默认延续、要证明是新的事才切换」的错误翻译，证据从**内容**
+  换成了**轮数计数**，上线一个月没有一例被确认拦对。举证 = 模型摘录本轮用户原话，
+  由 `verify_switch_evidence` 对照剥信封后的用户文本校验；**观测阶段只记不拦**，
+  拦截阶段要有读数才开，见 `task-ledger-switch-debounce-rethink-20260924.md` §5）。
 - **L3 更新通道**：toolface `bladex_ledger_update` 参数 → V-L1 条目原语。
   actor 恒 `model`（工具面只有模型在调）⇒ Goal 写保护自动生效（V-L1 红线 1）。
   带 `ref` 的条目来源标 `tool`（有证据），否则 `model`。
@@ -22,6 +24,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .flags import flag_number
@@ -30,6 +33,7 @@ from .ledger import (
     ENTRY_SOURCE_MODEL,
     ENTRY_SOURCE_TOOL,
     SECTION_GOAL,
+    STATUS_CLOSED,
     Ledger,
     LedgerEntry,
     LedgerError,
@@ -43,22 +47,43 @@ from .ledger import (
 # test_ledger.py / test_ledger_gate.py / probe_cont_head_layer.py 三处调用方当场红）。
 from .ledger import iso_ms as iso_ms
 
-# 数值默认经 flags 单一真相源（BLADEX_LEDGER_SWITCH_DEBOUNCE / BLADEX_LEDGER_STALE_TURNS）。
+# 数值默认经 flags 单一真相源（BLADEX_LEDGER_STALE_TURNS）。
 
 
-# ── L2 · 激活与切换防抖 ─────────────────────────────────────────────────────
+# ── L2 · 激活与切换举证 ─────────────────────────────────────────────────────
 
 
 @dataclass
 class SwitchVerdict:
     allowed: bool
-    reason: str = ""                # debounce | noop
+    #: 唯一的拒绝理由是 `noop`（同本重复激活，幂等）——批 Y1c 起**没有**启发式拒绝。
+    reason: str = ""                # noop
     event_payload: dict = field(default_factory=dict)   # LEDGER_SWITCH 的 payload
     #: 这个 scope 上一次落定切换所属的 session（空=首次）。仅供调用方判"并发争用"
     #: 并告警——**不参与判定**，见 `activation_scope` 里 project 信号未落地那段。
     prev_session: str = ""
     #: 距上次切换的秒数（`-1` = 首次）。争用判据要的是"**并发**"，不是"换了 session"。
     prev_age_s: float = -1.0
+    #: 🔴 **只供观测、不参与判定**（`agency_switch_evidence` 的形态字段，Y1c）：
+    #: 防抖删掉后「一轮里 A→B→A」这类快速切换会放行——不拦，但要看得见。
+    #: 读数来自进程内轨迹 `ActivationTable._switch_trace`，**不从 Hub 恢复**
+    #: （重启后首次切换这几格为空，不做跨口径相减——调度复核第 3 条）。
+    #: `switch_in_turn` = 本 session 本轮第几次落定切换（1 起）；
+    #: `delta_turns` = 距上次落定切换的轮次数（仅同 session，否则 None）；
+    #: `back_to_prev` = 切回上一次切换离开的那本（A→B→A）。
+    switch_in_turn: int = 1
+    delta_turns: int | None = None
+    back_to_prev: bool = False
+
+
+@dataclass(frozen=True)
+class _SwitchTrace:
+    """一个 scope 上最近一次落定切换的**观测轨迹**（Y1c）。只进告警，不进判定。"""
+    session_id: str
+    turn_index: int
+    from_ledger_id: str
+    to_ledger_id: str
+    n_in_turn: int
 
 
 #: 无项目信号时的 project 段（Hermes 这类没有项目概念的 agent 恒落这里）。
@@ -82,8 +107,10 @@ def activation_scope(agent_id: str, project_id: str = "") -> str:
 
     **为什么带 project**：光按 agent 会让同一 agent 的并发会话抢同一本
     （两个 Claude Code 窗口开在不同仓库 ⇒ 互相把对方账本切走）。project 段用
-    ADR-0032 §5 已定的四级模型（User→Agent→**Project**→Session）里那一级，
-    `resolve_project_identity` 判定；没有信号的 agent（Hermes 形态）落 Global，
+    ADR-0032 §5 四级模型（User→Agent→**Project**→Session）里那一级，由
+    `bladex_proxy.project_identity.resolve_project` 判定（生产唯一实现点；原
+    `flash_tree.resolve_project_identity` 从未接进生产，批 F4 随树删除）；
+    没有信号的 agent（Hermes 形态）落 Global，
     此时**等价于 per-agent**——正是拍板要的效果。
 
     ✅ project 信号 2026-08-29 已接通：识别四档（git-remote → git-root → path →
@@ -111,23 +138,28 @@ def split_scope(scope: str) -> tuple[str, str]:
 
 
 def user_turn_index(messages: list | None) -> int:
-    """轮次参照系 = **用户轮**：`role == "user"` 的消息数（MQ-L48 / MQ-L44 根治，批 E E0.2）。
+    """轮次参照系 = **轮次数**，按 ADR-0033 §2.2 规则计（`task_unit.turn_starts`）。
 
     🔴 **单一实现点**——`identity.resolve_identity`（`Identity.turn_index`）与
     `agency.tool_context` 都调这里。修前两处各写 `len(messages)//2`（"一问一答算一轮"），
     那是**请求数**：编程 agent（CC/Codex/Pi）每个工具调用是一次独立请求、消息 +2
-    ⇒ `SWITCH_DEBOUNCE=3` 在工具循环里 ≈ 3 个 bash 调用（防抖等于没有），
+    ⇒ 当时的切换防抖（3 轮，Y1c 已删）在工具循环里 ≈ 3 个 bash 调用，
     `STALE_TURNS=20` ≈ 一次 grep+读+改+测（什么都没做错就被喊"陈旧"）。
     同一用户轮内的工具往返不动这个数；tool 结果消息（`role == "tool"`）不算。
 
+    🔴 **口径切换（批 U · U1.1，2026-09-23；ADR-0033 §2.2「一套体系一个轮次定义」）**：
+    MQ-L48（批 E E0.2，09-06）起按 `role == "user"` 计数；本批起**算法与
+    `build_task_units` 同源**（都调 `turn_starts`）⇒ 工具循环中的用户插话、连续 user
+    不再计轮——陈旧判定随之变宽松，与 L48「同一用户轮内工具往返不计」的本意一致。
+    2026-09-23 之前产生的 `turn_index` 读数（Hub `LEDGER_SWITCH.turn_index` /
+    `Identity.turn_index`）是 **role=user 计数口径**，不回填；跨这个日期的差值不可比。
+    守卫：`test_turn_rule_single_source.py`（改回按 role=user 计数 ⇒ 红）。
+
     接受 dict 或带 `.role` 的对象；None/空 ⇒ 0。
     """
-    n = 0
-    for m in messages or ():
-        role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
-        if role == "user":
-            n += 1
-    return n
+    from .task_unit import turn_starts
+
+    return len(turn_starts(messages))
 
 
 class ActivationTable:
@@ -137,36 +169,31 @@ class ActivationTable:
     键由 `activation_scope()` 生成——**不要手拼**，分隔符是实现细节。
     """
 
-    def __init__(self, *, debounce_turns: int | None = None) -> None:
+    def __init__(self) -> None:
         self._active: dict[str, str] = {}
-        #: scope → 最近一次落定切换的 **(session_id, user_turn)**（MQ-L48/L44 根治）。
-        #: 防抖差值只在**同一 session** 内相减——`user_turn_index` 会话内单调、
-        #: 新会话/压缩后归零，跨 session 的两个值不是同一把尺子量出来的。
-        self._last_switch_turn: dict[str, tuple[str, int]] = {}
         #: scope → 最近一次落定切换所属的 session（并发争用告警 + MQ-L28 tier gate 用）
         self._last_switch_session: dict[str, str] = {}
         #: scope → 最近一次落定切换的**墙钟**（只为算"多久以前"——turn 跨会话不可比）。
         self._last_switch_at: dict[str, float] = {}
-        self._debounce = (int(flag_number("BLADEX_LEDGER_SWITCH_DEBOUNCE"))
-                          if debounce_turns is None else debounce_turns)
+        #: scope → 最近一次落定切换的观测轨迹（Y1c，只进 `agency_switch_evidence`）。
+        #: 🔴 **有意不进 `restore`**：Hub `LEDGER_SWITCH.turn_index` 存量跨两种轮次口径
+        #: （09-23 批 U · U1.1 前为 role=user 计数），重启后拿它相减就是调度复核第 3 条
+        #: 那个跨口径差值。进程内的值全是同一口径，观测读数只在进程内成立。
+        self._switch_trace: dict[str, _SwitchTrace] = {}
 
     def restore(self, bindings: dict[str, str],
-                sessions: dict[str, str] | None = None,
-                switch_turns: dict[str, tuple[str, int]] | None = None) -> None:
-        """恢复绑定（+可选的绑定来源会话 `ledger.binding_sessions`、+可选的最近切换
-        轮位 `ledger.binding_switch_turns`——两者都是 `LEDGER_SWITCH` 事件的投影）。
+                sessions: dict[str, str] | None = None) -> None:
+        """恢复绑定（+可选的绑定来源会话 `ledger.binding_sessions`——`LEDGER_SWITCH`
+        事件的投影）。
 
         sessions 缺省 = 来源未知——注入面 tier gate 对未知来源按"继承"保守处理
         （MQ-L28：误注旧任务给弱模型的代价 > 弱档少注一轮上下文）。
-        switch_turns 缺省 = 不恢复防抖基点（历史事件无 `turn_index` 字段）⇒ 重启后
-        首次切换不判防抖：宽松方向只漏不误（MQ-L44 修前 `_last_switch_turn` 根本不进
-        restore，重启清零反而是那次事故没被更早抓到的原因）。"""
+
+        批 Y1c（2026-09-24）起**不再恢复任何轮位**：此前的 `switch_turns=`
+        （`ledger.binding_switch_turns`）唯一消费方是切换防抖的基点，防抖已删，一并删除。"""
         self._active.update(bindings)
         if sessions:
             self._last_switch_session.update(sessions)
-        if switch_turns:
-            for scope, (sid, turn) in switch_turns.items():
-                self._last_switch_turn[scope] = (str(sid), int(turn))
 
     def active(self, scope: str) -> str:
         return self._active.get(scope, "")
@@ -174,39 +201,6 @@ class ActivationTable:
     def last_session(self, scope: str) -> str:
         """上一次在这个 scope 上落定切换的 session（争用告警用）。"""
         return self._last_switch_session.get(scope, "")
-
-    def last_switch_turn(self, scope: str) -> int | None:
-        """上一次落定切换的用户轮（防抖告警读数用；None = 没有基点）。
-        它属于 `last_switch_turn_session()` 那个 session 的参照系——跨 session 别拿它相减。"""
-        rec = self._last_switch_turn.get(scope)
-        return None if rec is None else rec[1]
-
-    def last_switch_turn_session(self, scope: str) -> str:
-        """`last_switch_turn()` 读数所属的 session（同参照系判据的另一半）。"""
-        rec = self._last_switch_turn.get(scope)
-        return "" if rec is None else rec[0]
-
-    @property
-    def debounce_turns(self) -> int:
-        return self._debounce
-
-    def migrate(self, src_scope: str, dst_scope: str) -> str:
-        """把 src 的绑定搬到 dst（惰性作用域迁移，2026-08-29）。返回搬动的
-        ledger_id（src 空则 "" 且不动任何状态）。
-
-        防抖轮计数随迁移走（同一本账本的连续性）；**绑定来源会话有意不搬**——
-        迁移不是会话内的切换动作，dst 来源留空让 MQ-L28 gate 按继承保守处理。
-        """
-        lid = self._active.pop(src_scope, "")
-        if not lid:
-            return ""
-        self._active[dst_scope] = lid
-        if src_scope in self._last_switch_turn:
-            self._last_switch_turn[dst_scope] = self._last_switch_turn.pop(src_scope)
-        if src_scope in self._last_switch_at:
-            self._last_switch_at[dst_scope] = self._last_switch_at.pop(src_scope)
-        self._last_switch_session.pop(src_scope, None)
-        return lid
 
     def forget_ledger(self, ledger_id: str) -> list[str]:
         """把某本账本从**所有** scope 的激活位上摘掉。返回受影响的 scope 列表。
@@ -219,13 +213,13 @@ class ActivationTable:
         与 `apply_ledger_tombstones` 把 switch 改写成"切到空"同一语义。
         回退到上一本 = 让前一本吃掉本属于被墓碑账本的窗口（MQ-L15 同型）。
 
-        防抖计数与来源会话一并清除：它们描述的是"最近一次切到它"，
+        观测轨迹与来源会话一并清除：它们描述的是"最近一次切到它"，
         账本没了这些记录就是悬空的。
         """
         hit = [s for s, lid in self._active.items() if lid == ledger_id]
         for s in hit:
             self._active.pop(s, None)
-            self._last_switch_turn.pop(s, None)
+            self._switch_trace.pop(s, None)
             self._last_switch_session.pop(s, None)
             self._last_switch_at.pop(s, None)
         return hit
@@ -237,53 +231,42 @@ class ActivationTable:
     def request_switch(self, scope: str, to_ledger_id: str, *,
                        agent_id: str, turn_index: int,
                        session_id: str = "",
-                       project_id: str = "",
-                       newly_created: bool = False,
-                       user_requested: bool = False) -> SwitchVerdict:
+                       project_id: str = "") -> SwitchVerdict:
         """判定一次切换请求。允许 ⇒ 应用到表并给出管理事件 payload（写 Hub 归调用方）。
 
         `scope` 由 `activation_scope(agent_id, project_id)` 生成；`session_id` **不是绑定键**
-        （2026-08-26 拍板的核心变化），它进事件载荷（审计/溯源）并充当防抖轮计数的
-        **参照系**（同 session 才相减，见下文 E0.2 段）。
+        （2026-08-26 拍板的核心变化），它进事件载荷（审计/溯源）。
 
-        防抖：距上次**落定的**切换不足 N 轮 ⇒ 拒绝（首次绑定不受限——空 scope 绑
-        第一本不是抖动）。同本重复激活 ⇒ noop 不出事件（幂等，防事件流被重发灌水）。
+        唯一的拒绝 = **noop**：同本重复激活不出事件（幂等，防事件流被重发灌水）。
 
-        🔴 `newly_created=True` **豁免防抖**（2026-08-25 live 病例）：CC 4 秒内
-        建了两本——第二本是模型的**自我纠正**（Goal 干净、标题工整、Core 到位），
-        却被防抖挡住切换 ⇒ 会话绑在质量差的那本上、好的那本成孤儿。
-        防抖要防的是"在**已有**账本间反复横跳"，不是"新建一本"——新建本身是
-        模型的显式决定且已落 `ledger_create` 事件，拦切换只会让事件流与绑定表打架。
+        🔴 **批 Y · Y1c（MQ-L91，2026-09-24）删除轮数防抖**（原「同 session 距上次落定
+        切换不足 N 轮 ⇒ 拒」+ `newly_created` / `user_requested` 两条豁免）。病根：ADR-0031
+        「默认延续，要证明它是新的事才切换」在 v5 被翻译成了"要等 3 轮才能切换"——证据从
+        **内容**换成了**轮数计数**。它豁免新建（拦不住真正的碎片 = 重复建本），却一直在拦
+        正当切换：09-23 Hermes 飞书，距上次切换 13 小时的换题被拒两次，第三次只因轮数攒够
+        才落定；上线一个月五个自身缺陷，零例被确认拦对（刚性原则 15）。
+        「默认延续」改由**举证**承接：见 `verify_switch_evidence`，观测阶段只记不拦。
 
-        🔴 **轮次参照系 = (session_id, 用户轮)**（MQ-L44 根治 + MQ-L48，批 E E0.2，2026-09-06）。
-
-        `turn_index` 的单位是 `user_turn_index(messages)`（role=user 消息数），不再是
-        `len(messages)//2`（请求数：工具循环里每个 bash 调用都算一"轮"，3 轮防抖 ≈ 3 个
-        工具调用）。`_last_switch_turn[scope]` 存 **(session_id, user_turn)**，防抖判据 =
-        **`session_id 相同 ∧ 0 ≤ Δ < debounce ⇒ 拒`**；session 不同、或任一方缺 session
-        ⇒ 不判（两个值不是同一把尺子量的，相减没有意义）。session 在这里只是**尺子的参照
-        系**，仍不是绑定键（2026-08-26 拍板：绑定按 (agent, project)）。
-
-        MQ-L44 的最小修（负差值不判）被本判据蕴含——负差要么跨 session（不判），要么同
-        session 内压缩归零（0 ≤ Δ 不成立，不判），两者都不是抖动。那段"负值 ⇒ 更宽松"的
-        错误推理与 live 病例（Pi 新会话 `2 - 18 = -16 < 3` 被拒）记在 MQ-L44。
-
-        `newly_created` / `user_requested` 豁免不变（后者的生产者见 E0.3 / MQ-L41）。
+        `turn_index`（轮次数，`user_turn_index`）仍进事件载荷——它是 Hub 的原始数据
+        （刚性原则 13 无损），只是不再被任何判定消费；观测轨迹（`SwitchVerdict` 的
+        `switch_in_turn` / `delta_turns` / `back_to_prev`）只在同 session 内相减。
         """
         current = self._active.get(scope, "")
         if to_ledger_id == current:
             return SwitchVerdict(allowed=False, reason="noop")
-        rec = self._last_switch_turn.get(scope)
-        # `user_requested` 同样豁免（2026-08-25 复核）：防抖是防**模型**抖动的，
-        # 用户显式说"切到那本"时拦下来，等于系统跟用户的明确意图对着干——
-        # 这与 Goal 只有用户能改是同一条原则（用户意图永远压过启发式）。
-        # 同参照系才相减：同 session ∧ 0 ≤ Δ < N ⇒ 抖动。
-        if (not newly_created and not user_requested and current
-                and rec is not None and session_id and rec[0] == session_id
-                and 0 <= (turn_index - rec[1]) < self._debounce):
-            return SwitchVerdict(allowed=False, reason="debounce")
+        trace = self._switch_trace.get(scope)
+        same_session = bool(trace is not None and session_id
+                            and trace.session_id == session_id)
+        n_in_turn = (trace.n_in_turn + 1
+                     if same_session and trace.turn_index == int(turn_index) else 1)
+        delta_turns = int(turn_index) - trace.turn_index if same_session else None
+        back_to_prev = bool(trace is not None and trace.to_ledger_id == current
+                            and trace.from_ledger_id == to_ledger_id
+                            and trace.from_ledger_id != "")
         self._active[scope] = to_ledger_id
-        self._last_switch_turn[scope] = (session_id, turn_index)
+        self._switch_trace[scope] = _SwitchTrace(
+            session_id=session_id, turn_index=int(turn_index),
+            from_ledger_id=current, to_ledger_id=to_ledger_id, n_in_turn=n_in_turn)
         prev_session = self._last_switch_session.get(scope, "")
         prev_at = self._last_switch_at.get(scope)
         prev_age = -1.0 if prev_at is None else max(0.0, time.time() - prev_at)
@@ -294,9 +277,49 @@ class ActivationTable:
             "session_id": session_id, "agent_id": agent_id,
             "project_id": project_id or ACTIVATION_PROJECT_GLOBAL,
             "from_ledger_id": current, "to_ledger_id": to_ledger_id,
-            # E0.2：落定时的用户轮进事件——`binding_switch_turns` 据此恢复防抖基点。
+            # E0.2 起落定时的轮次进事件（Hub 原始数据，原则 13 无损）。Y1c 起无判定消费方。
             "turn_index": int(turn_index),
-        }, prev_session=prev_session, prev_age_s=prev_age)
+        }, prev_session=prev_session, prev_age_s=prev_age,
+            switch_in_turn=n_in_turn, delta_turns=delta_turns,
+            back_to_prev=back_to_prev)
+
+
+# ── L2 · 切换举证（批 Y · Y1c，MQ-L91）────────────────────────────────────────
+
+#: 举证来源闭集（`LEDGER_SWITCH.evidence_source` / `agency_switch_evidence.source`）。
+#: - `user_text`       模型给了 `evidence`，按本轮用户原话校验（唯一需要校验的一种）；
+#: - `new_ledger`      新建——证据是模型提炼的 Goal（建本本身是显式决定）；
+#: - `child_writeback` 子账本回写父本——证据是子本 Next 里 `ref=<parent>` 那条义务；
+#: - ``（空）          没有任何证据（观测阶段照常切换，`evidence_ok=None`）。
+EVIDENCE_SOURCES: tuple[str, ...] = ("user_text", "new_ledger", "child_writeback", "")
+
+#: 摘录的最小字数（归一化后）。1 个字几乎必然是任意用户文本的子串，不构成证据。
+EVIDENCE_MIN_CHARS = 2
+
+
+def _norm_evidence(text: str) -> str:
+    # 空白折叠 + casefold：模型摘录时换行/多空格/大小写的出入不算编造。
+    return " ".join(str(text or "").split()).casefold()
+
+
+def verify_switch_evidence(evidence: str, user_text: str) -> bool | None:
+    """`evidence` 是否是本轮用户原话的片段。**单一实现点**（Y1c 判据 5）。
+
+    返回 None = 没给证据（与"给了但对不上"的 False 分开——观测阶段两者都照常切换，
+    但它们回答的是两个问题：模型愿不愿举证 / 举的证是不是真的）。
+
+    🔴 `user_text` 必须是**剥过信封**的本轮用户文本，调用方只许传
+    `tool_context()["user_query"]`（`_last_user_text(for_goal=True)`，与 Goal 改动的
+    引文锚同源）——**值要能回溯到它声称的来源**（刚性原则 13 层 4）。传模型自己给的
+    任何参数进来，校验就退化成"模型自报"。守卫：`test_switch_evidence.py`。
+    首尾引号/空白不计；归一化后不足 `EVIDENCE_MIN_CHARS` 字 ⇒ False（太短不成证据）。
+    """
+    ev = _norm_evidence(evidence).strip("\"'“”‘’「」『』`")
+    if not ev:
+        return None
+    if len(ev) < EVIDENCE_MIN_CHARS:
+        return False
+    return ev in _norm_evidence(user_text)
 
 
 # ── L3 · 工具更新通道 ───────────────────────────────────────────────────────
@@ -883,18 +906,32 @@ def path_like_units(text: str) -> frozenset[str]:
     return frozenset(out)
 
 
+#: 批 HO（MQ-L99）：已关账本进相关性段的时间窗——关闭时刻距本轮 ≤ 此值才列。
+#: 值沿用 E4（MQ-L98）「本会话近期关闭」小节的 24 h（那一节已并入相关性段，见
+#: `agency/runtime.py`）；30 天回放读数：「回到那件事」4 条全在关后 1 h 内，
+#: 24 h 之外的新增条目全是「新的同类事 / 无关」（`report-batch-HO-20261015.md` §3）。
+CLOSED_MATCH_WINDOW_S = 24 * 3600.0
+
+
 @dataclass(frozen=True)
 class LedgerMatch:
     ledger_id: str
     title: str
     score: float
     shared: int
+    #: 批 HO（MQ-L99）：命中的是一本**已关**的账本。渲染方据此标 `[closed …]`；
+    #: 切过去 = 重开（`_h_ledger_switch` 的既有路径）。
+    closed: bool = False
 
 
 def relevant_ledgers(pool: dict[str, Ledger], user_text: str, *,
                      exclude_id: str = "", top_n: int = 3,
                      min_score: float = 0.3, min_shared: int = 2,
-                     require_rare_anchor: bool = True) -> list[LedgerMatch]:
+                     require_rare_anchor: bool = True,
+                     include_closed: bool = True,
+                     closed_window_s: float | None = CLOSED_MATCH_WINDOW_S,
+                     include_superseded: bool = False,
+                     now_ms: float | None = None) -> list[LedgerMatch]:
     """按当前用户话找"像同一件事"的账本（MQ-L38 相关性位）。
 
     - 账本侧单元 = title + goal；idf 按池内文档频次（`log((N+1)/(df+1))`）。
@@ -907,13 +944,42 @@ def relevant_ledgers(pool: dict[str, Ledger], user_text: str, *,
       就不是同一件事（沙盒回放实测，去掉这条即误召）。
     - 拉丁 token 交集**按 2 计**：`freetoken` 这类唯一标识一个就够定一件事；
       纯 CJK 仍要 ≥2 个 2-gram（单个 2-gram 太容易撞）。
-    - `closed` 账本照列——"切回一本已完结的账本"正是"以前干过"的语义；排除激活本。
+    - 🔴 **`closed` 账本按内容命中时照列，带 `closed=True`**（批 HO，MQ-L99，2026-10-15；
+      推翻批 Z · Z3 的「closed 不列」）。Z3 的理由是「close 是有人明确说了结束，再推到模型
+      面前等于替它翻案」——这对**没有内容依据**的 recency 段仍成立（那一段照旧排除 closed，
+      见 `agency/runtime.py`），对**这一段**不成立：这里列出一本已关的本，依据是**当前用户
+      这句话**与它的 title + goal 对得上，翻案的是用户，不是我们。病例：10-15 交接，交出方
+      把「交给别人收尾」当做完关了本，接手方首句与原本 score 0.83 / shared 9，却因这一行
+      排除只能新建（MQ-L98 的同会话小节对换会话、换 agent 必然无效）。门槛与 open 同一套
+      （30 天回放读数定，见 `report-batch-HO-20261015.md`）。切不切归模型；切过去 = 重开。
+      放开有两个收紧，**都由回放读数定**（收紧前 31 条新增里「无关」21 条）：
+      ① **被取代的不列**（`superseded_by` 非空）——那件事已有明确的继任本，继任本若对得上
+      会作为 open 本自己出现；回放里被取代本新增 13 条，0 条该切回它；
+      ② **关闭超过 `CLOSED_MATCH_WINDOW_S`（24 h）的不列**，`closed_at` 缺失（老事件）同样不列
+      ——「回到那件事」全在关后 1 h 内。收紧后 10 条：回到 3 / 新的同类事 4 / 无关 3。
+      `include_closed=False` / `closed_window_s=None` / `include_superseded=True` 只给对照臂
+      （探针 / 阴性对照）用；`now_ms` 缺省取当前时刻（探针回放传该轮时刻）。
+      idf / 稀有锚仍按**全池**算——关掉一本不改变其它账本的得分（Z3 判据 ② 的阴性对照）。
+      排除激活本。
     - 返回按 score 降序前 `top_n`；query 无有效单元 ⇒ 空（不猜）。
     """
     import math
     q = candidate_units(user_text)
     if not q or not pool:
         return []
+    _now = time.time() * 1000.0 if now_ms is None else now_ms
+
+    def closed_listable(led: Ledger) -> bool:
+        if not include_closed:
+            return False
+        if led.superseded_by and not include_superseded:
+            return False
+        if closed_window_s is None:
+            return True
+        if not led.closed_at:
+            return False
+        return 0 <= _now - iso_ms(led.closed_at) <= closed_window_s * 1000.0
+
     docs: list[tuple[str, str, set[str]]] = []
     df: dict[str, int] = {}
     for lid, led in pool.items():
@@ -933,7 +999,8 @@ def relevant_ledgers(pool: dict[str, Ledger], user_text: str, *,
         return []
     out: list[LedgerMatch] = []
     for lid, title, units in docs:
-        if lid == exclude_id:
+        closed = pool[lid].status == STATUS_CLOSED
+        if lid == exclude_id or (closed and not closed_listable(pool[lid])):
             continue
         shared_units = q_seen & units
         if not shared_units:
@@ -943,7 +1010,7 @@ def relevant_ledgers(pool: dict[str, Ledger], user_text: str, *,
         shared = sum(2 if _is_latin_unit(u) else 1 for u in shared_units)
         score = sum(idf(u) for u in shared_units) / denom
         if shared >= min_shared and score >= min_score:
-            out.append(LedgerMatch(lid, title, round(score, 2), shared))
+            out.append(LedgerMatch(lid, title, round(score, 2), shared, closed))
     out.sort(key=lambda m: (-m.score, -m.shared, m.ledger_id))
     return out[:top_n]
 
@@ -973,6 +1040,119 @@ def turn_key_ts_ms(turn_key: str) -> float:
     """
     tail = (turn_key or "").rsplit("/", 1)[-1].split("-", 1)[0]
     return float(tail) if tail.isdigit() else 0.0
+
+
+def project_scope_since(timeline: dict[str, list[tuple[float, str]]]) -> float:
+    """时间轴上**第一条落在非 Global scope 上的激活事件**的时刻；没有 ⇒ `inf`。
+
+    这是"运行时开始按 (agent, project) 分键查绑定"的最早可证时刻——证据来自运行时
+    自己写下的事件（switch / migrate / 带 scope 的 create），不是部署日期常量。
+    """
+    since = float("inf")
+    for scope, seq in timeline.items():
+        if seq and split_scope(scope)[1] != ACTIVATION_PROJECT_GLOBAL:
+            since = min(since, seq[0][0])
+    return since
+
+
+def turn_active_ledger(timeline: dict[str, list[tuple[float, str]]], turn_key: str,
+                       project_id: str, *, bindings: dict[str, str] | None = None,
+                       turn_index: int | Callable[[], int | None] | None = None,
+                       apply_done_pause: bool = True) -> str:
+    """**这一轮发生时激活的是哪本账本**——全仓唯一实现点（批 Y · Y1a，MQ-L88）。
+
+    `turn_key` 定 agent 与时刻（stream ms），`project_id` = 该轮自己的
+    `identity.project_id`（调用方从 Hub 行取：`scan_meta_snapshot` 行或 `Turn.identity`，
+    同一字段）；老轮次没有 ⇒ 空 ⇒ `activation_scope` 落 Global，与历史事件同键。
+
+    🔴 **为什么必须只有一处**（原则 13 层 2）：此前两个消费方各算一遍——
+    `ledger_memory` 的窗口查表（MQ-I22，批 T0 修成带 project）与重建锚层
+    `memory_index._la_ledger_at`（写死 `activation_scope(agent, "")`，docstring 还写着
+    "project 段在 V-F1 落地前恒 Global"——project 信号 08-29 就接通了）。
+    同一个错在两个消费方上各活了一遍，第二遍藏了三周、在第一红线上贡献 59 条错边。
+    守卫 `test_turn_ledger_single_impl.py`：生产代码里除本函数外，任何同时取
+    turn key 身份（`agent_of_turn_key` / `turn_key_ts_ms`）又查 scope/时间轴
+    （`activation_scope` / `ledger_active_at` / `ledger_activation_windows`）的函数都红。
+
+    `bindings`（可选）= 终态绑定兜底，只在**时间轴上这个 scope 压根没有条目**时用
+    （无 ts 的历史事件形态）；scope 在轴上而该刻早于第一次切换 ⇒ 空，不回落
+    （否则会把"建账本之前"的历史塞进锚定 Matter，MQ-L15 反向形状）。
+
+    🔴 **project 维的生效时刻 = 事件流里第一条带真 project 的激活事件**
+    （`project_scope_since`；原则 13 层 4：值是不是来自它声称的来源）。
+    `identity.project_id` 在 08-29 先于"绑定按 project 分键"接通：live 上 codex 的轮次
+    04:28 起就带 `p-10ad1f61d0c2`，而运行时 09:23 仍在 `codex@Global` 上切账本，
+    第一条带 project 的 switch 要到 10:12:49。那段轮次的 project_id 是真的，
+    但**运行时查绑定用的不是它**——按它查会把 54 轮从它们当时真正所在的账本上摘掉
+    （Y1a 修前/修后逐轮差异 `unanchored|project` 桶）。故该时刻之前一律按 Global 查。
+
+    🔴 **完结即停锚（批 Z · Z3.2 / Y1b，拍板 (27)）**：查到的账本若在这一刻处于
+    「自述完结」区间（`ledger.DoneSpan`：某次写入后 Open 与 Next 都空、Verified 非空，
+    至今没有写入让它重新有待办、也没有人显式切回它）⇒ **返回空**，本轮落回 D1/DPL
+    兜底——Y0「做完不关」的机判形态（W15：07:50 自述完结后 6 小时的 ADR 问答被锚进来）。
+    只影响**锚定**：live 绑定不解除（那是 close 的事），热路径上不替模型做任何决定。
+    判据零标定（不用"账本陈旧度"——Y0 标为未标定候选）。
+    区间里**写过这本账本的用户轮**照常锚（`DoneSpan.writers`：完结写入所在的那一轮就是
+    它的收尾）——判它要本轮的 `turn_index`（`Turn.identity.turn_index`，与写入时
+    `tool_context` 同一公式）。可传值或零参可调用（只在命中区间且会话对得上时才取，
+    调用方不必为绝大多数轮次付一次 Hub 读）；不传 ⇒ 不豁免。
+    区间挂在 `switch_timeline` 的产物上（`SwitchTimeline.done_spans`）——拿到时间轴就拿到
+    停锚，没有第二条取法；手拼的普通 dict 没有它 ⇒ 不停锚（= 修前口径）。
+
+    `apply_done_pause=False` = **标签口径**：只给 DPL 准入闸（`ledger_gate` 闸②）用。停锚只摘掉
+    ANCHOR，不摘掉"这一轮在谁的激活窗口里"——被停锚的轮次仍不许挂到**别的**账本锚卡上
+    （否则判据 ⑤ 说的"换受害者"：摘掉标签，闸② 放行，内容相似就能把它挂进别人的锚卡），
+    挂回自己这本的锚卡则交给内容（CONT「延续 ∧ 无新主体」）决定。
+    """
+    from .ledger import ledger_active_at
+
+    scope = turn_activation_scope(timeline, turn_key, project_id)
+    if not scope:
+        return ""
+    lid = ledger_active_at(timeline, scope, turn_key_ts_ms(turn_key))
+    if not lid and bindings is not None and scope not in timeline:
+        lid = bindings.get(scope, "")
+    if (lid and apply_done_pause
+            and ledger_done_paused(timeline, lid, turn_key, turn_index=turn_index)):
+        return ""
+    return lid
+
+
+def ledger_done_paused(timeline: dict[str, list[tuple[float, str]]], ledger_id: str,
+                       turn_key: str, *,
+                       turn_index: int | Callable[[], int | None] | None = None) -> bool:
+    """`turn_key` 这一轮发生时 `ledger_id` 是否处于完结停锚区间（且本轮不是它的写者用户轮）。
+
+    `turn_active_ledger` 的后半段，单独给出只为仪器能数"被停锚的轮次"而不必自己再判一遍。
+    """
+    spans = getattr(timeline, "done_spans", None) or {}
+    t = turn_key_ts_ms(turn_key)
+    for sp in spans.get(ledger_id, ()):
+        if not (sp.start_ms < t and (sp.end_ms is None or t <= sp.end_ms)):
+            continue
+        session = session_of_turn_key(turn_key)
+        if session and any(s == session for s, _ in sp.writers):
+            ti = turn_index() if callable(turn_index) else turn_index
+            if ti is not None and (session, int(ti)) in sp.writers:
+                return False
+        return True
+    return False
+
+
+def turn_activation_scope(timeline: dict[str, list[tuple[float, str]]], turn_key: str,
+                          project_id: str) -> str:
+    """这一轮发生时运行时查绑定用的 **scope**；turn key 不合形 ⇒ ""。
+
+    `turn_active_ledger` 的前半段，单独给出是为了仪器（窗口 / 波及面）能拿到"锚层查的是哪条轴"
+    而不必自己再拼一遍——拼一遍就是第二个实现点（守卫同一条）。project 维生效时刻见
+    `turn_active_ledger` docstring。
+    """
+    agent = agent_of_turn_key(turn_key)
+    if not agent:
+        return ""
+    if project_id and turn_key_ts_ms(turn_key) < project_scope_since(timeline):
+        project_id = ""
+    return activation_scope(agent, project_id)
 
 
 # `iso_ms` 见 bladex_core.ledger（从本模块 import 再导出，调用方路径不变）。

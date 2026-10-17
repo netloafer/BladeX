@@ -22,12 +22,34 @@ if str(_SCRIPT.parent) not in sys.path:
 crv = importlib.import_module("check_release_version")
 
 
-def _fake_repo(tmp_path: Path, versions: dict[str, str]) -> Path:
+def _write_lock(root: Path, versions: dict[str, str]) -> None:
+    """按 pyproject 相对路径生成 uv.lock 的 workspace 条目（+ 一条第三方干扰项）。"""
+    chunks = ['version = 1\n[[package]]\nname = "somelib"\nversion = "1.0.0"\n'
+              'source = { registry = "https://pypi.org/simple" }\n']
+    for rel, v in versions.items():
+        if rel == "pyproject.toml":
+            src = 'source = { virtual = "." }'
+            name = "fake-root"
+        else:
+            pkg_dir = rel.rsplit("/", 1)[0]
+            src = f'source = {{ editable = "{pkg_dir}" }}'
+            name = pkg_dir.rsplit("/", 1)[-1]
+        chunks.append(f'[[package]]\nname = "{name}"\nversion = "{v}"\n{src}\n')
+    (root / crv.UV_LOCK).write_text("\n".join(chunks), encoding="utf-8")
+
+
+def _fake_repo(tmp_path: Path, versions: dict[str, str],
+               lock_versions: dict[str, str] | None = None) -> Path:
+    """lock_versions 缺省=与 pyproject 一致；传 {} 表示不写 uv.lock。"""
     for rel in crv.PYPROJECTS:
         p = tmp_path / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(f'[project]\nname = "{p.parent.name}"\nversion = "{versions[rel]}"\n',
                      encoding="utf-8")
+    if lock_versions is None:
+        lock_versions = versions
+    if lock_versions:
+        _write_lock(tmp_path, lock_versions)
     return tmp_path
 
 
@@ -75,6 +97,55 @@ def test_inconsistent_versions_fail_without_tag(tmp_path):
 def test_near_miss_tags_fail(tmp_path, tag):
     root = _fake_repo(tmp_path, _all("0.2.0"))
     assert crv.check(tag, root), f"{tag!r} 不该被当成 0.2.0"
+
+
+# ── 批 P · P1：uv.lock 进对账面（拍板 0.2.0-(61)，f31b3f2 的形状）────────────
+
+
+def test_lock_version_drift_fails(tmp_path):
+    """事故形状：uv sync 升了 uv.lock、pyproject 四处一致——修前这里是绿的。"""
+    lock = _all("0.2.0")
+    lock["packages/bladex-core/pyproject.toml"] = "9.9.9"
+    root = _fake_repo(tmp_path, _all("0.2.0"), lock_versions=lock)
+    problems = crv.check("v0.2.0", root)
+    assert len(problems) == 1
+    assert "uv.lock" in problems[0] and "9.9.9" in problems[0] and "bladex-core" in problems[0]
+
+
+def test_lock_missing_entry_for_workspace_package_fails(tmp_path):
+    lock = _all("0.2.0")
+    del lock["packages/bladex-mcp/pyproject.toml"]
+    root = _fake_repo(tmp_path, _all("0.2.0"), lock_versions=lock)
+    problems = crv.check(None, root)
+    assert len(problems) == 1 and "uv.lock 缺" in problems[0] and "bladex-mcp" in problems[0]
+
+
+def test_lock_extra_workspace_entry_fails(tmp_path):
+    lock = _all("0.2.0")
+    lock["packages/bladex-new/pyproject.toml"] = "0.2.0"
+    root = _fake_repo(tmp_path, _all("0.2.0"), lock_versions=lock)
+    problems = crv.check(None, root)
+    assert len(problems) == 1 and "PYPROJECTS" in problems[0]
+
+
+def test_lock_absent_skips_loudly_not_silently(tmp_path, capsys):
+    """公开树不带 uv.lock：通过，但跳过理由必须打出来（不许静默通过）。"""
+    root = _fake_repo(tmp_path, _all("0.2.0"), lock_versions={})
+    assert crv.check("v0.2.0", root) == []
+    err = capsys.readouterr().err
+    assert "uv.lock 不存在" in err and "跳过" in err
+
+
+def test_lock_mapping_is_by_source_path_not_name(tmp_path):
+    """锁条目按 source 路径映射：包名与目录名对不上也照样对账。"""
+    root = _fake_repo(tmp_path, _all("0.2.0"))
+    lock_text = (root / crv.UV_LOCK).read_text(encoding="utf-8")
+    (root / crv.UV_LOCK).write_text(
+        lock_text.replace('name = "bladex-core"', 'name = "renamed-dist"'), encoding="utf-8")
+    assert crv.check("v0.2.0", root) == []
+    mapped = crv.collect_lock_versions(root)
+    assert mapped is not None
+    assert mapped["packages/bladex-core/pyproject.toml"] == ("renamed-dist", "0.2.0")
 
 
 # ── 真实仓库：脚本以子进程跑，退出码就是 release.yml 看到的那个 ───────────────

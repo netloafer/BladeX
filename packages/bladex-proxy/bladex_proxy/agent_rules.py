@@ -135,24 +135,24 @@ def _rule_from_dict(raw: dict[str, Any], source: str) -> AgentFingerprintRule:
     unknown = set(raw) - known
     if unknown:
         raise ValueError(
-            f"agent 规则 {raw.get('name') or raw.get('agent_id')!r} 含未知字段 "
-            f"{sorted(unknown)}；可用字段：{sorted(known)}"
+            f"agent rule {raw.get('name') or raw.get('agent_id')!r} has unknown fields "
+            f"{sorted(unknown)}; allowed fields: {sorted(known)}"
         )
     agent_id = str(raw.get("agent_id", "")).strip()
     if not agent_id:
-        raise ValueError(f"agent 规则缺少 agent_id：{raw!r}")
+        raise ValueError(f"agent rule is missing agent_id: {raw!r}")
 
     headers: list[HeaderPattern] = []
     for hp in raw.get("header_patterns", []) or []:
         if not isinstance(hp, dict) or "name" not in hp:
-            raise ValueError(f"{agent_id} 的 header_patterns 条目需要 name 字段：{hp!r}")
+            raise ValueError(f"{agent_id}: each header_patterns entry needs a name field: {hp!r}")
         pattern = str(hp.get("pattern", ""))
         if pattern:
             try:
                 re.compile(pattern)
             except re.error as exc:
                 raise ValueError(
-                    f"{agent_id} 的 header_patterns 正则非法（{hp['name']}）：{exc}"
+                    f"{agent_id}: invalid regex in header_patterns ({hp['name']}): {exc}"
                 ) from exc
         headers.append(HeaderPattern(name=str(hp["name"]).lower(), pattern=pattern))
 
@@ -586,7 +586,8 @@ def append_user_rule(rule: dict[str, Any], path: str | Path | None = None,
     """
     target = Path(path) if path is not None else _discover_user_rules_path()
     if target is None:
-        raise RuntimeError("找不到部署根，无法写用户规则文件；请显式传 path")
+        raise RuntimeError("cannot find the deployment root to write the user rules file; "
+                           "pass path explicitly")
     if merge_preset:
         rule = merge_with_preset(rule)
     snippet = render_rule_toml(rule)

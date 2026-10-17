@@ -35,6 +35,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field
@@ -146,6 +147,20 @@ class Ledger(BaseModel):
     rev: int = 0
     #: 最近写者（agent 完整 id / "user"）。注入面并发标注的判据，不参与身份。
     last_writer: str = ""
+    #: 被哪本账本取代（批 Z · Z3，README 承诺的 `supersede` 原语）。只存这一个方向——
+    #: 与 `parent_ledger_id` 同理，反向（"它取代了谁"）由池派生，两向都存就要双写同步。
+    #: 只由 `ledger_supersede` 事件写（`close_ledger`），`reopen_ledger` 清空。
+    superseded_by: str = ""
+    #: 批 E · E4（MQ-L98，2026-09-29）：**谁在何时关的**——加法字段，老事件缺省为空。
+    #: 只由 `close_ledger` 写、`reopen_ledger` 清，重放与运行时同一变换。
+    #: 🔴 批 HO（MQ-L99，2026-10-15）改了它的消费方：E4 时「已关账本只对关它的那个会话
+    #: 列出」（`closed_by_session == session_id`），交接（换会话、换 agent）必然不满足；
+    #: 现在已关账本按**内容**进相关性段（任何会话，`ledger_runtime.relevant_ledgers`），
+    #: `closed_at` 定时间窗，`closed_by_agent` 只用于渲染「谁关的」，`closed_by_session`
+    #: 不再参与候选判定（仍随事件重放，审计用）。
+    closed_by_session: str = ""
+    closed_by_agent: str = ""              # 批 HO：关闭事件载荷的写者 agent（CLI / admin 为空）
+    closed_at: str = ""                    # ISO（关闭事件的时刻）
     # ── Goal：单块文本 ──
     #
     # 🔴 2026-08-26 拍板（Jason）：从「取」改为「**由 agent 侧模型提炼**」。
@@ -368,6 +383,69 @@ def add_section(ledger: Ledger, key: str, *, position: int | None = None) -> Led
     return ledger.model_copy(update={"section_order": order, "sections": sections})
 
 
+# ── 生命周期：close / supersede / reopen（批 Z · Z3，MQ-L39 / MQ-L86）──────────
+#
+# 🔴 三个原语**只动 `status` / `superseded_by`**，一字不碰 Goal 与各段条目——
+# 关本是账本对象操作（三红线之 1 之内），不是内容写入，更不是改目标（红线 1：
+# Goal 仅用户可改）。守卫 `test_ledger_lifecycle.py::test_close_never_touches_goal`。
+
+STATUS_ACTIVE = "active"
+STATUS_CLOSED = "closed"
+
+#: 生命周期事件的 `origin` 闭集（原则 13 层 4：值要能指认来源）。
+#: `model` 只由工具 handler 写；admin 端点只收 `user` / `cli`（不许冒充模型）。
+LIFECYCLE_ORIGIN_MODEL = "model"
+LIFECYCLE_ORIGIN_USER = "user"
+LIFECYCLE_ORIGIN_CLI = "cli"
+LIFECYCLE_ORIGINS: tuple[str, ...] = (
+    LIFECYCLE_ORIGIN_MODEL, LIFECYCLE_ORIGIN_USER, LIFECYCLE_ORIGIN_CLI,
+)
+
+
+def ledger_is_done(ledger: Ledger | dict | None) -> bool:
+    """账本**自述完结**：Open 与 Next 都空、Verified 非空（批 Z · Z3.2 / Y1b 的机判口径）。
+
+    与 Y0 探针 `done_at` 同一判据（`20260923-pre-t1` 的 10 条机判就是按它分的）。
+    段不存在按空算（模板可删段）；**没有 Verified 就不算做完**——空账本不是完结的账本。
+    接受 `Ledger` 或其 dump（事件载荷），两种形态一处判。
+    """
+    if ledger is None:
+        return False
+    sec = ledger.get("sections") if isinstance(ledger, dict) else ledger.sections
+    sec = sec or {}
+    return (not sec.get(SECTION_OPEN) and not sec.get(SECTION_NEXT)
+            and bool(sec.get(SECTION_VERIFIED)))
+
+
+def close_ledger(ledger: Ledger, *, superseded_by: str = "",
+                 closed_by_session: str = "", closed_at: str = "",
+                 closed_by_agent: str = "") -> Ledger:
+    """关本（`superseded_by` 非空 = supersede）。重放与运行时共用这一处变换。
+
+    `closed_by_session` / `closed_by_agent` / `closed_at`（E4 MQ-L98 / 批 HO MQ-L99）：
+    关闭事件载荷里的写者会话、写者 agent 与事件时刻；admin / CLI 关的本没有会话与 agent
+    ⇒ 留空。是否回到模型候选**不看谁关的**（MQ-L99：按内容匹配，任何会话）。
+    """
+    return ledger.model_copy(update={
+        "status": STATUS_CLOSED,
+        "superseded_by": superseded_by or ledger.superseded_by,
+        "closed_by_session": closed_by_session,
+        "closed_by_agent": closed_by_agent,
+        "closed_at": closed_at,
+    })
+
+
+def reopen_ledger(ledger: Ledger) -> Ledger:
+    """重开：只恢复状态（**不激活**——激活只有 switch 一条路）。
+
+    取代指针一并清空：重开意味着它又是一件在办的事，留着 "superseded by X"
+    会让读者以为它已被取代。取代的历史仍在 Hub 事件流里（`ledger_supersede`）。
+    """
+    return ledger.model_copy(update={"status": STATUS_ACTIVE, "superseded_by": "",
+                                     "closed_by_session": "", "closed_by_agent": "",
+                                     "closed_at": ""})
+
+
 # ── 渲染（纯函数）────────────────────────────────────────────────────────────
 
 _MACHINE_COMMENT = ("<!-- BladeX Ledger · authored by the agent, kept by BladeX. "
@@ -401,6 +479,9 @@ def render_ledger_md(ledger: Ledger) -> str:
     if ledger.parent_ledger_id:
         # V-L6e：子账本永远指得回父账本（失联是 Jason 点名要避免的形态）
         lines.append(f"- parent ledger: `{ledger.parent_ledger_id}`")
+    if ledger.superseded_by:
+        # Z3：取代链的读侧——读到一本被取代的账本，下一跳就在这一行
+        lines.append(f"- superseded by: `{ledger.superseded_by}`")
     # 呈现层：本地时区（用户在 CST 读到的 `updated` 曾比墙钟早 8 小时，MQ-L46）
     if ledger.created_at:
         lines.append(f"- created: {local_iso(ledger.created_at)}")
@@ -471,7 +552,7 @@ def template_section_order(template_md: str) -> list[str]:
 # ── 解析（MD → Ledger，与渲染往返等价；容忍手编）────────────────────────────
 
 _META_RE = re.compile(
-    r"^- (ledger|status|matter|parent ledger|created|updated): `?([^`]*)`?\s*$")
+    r"^- (ledger|status|matter|parent ledger|superseded by|created|updated): `?([^`]*)`?\s*$")
 #: 条目行。四个捕获组：正文 / source / ref / writer。
 #: 🔴 **向后兼容是硬要求**：池里存量全是两段形态（`[model · ref]` 或 `[user]`），
 #: ref 段与 writer 段都可缺席，且 writer 段永远带 `@` 前缀——ref 组的 `(?!@)`
@@ -548,6 +629,7 @@ def parse_ledger_md(text: str, *, base: Ledger | None = None) -> Ledger:
         status=meta.get("status", "active"),
         matter_id=meta.get("matter", ""),
         parent_ledger_id=meta.get("parent ledger", ""),
+        superseded_by=meta.get("superseded by", ""),
         # 文件里是本地偏移串（render 产物）或用户手写的任意偏移 ⇒ 归一回 UTC，
         # 池里不许混偏移（红线 3 时区纪律）
         created_at=normalize_iso_utc(meta.get("created", "")),
@@ -562,7 +644,7 @@ def parse_ledger_md(text: str, *, base: Ledger | None = None) -> Ledger:
     return ledger
 
 
-# ── 池化路径（ADR-0032 §4.2：真身在 User 级池，目录树只存引用）───────────────
+# ── 池化路径（账本投影落点；真相在 Hub 事件流，ADR-0034 §3.2）──────────────────
 
 LEDGERS_DIR = "ledgers"
 
@@ -590,9 +672,9 @@ def ledger_shard(ledger_id: str) -> str:
 
 def ledger_md_path(root: str, principal: str, ledger_id: str,
                    *, scope: str = SCOPE_PERSONAL) -> str:
-    """池内真身：`ledgers/<桶>/<id>.md`（两级分桶见 `ledger_shard`）。
-    🔴 签名里没有 agent/project/session——账本身份独立于访问路径
-    （目录树的 LEDGERS.md 引用行归 V-F1）。"""
+    """账本投影文件：`ledgers/<桶>/<id>.md`（两级分桶见 `ledger_shard`）。
+    也是用户直编的落点（ADR-0034 §3.1 ①，Flash 唯一不可替代的职责）。
+    🔴 签名里没有 agent/project/session——账本身份独立于访问路径。"""
     return (f"{ledgers_dir(root, principal, scope=scope)}/"
             f"{ledger_shard(ledger_id)}/{safe_component(ledger_id)}.md")
 
@@ -617,6 +699,22 @@ EVENT_LEDGER_SWITCH = "ledger_switch"        # payload = {session_id, agent_id, 
 #: to_project, ledger_id}。自愈实测证伪（自发 0/2）后立的机制解。
 EVENT_LEDGER_SCOPE_MIGRATE = "ledger_scope_migrate"
 EVENT_LEDGER_USER_EDIT = "ledger_user_edit"  # payload = {ledger: dump}——直编捕获后的完整状态
+#: 生命周期（批 Z · Z3）。**增量式**载荷（与 create/update 的整本 dump 不同）：
+#: 关 / 重开只动 status，一本整本 dump 会把"谁改了正文"与"谁关了本"混成一件事。
+#: payload = {ledger_id, origin ∈ LIFECYCLE_ORIGINS, reason, agent_id, project_id,
+#:            session_id, turn_index}（后四个只有 model 来源有）；
+#: supersede 另带 `superseded_by`。
+#: 🔴 close / supersede 在时间轴上 = 该本**当时激活着的每个 scope** 切到空
+#: （`switch_timeline`）；在绑定上 = 这些 scope 解除（`replay_ledger_events`）。
+#: reopen 只动池里的 status，**不碰时间轴与绑定**（重开 ≠ 激活）。
+EVENT_LEDGER_CLOSE = "ledger_close"
+EVENT_LEDGER_REOPEN = "ledger_reopen"
+EVENT_LEDGER_SUPERSEDE = "ledger_supersede"
+LEDGER_LIFECYCLE_EVENTS = frozenset({
+    EVENT_LEDGER_CLOSE, EVENT_LEDGER_REOPEN, EVENT_LEDGER_SUPERSEDE,
+})
+#: 释放激活的那两类（close 与 supersede 在时间轴 / 绑定上同形）。
+_RELEASING_EVENTS = frozenset({EVENT_LEDGER_CLOSE, EVENT_LEDGER_SUPERSEDE})
 
 #: 账本事件全集（§3.2b 单一判据：agency 的池装载与 flash 维护进程的 Hub 源
 #: 都按这一份过滤——两边各抄一份迟早分叉）。
@@ -624,11 +722,13 @@ LEDGER_EVENT_TYPES = frozenset({
     EVENT_LEDGER_CREATE, EVENT_LEDGER_UPDATE,
     EVENT_LEDGER_SWITCH, EVENT_LEDGER_USER_EDIT,
     EVENT_LEDGER_SCOPE_MIGRATE,
+    *LEDGER_LIFECYCLE_EVENTS,
 })
 
 
 def apply_ledger_tombstones(
-    events: list[dict], tombstoned: set[str],
+    events: list[dict], tombstoned: set[str], *,
+    tombstone_ts_ms: dict[str, float] | None = None,
 ) -> list[dict]:
     """滤掉被墓碑账本的事件（纯函数）。返回新列表，不改入参。
 
@@ -649,10 +749,35 @@ def apply_ledger_tombstones(
 
     其余四类事件（create/update/user_edit/scope_migrate）只喂账本池、不进时间轴，
     直接丢弃即可。
+
+    ## 🔴 2026-09-18（批 S · S2.1，MQ-I19）：墓碑**从它发生的那一刻起**生效，不改写历史
+
+    上面"把 switch 改写成切到空"是把墓碑**倒填到切换那一刻**：账本活着的那段
+    窗口从时间轴上整段消失，窗口内的轮次在重建/滞后蒸馏时查不到激活账本，
+    产出落到 DPL 内容卡上（批 S 实测：live 库 232 条 fact 的源轮次发生在账本
+    存活期内、却在墓碑之后才入库 ⇒ 全部落内容卡；Q3 真跑 S3「fact 换卡长回来」
+    同一成因）。而拍板 0.3.0-(2) 的语义是**墓碑账本 ≠ 清派生记忆**：任务收摊，
+    知识不作废——知识的外部边界（账本的激活窗口）也不该跟着作废。
+
+    故改为：**已知墓碑时刻**（`tombstone_ts_ms[lid]`）时，切入该账本的 switch
+    **原样保留**，并在墓碑时刻**合成一条「切到空」**（`to_ledger_id=""`，与既有
+    语义同形）——只对墓碑那一刻仍激活着该账本的 scope 合成，早已切走的 scope
+    不动（否则会把后一本账本的窗口切断，同型于 MQ-L15）。合成事件按 ts 插回
+    序列，`replay_ledger_events`（last-write-wins）与 `switch_timeline`（点时）
+    都因此得到正确答案：墓碑之前 = 该账本在场；墓碑之后 = 无账本。
+
+    墓碑时刻**未知**（调用方没传 / 该 id 不在表里）⇒ 回落旧行为（改写切入为空）
+    ——缺数不当作"从未在场"以外的任何强信号。
+
+    三个消费方的行为差异：agency 池 / flash 物化只看池（create/update 仍丢弃，
+    **零变化**）；激活绑定终态与此前一致（墓碑那一刻仍激活 ⇒ 合成的空切换
+    把它 pop 掉）；**只有重建锚层**看到了多出来的窗口——这正是本条要修的对象。
     """
     if not tombstoned:
         return list(events)
+    ts_map = tombstone_ts_ms or {}
     out: list[dict] = []
+    kept_switch_scopes: dict[str, set[str]] = {}   # lid → 保留了切入事件的 scope 集合
     for ev in events:
         etype = ev.get("type", "")
         payload = ev.get("payload") or {}
@@ -660,13 +785,102 @@ def apply_ledger_tombstones(
             lid = (payload.get("ledger") or {}).get("ledger_id", "")
             if lid in tombstoned:
                 continue
+        elif etype in LEDGER_LIFECYCLE_EVENTS:
+            # 批 Z · Z3：墓碑**前**的关本是时间轴事件（它比墓碑更早结束了窗口），原样保留——
+            # 丢掉它会让窗口越过关本时刻一直延到墓碑（换受害者，MQ-L15 同型）。
+            # 墓碑时刻未知 / 关本晚于墓碑 ⇒ 丢弃（切入已被改写成切到空，它无事可做）。
+            lid = payload.get("ledger_id", "")
+            if lid in tombstoned:
+                t_tomb = ts_map.get(lid)
+                if not (t_tomb and _event_ts_ms(ev) < t_tomb):
+                    continue
         elif etype == EVENT_LEDGER_SCOPE_MIGRATE:
-            if payload.get("ledger_id", "") in tombstoned:
-                continue
+            lid = payload.get("ledger_id", "")
+            if lid in tombstoned:
+                # 🔴 批 Y · Y1a（2026-09-23）：迁移现在也是时间轴事件（见 `switch_timeline`）。
+                # 墓碑前的迁移与墓碑前的切入同理**原样保留**，dst scope 记进待合成集合——
+                # 丢掉它会让 Global 窗口越过迁移时刻一直延到墓碑、项目键上的那段窗口整段消失
+                # （换了个受害者，MQ-L15 同型）。墓碑时刻未知 / 迁移晚于墓碑 ⇒ 丢弃（旧行为）。
+                t_tomb = ts_map.get(lid)
+                agent = payload.get("agent_id", "")
+                if not (t_tomb and agent and _event_ts_ms(ev) < t_tomb):
+                    continue
+                from .ledger_runtime import activation_scope  # 循环导入：延迟到调用点
+                kept_switch_scopes.setdefault(lid, set()).add(
+                    activation_scope(agent, payload.get("to_project", "")))
         elif etype == EVENT_LEDGER_SWITCH:
-            if payload.get("to_ledger_id", "") in tombstoned:
-                ev = {**ev, "payload": {**payload, "to_ledger_id": ""}}
+            to = payload.get("to_ledger_id", "")
+            if to in tombstoned:
+                t_tomb = ts_map.get(to)
+                agent = payload.get("agent_id", "")
+                if t_tomb and agent and _event_ts_ms(ev) < t_tomb:
+                    from .ledger_runtime import activation_scope  # 循环导入：延迟到调用点
+                    kept_switch_scopes.setdefault(to, set()).add(
+                        activation_scope(agent, payload.get("project_id", "")))
+                else:
+                    ev = {**ev, "payload": {**payload, "to_ledger_id": ""}}
         out.append(ev)
+    if not kept_switch_scopes:
+        return out
+    # 合成「墓碑时刻切到空」：只对那一刻仍激活着该账本的 scope。
+    timeline = switch_timeline(out)
+    synthesized: list[dict] = []
+    for lid, scopes in kept_switch_scopes.items():
+        t_tomb = ts_map[lid]
+        for scope in sorted(scopes):
+            if ledger_active_at(timeline, scope, t_tomb) != lid:
+                continue
+            from .ledger_runtime import split_scope
+            agent, project = split_scope(scope)
+            # ts 用 datetime：`_event_ts_ms` 对裸数值按量级猜秒/毫秒，datetime 无歧义。
+            from datetime import UTC as _UTC
+            from datetime import datetime as _dt
+            synthesized.append({
+                "type": EVENT_LEDGER_SWITCH, "ts": _dt.fromtimestamp(t_tomb / 1000.0, _UTC),
+                "payload": {"to_ledger_id": "", "agent_id": agent,
+                            "project_id": "" if project in ("", "Global") else project,
+                            "reason": "ledger_tombstone", "from_ledger_id": lid},
+            })
+    if not synthesized:
+        return out
+    # 按 ts 插回：last-write-wins 的重放靠顺序，合成事件必须排在它之前的真实事件之后、
+    # 之后的真实事件之前（否则墓碑之后切到另一本账本的绑定会被它 pop 掉）。
+    import bisect
+    ts_list = [_event_ts_ms(e) for e in out]
+    for sev in sorted(synthesized, key=_event_ts_ms):
+        t = _event_ts_ms(sev)
+        idx = bisect.bisect_right(ts_list, t)
+        out.insert(idx, sev)
+        ts_list.insert(idx, t)
+    return out
+
+
+def ledger_activation_windows(
+    timeline: dict[str, list[tuple[float, str]]], ledger_id: str, *,
+    until_ms: float | None = None,
+) -> dict[str, list[tuple[float, float | None]]]:
+    """某本账本在各 scope 上的**激活窗口** `{scope: [(start_ms, end_ms|None), …]}`。
+
+    窗口 = 从切入它到下一次切换（含合成的「切到空」）；最后一段若没有后续切换，
+    `end_ms=None`（仍激活）或 `until_ms`（调用方给的截止，如"现在"）。
+    消费方：`bladex ledger tombstone --with-memory`（拍板 0.3.0-(2)）按窗口给源轮次打
+    TURN 墓碑；仪器（R1b / D1-B）按窗口取 fact。**与 `ledger_active_at` 同一条时间轴**，
+    不另起判据。
+    """
+    out: dict[str, list[tuple[float, float | None]]] = {}
+    for scope, seq in timeline.items():
+        windows: list[tuple[float, float | None]] = []
+        start: float | None = None
+        for ts, lid in seq:
+            if lid == ledger_id and start is None:
+                start = ts
+            elif lid != ledger_id and start is not None:
+                windows.append((start, ts))
+                start = None
+        if start is not None:
+            windows.append((start, until_ms))
+        if windows:
+            out[scope] = windows
     return out
 
 
@@ -728,6 +942,32 @@ def replay_ledger_events(
                 if bindings.get(src) == lid:
                     bindings.pop(src, None)
                 bindings[dst] = lid
+        elif etype in LEDGER_LIFECYCLE_EVENTS:
+            # 批 Z · Z3：与运行时 `AgencyRuntime.close_ledger / reopen_ledger` 同一变换
+            # （`close_ledger` / `reopen_ledger`），重放 = 运行时。
+            lid = payload.get("ledger_id", "")
+            led = pool.get(lid)
+            if led is None:
+                logger.warning("ledger_replay_lifecycle_unknown type=%s ledger=%s", etype, lid)
+                continue
+            if etype == EVENT_LEDGER_REOPEN:
+                pool[lid] = reopen_ledger(led)
+                continue
+            # E4（MQ-L98）/ 批 HO（MQ-L99）：谁关的 = 载荷写者会话与 agent（工具关本才有；admin / CLI 为空），
+            # 何时关的 = 事件时刻——与运行时 `lifecycle_close` 写进池里的值同源。
+            _closed_ms = _event_ts_ms(ev)
+            pool[lid] = close_ledger(
+                led,
+                superseded_by=(payload.get("superseded_by", "")
+                               if etype == EVENT_LEDGER_SUPERSEDE else ""),
+                closed_by_session=str(payload.get("session_id", "") or ""),
+                closed_by_agent=str(payload.get("agent_id", "") or ""),
+                closed_at=(datetime.fromtimestamp(_closed_ms / 1000.0, UTC).isoformat(timespec="seconds")
+                           if _closed_ms > 0 else ""))
+            # 关本 = 解除它在每个 scope 上的激活（与 `ActivationTable.forget_ledger` 同语义：
+            # 该 scope 变成无激活账本，**不回退**到上一本——MQ-L15 同型）。
+            for scope in [s for s, b in bindings.items() if b == lid]:
+                bindings.pop(scope, None)
     return (pool, bindings)
 
 
@@ -742,8 +982,16 @@ def binding_sessions(events: list[dict]) -> dict[str, str]:
     这是注入面的独立消费者。
     """
     out: dict[str, str] = {}
+    bound: dict[str, str] = {}   # scope → ledger_id（只为关本时找得到该解除哪些 scope）
     for ev in events:
         etype = ev.get("type", "")
+        if etype in _RELEASING_EVENTS:
+            # 批 Z · Z3：关本解除绑定 ⇒ 来源会话随之作废（与 `replay_ledger_events` 同步）。
+            lid = (ev.get("payload") or {}).get("ledger_id", "")
+            for scope in [s for s, b in bound.items() if b == lid]:
+                bound.pop(scope, None)
+                out.pop(scope, None)
+            continue
         if etype == EVENT_LEDGER_SCOPE_MIGRATE:
             payload = ev.get("payload") or {}
             agent = payload.get("agent_id", "")
@@ -751,8 +999,11 @@ def binding_sessions(events: list[dict]) -> dict[str, str]:
                 from .ledger_runtime import activation_scope
                 # 搬走后 src 来源作废；dst 来源**有意不设**——迁移不是本会话
                 # 的切换动作，MQ-L28 gate 对未知来源按继承保守处理（weak 不注）。
-                out.pop(activation_scope(
-                    agent, payload.get("from_project", "")), None)
+                src = activation_scope(agent, payload.get("from_project", ""))
+                out.pop(src, None)
+                lid = bound.pop(src, "") or payload.get("ledger_id", "")
+                if lid:
+                    bound[activation_scope(agent, payload.get("to_project", ""))] = lid
             continue
         if etype != EVENT_LEDGER_SWITCH:
             continue
@@ -760,46 +1011,15 @@ def binding_sessions(events: list[dict]) -> dict[str, str]:
         to = payload.get("to_ledger_id", "")
         agent = payload.get("agent_id", "")
         sid = payload.get("session_id", "")
-        if to and agent and sid:
+        if agent:
             from .ledger_runtime import activation_scope
-            out[activation_scope(agent, payload.get("project_id", ""))] = sid
-    return out
-
-
-def binding_switch_turns(events: list[dict]) -> dict[str, tuple[str, int]]:
-    """事件流 → **scope → (session_id, user_turn)**：最近一次落定切换的轮位
-    （与 `binding_sessions` 同形态 last-wins；批 E E0.2，MQ-L44 根治）。
-
-    消费者 = `ActivationTable.restore(switch_turns=)`：防抖基点随重启恢复。
-    历史 `LEDGER_SWITCH` 事件**没有 `turn_index` 字段** ⇒ 该 scope 不恢复（= 首次切换
-    不判防抖，宽松方向只漏不误）；`apply_ledger_tombstones` 改写成"切到空"的事件
-    与 scope 迁移都清掉基点——基点描述的是"最近一次切到**它**"，账本没了就悬空。
-    """
-    out: dict[str, tuple[str, int]] = {}
-    for ev in events:
-        etype = ev.get("type", "")
-        payload = ev.get("payload") or {}
-        agent = payload.get("agent_id", "")
-        if not agent:
-            continue
-        from .ledger_runtime import activation_scope  # 循环导入：延迟到调用点
-        if etype == EVENT_LEDGER_SCOPE_MIGRATE:
-            out.pop(activation_scope(agent, payload.get("from_project", "")), None)
-            continue
-        if etype != EVENT_LEDGER_SWITCH:
-            continue
-        scope = activation_scope(agent, payload.get("project_id", ""))
-        to = payload.get("to_ledger_id", "")
-        if not to:
-            out.pop(scope, None)
-            continue
-        if "turn_index" not in payload or not payload.get("session_id", ""):
-            out.pop(scope, None)          # 无参照系的落定：不留半个基点
-            continue
-        try:
-            out[scope] = (str(payload["session_id"]), int(payload["turn_index"]))
-        except (TypeError, ValueError):
-            out.pop(scope, None)
+            scope = activation_scope(agent, payload.get("project_id", ""))
+            if to:
+                bound[scope] = to
+            else:
+                bound.pop(scope, None)
+            if to and sid:
+                out[scope] = sid
     return out
 
 
@@ -821,7 +1041,99 @@ def _event_ts_ms(ev: dict) -> float:
     return v * 1000.0 if v < 1e11 else v
 
 
-def switch_timeline(events: list[dict]) -> dict[str, list[tuple[float, str]]]:
+@dataclass
+class DoneSpan:
+    """一段「账本自述完结」区间（批 Z · Z3.2 / Y1b）：`(start_ms, end_ms]` 内锚层视为窗口暂停。
+
+    - **开**：某次写入（create / update / user_edit，**正文有变化**）之后该本 `ledger_is_done`；
+    - **关**：之后某次写入让它不再是完结形态（Open 或 Next 重新非空），或**有人显式切回它**
+      （`ledger_switch` 的 `to` = 它、`from` ≠ 它）。`end_ms=None` = 至今未恢复。
+    - `writers` = 区间内写过这本的**用户轮** `(session_id, turn_index)`：这些用户轮里的轮次
+      照常锚（模型在这一轮里还在给它记账，完结写入所在的那一轮更是它的收尾）。
+      只有载荷带写者的事件（本批起的 `ledger_update`）才进得来；历史事件没有 ⇒ 空集 ⇒ 不豁免。
+    """
+
+    start_ms: float
+    end_ms: float | None = None
+    writers: set[tuple[str, int]] = field(default_factory=set)
+
+
+class SwitchTimeline(dict):
+    """`switch_timeline` 的返回值：`{scope: [(ts_ms, ledger_id), …]}`，**dict 语义逐字不变**
+    （`ledger_active_at` / `ledger_activation_windows` / 所有按 dict 读的仪器照旧），
+    另挂 `done_spans: {ledger_id: [DoneSpan, …]}` 供唯一消费点
+    `ledger_runtime.turn_active_ledger` 判「完结即停锚」。
+
+    🔴 为什么挂在时间轴上而不是给 `turn_active_ledger` 加一个必传参数：锚层消费方有
+    重建锚层 / 墓碑窗口 / 多支探针，漏传一处就是"同一轮两个答案"（原则 13 层 2）。
+    挂在 `switch_timeline` 的产物上，拿到时间轴就拿到了停锚——**没有第二条取法**。
+    手拼的普通 dict（如修前口径的探针）没有它 ⇒ 不停锚，正是"修前"的语义。
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.done_spans: dict[str, list[DoneSpan]] = {}
+
+
+def _writer_turn(payload: dict) -> tuple[str, int] | None:
+    """事件载荷里的写者用户轮 `(session_id, turn_index)`；缺任一 ⇒ None（缺数不猜）。"""
+    sid = str(payload.get("session_id", "") or "")
+    ti = payload.get("turn_index")
+    if not sid or isinstance(ti, bool) or not isinstance(ti, int):
+        return None
+    return (sid, ti)
+
+
+def _done_spans(events: list[dict]) -> dict[str, list[DoneSpan]]:
+    """事件流 → 每本账本的完结区间（纯函数；判据见 `DoneSpan`）。
+
+    只认**正文有变化**的写入：`bind-legacy-matters` 这类维护写（整本 dump、段不变）
+    不是"模型说做完了"，不许借它重新开一段停锚。按 ts 排序处理（`load_ledger_events`
+    会把墓碑账本的池事件补在最前面，顺序不可信）。
+    """
+    items: list[tuple[float, int, str, str, dict]] = []
+    for i, ev in enumerate(events):
+        etype = ev.get("type", "")
+        payload = ev.get("payload") or {}
+        if etype in (EVENT_LEDGER_CREATE, EVENT_LEDGER_UPDATE, EVENT_LEDGER_USER_EDIT):
+            lid = (payload.get("ledger") or {}).get("ledger_id", "")
+            if lid:
+                items.append((_event_ts_ms(ev), i, "write", lid, payload))
+        elif etype == EVENT_LEDGER_SWITCH:
+            to = payload.get("to_ledger_id", "")
+            if to and to != payload.get("from_ledger_id", ""):
+                items.append((_event_ts_ms(ev), i, "switch_in", to, payload))
+    items.sort(key=lambda it: (it[0], it[1]))
+    spans: dict[str, list[DoneSpan]] = {}
+    open_: dict[str, DoneSpan] = {}
+    last_sections: dict[str, object] = {}
+    for ts, _i, kind, lid, payload in items:
+        span = open_.get(lid)
+        if kind == "switch_in":
+            if span is not None:      # 显式切回 ⇒ 恢复
+                span.end_ms = ts
+                del open_[lid]
+            continue
+        dump = payload.get("ledger") or {}
+        sections = dump.get("sections") or {}
+        if lid in last_sections and last_sections[lid] == sections:
+            continue                  # 正文没变：不是一次写入
+        last_sections[lid] = sections
+        if ledger_is_done(dump):
+            if span is None:
+                span = DoneSpan(start_ms=ts)
+                open_[lid] = span
+                spans.setdefault(lid, []).append(span)
+            writer = _writer_turn(payload)
+            if writer is not None:
+                span.writers.add(writer)
+        elif span is not None:        # Open / Next 重新非空 ⇒ 恢复
+            span.end_ms = ts
+            del open_[lid]
+    return spans
+
+
+def switch_timeline(events: list[dict]) -> SwitchTimeline:
     """事件流 → **按 scope 的切换时间轴** `{scope: [(ts_ms, ledger_id), …]}`（升序）。
 
     🔴 为什么需要它（MQ-L15，2026-08-26 实测立）：`replay_ledger_events` 是
@@ -836,14 +1148,71 @@ def switch_timeline(events: list[dict]) -> dict[str, list[tuple[float, str]]]:
     （注入侧）是对的，两个消费方要的东西本就不同；合并成一个函数会让
     注入侧被迫处理它不需要的时间轴。事件顺序按调用方传入序，本函数只按
     `ts` 排序，不重排来源。
+
+    ## 「建本即激活」也是一个窗口起点（批 T0，2026-09-22）
+
+    建本这个动作本身就是"该 scope 从此刻起在这本账本上"。当前实现里
+    `ledger_create` 之后紧跟着一条切到新本的 switch（全新 id 不可能 noop；
+    批 Y1c 删防抖前它靠 `newly_created` 豁免才不被拦），所以两个起点**今天恒等**；但那是实现巧合，
+    不是结构保证——`agency_switch_unknown_ledger`（MQ-L80）这类形态一旦让
+    switch 发不出来，账本就只剩一条 create 事件、窗口整段消失（墓碑/清仓
+    因此打 0 条而报成功，正是 MQ-I22 的同族）。故把 CREATE 也纳入起点。
+
+    🔴 **只认载荷里带 scope 的 create**：`ledger_create` 的载荷历史上只有
+    `{"ledger": {...}}`，**没有 agent_id / project_id**（`last_writer` 也 85/85 为空，
+    MQ-L85）——没有 scope 就定不了在哪条轴上开窗，硬猜就是原则 13 层 4 要防的
+    "值不来自它声称的来源"。故：老事件（存量 85/85）一律跳过，读数上
+    **零变化**；生产侧自本批起在 create 载荷补 `agent_id` / `project_id`
+    （`agency/handlers.py`），新事件才有第二个起点。
+
+    ## 作用域迁移也是时间轴事件（批 Y · Y1a，2026-09-23）
+
+    `ledger_scope_migrate`（曾由 `agency/handlers._maybe_migrate_binding` 产生，
+    **批 Y · Y1d 2026-09-28 停产**，拍板 (30) / MQ-L93：全库 4 次迁移 3 次跨项目；
+    Hub 里既有的事件是当时运行时的真实行为，**本段重放一字不动**）在运行时把
+    `agent@Global` 的绑定**搬**到 `agent@project`（当时的 `ActivationTable.migrate`：src pop、
+    dst 设值）。此前本函数不认它 ⇒ 时间轴上 Global 那本一直激活到下一次 Global 切换、
+    项目键在第一次显式切换前**什么都没有**——而锚层终态兜底又把项目键的整段历史
+    （含迁移之前）塞给迁移来的那本（MQ-L15 反向形状）。现在重放成两条：
+    迁移时刻 src 切到空、dst 切到该账本 ⇒ **迁移之前的轮次查 Global、之后查项目键**。
+
+    ## 关本与完结停锚（批 Z · Z3，2026-09-24）
+
+    - `ledger_close` / `ledger_supersede`：在该本**那一刻激活着的每个 scope** 上插一条
+      「切到空」（与墓碑合成的空切换同形）——关本之后的轮次不再锚到它，绑定也随之解除
+      （`replay_ledger_events` 同步）。`ledger_reopen` 不进时间轴：重开不是激活。
+    - 完结停锚（Y1b）**不改时间轴条目**——绑定没有解除（那是 close 的事），只是锚层在
+      完结区间里不认它。区间挂在返回值的 `done_spans` 上（`SwitchTimeline`），唯一的
+      消费点是 `ledger_runtime.turn_active_ledger`。
     """
     from .ledger_runtime import activation_scope  # 循环导入：延迟到调用点
 
     timeline: dict[str, list[tuple[float, str]]] = {}
     for ev in events:
-        if ev.get("type", "") != EVENT_LEDGER_SWITCH:
-            continue
+        etype = ev.get("type", "")
         payload = ev.get("payload") or {}
+        if etype == EVENT_LEDGER_SCOPE_MIGRATE:
+            agent = payload.get("agent_id", "")
+            lid = payload.get("ledger_id", "")
+            if not agent or not lid:
+                continue
+            ts = _event_ts_ms(ev)
+            timeline.setdefault(activation_scope(agent, payload.get("from_project", "")),
+                                []).append((ts, ""))
+            timeline.setdefault(activation_scope(agent, payload.get("to_project", "")),
+                                []).append((ts, lid))
+            continue
+        if etype == EVENT_LEDGER_CREATE:
+            # 建本即激活：scope 只认载荷里显式带的那一对；缺 agent ⇒ 跳过（见 docstring）。
+            agent = payload.get("agent_id", "")
+            lid = (payload.get("ledger") or {}).get("ledger_id", "")
+            if not agent or not lid:
+                continue
+            scope = activation_scope(agent, payload.get("project_id", ""))
+            timeline.setdefault(scope, []).append((_event_ts_ms(ev), lid))
+            continue
+        if etype != EVENT_LEDGER_SWITCH:
+            continue
         to = payload.get("to_ledger_id", "")
         agent = payload.get("agent_id", "")
         # 🔴 **空 `to` 要保留**（2026-09-01）：它是 `apply_ledger_tombstones` 写的
@@ -856,7 +1225,28 @@ def switch_timeline(events: list[dict]) -> dict[str, list[tuple[float, str]]]:
         timeline.setdefault(scope, []).append((_event_ts_ms(ev), to))
     for seq in timeline.values():
         seq.sort(key=lambda it: it[0])
-    return timeline
+    # ── 批 Z · Z3：关本 = 该本**当时激活着的每个 scope** 切到空 ──
+    # 按 ts 顺序处理：后一次关本要看到前一次插进去的空切换。插在同刻条目之后
+    # （`bisect_right`）——同一毫秒里先切入、再关，结果是关。
+    import bisect
+    closes = sorted(
+        ((_event_ts_ms(ev), i, (ev.get("payload") or {}).get("ledger_id", ""))
+         for i, ev in enumerate(events) if ev.get("type", "") in _RELEASING_EVENTS),
+        key=lambda it: (it[0], it[1]))
+    for ts, _i, lid in closes:
+        if not lid:
+            continue
+        for seq in timeline.values():
+            idx = bisect.bisect_right([it[0] for it in seq], ts)
+            if idx > 0 and seq[idx - 1][1] == lid:
+                seq.insert(idx, (ts, ""))
+    out = SwitchTimeline(timeline)
+    # 完结停锚默认关（`BLADEX_LEDGER_DONE_PAUSE`，读数见 flags 注释）：关着 ⇒ 区间为空 ⇒
+    # `turn_active_ledger` 逐字等于 Z3 之前。开关读在这里（产出区间的唯一一处），
+    # 消费点不必各自再判一遍。
+    from .flags import flag_enabled
+    out.done_spans = _done_spans(events) if flag_enabled("BLADEX_LEDGER_DONE_PAUSE") else {}
+    return out
 
 
 def ledger_active_at(timeline: dict[str, list[tuple[float, str]]],

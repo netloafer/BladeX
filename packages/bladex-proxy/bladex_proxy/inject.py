@@ -30,12 +30,11 @@ from typing import Any
 
 import structlog
 from bladex_core.fact import Fact
-from bladex_core.task_unit import build_task_units
+from bladex_core.task_unit import build_task_units, turn_starts
 
 from bladex_proxy import metrics as metrics_mod
 from bladex_proxy.config import ProxyConfig
 from bladex_proxy.modules import module_enabled
-from bladex_proxy.pruning import apply_frozen_plan, prune_cold_context
 
 if True:  # runtime import
     # SUMMARY_OPEN/CLOSE 的唯一定义在 assembly.py（S3 2026-09-03 收掉本文件那份重复
@@ -105,47 +104,6 @@ def detect_required_capabilities(
 # ── ADR-0028 E4：Prompt Cache TTL 感知 ──────────────────────────────────────
 
 
-def _should_understand(inject_on: bool, auxiliary: bool, agent_id: str) -> bool:
-    """理解层要不要跑——同步 / 异步两个入口的**唯一判据**（F0.4，2026-09-06）。
-
-    S1 后 `_understand` 的唯一消费者是冷启相关性裁剪 `_prune_if_cold`，而它只在
-    `assembly_enabled_for(agent_id)`（`BLADEX_ASSEMBLY_AGENTS`，默认只 claude-code）之后才跑
-    ⇒ 非 CC 每轮白算一次理解层 + 一条 `query_understood` 日志。判据加上装配门：
-    非 CC 轮 `query_understood` 0 条，CC 轮不变。
-    """
-    return inject_on and not auxiliary and assembly_enabled_for(agent_id)
-
-
-def _understand(messages: list[dict], query: str, source: Any,  # noqa: ANN401
-                session_id: str) -> str:
-    """E6.1 Query 理解层：剥信封 + 短指代扩写 + 截断。
-
-    S1 后它的唯一消费者是冷启相关性裁剪（`_prune_if_cold` 用它 embed）——
-    词法通道 / Project 卡那两个消费者已随主动注入检索路径删除。
-
-    两种坏 query 的真实形态：
-      ① **信封当 query**——claude-code 末条 user 消息 p50 = 70,261 字符，
-         其中 98.21% 是 agent 内部协议信封。拿它去 embed，向量指的是信封的语义。
-      ② **短指代**——「这个怎么办」「继续」，8 个字符不到，召回等同随机。
-
-    返回用于检索的 query（失败时原样返回，绝不打死注入主路径）。
-    """
-    try:
-        # 单元切分 + open 单元取文 + 理解层，整条委托给 `retrieval_query`——
-        # 离线仪器（eval_consumption 的相关性轴）必须复现**同一条路**，
-        # 各写一份就是"筛子和被测系统各算各的"（MQ-S4 形态）。
-        from bladex_core.query_understanding import retrieval_query
-
-        q, identifiers = retrieval_query(messages, query)
-        if q != query:
-            logger.info("query_understood", raw_len=len(query), used_len=len(q),
-                        identifiers=len(identifiers))
-        return q
-    except Exception as e:  # noqa: BLE001 —— 理解层失败退回原 query
-        logger.warning("query_understanding_failed", error=str(e))
-        return query
-
-
 def _cache_registry():  # noqa: ANN202
     from bladex_proxy.cache_state import registry
     return registry()
@@ -196,42 +154,28 @@ def _cache_warm(session_id: str, prefix_changed: bool) -> bool:
     )
 
 
-def _prune_if_cold(
-    messages: list[dict],
-    source: Any,  # noqa: ANN401
-    query: str,
-    q_vec: list[float] | None,
-    session_id: str,
-) -> tuple[list[dict], dict | None]:
-    """冷启相关性裁剪（E4.3）。任何前置条件不满足 → 原样返回。"""
-    if not _ttl_enabled() or not messages:
-        return messages, None
-    index = getattr(source, "_index_for_hits", None)
-    if index is None:
-        return messages, None
-    embed_passage = getattr(index, "embed_passage", None)
-    if embed_passage is None:
-        return messages, None
-    if q_vec is None:
-        try:
-            q_vec = index.embed_query_vec(query)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("prune_query_embed_failed", error=str(e))
-            return messages, None
-    state = _cache_registry().ensure(session_id) if session_id else None
-    try:
-        return prune_cold_context(
-            messages, q_vec=q_vec, embed_passage=embed_passage, state=state,
-        )
-    except Exception as e:  # noqa: BLE001 —— 裁剪失败绝不打死请求
-        logger.warning("prune_failed", error=str(e))
-        return messages, None
+def _assembly_trigger(session_id: str, prefix_changed: bool, n_turns: int) -> dict[str, Any]:
+    """ADR-0033 §2.3 装配触发门：**轮次数 > `BLADEX_ASSEMBLY_MIN_UNITS` ∧ 上游 cache 已冷**（同一 session）。
+
+    冷 = 上一轮上游回报的 `cache_read_tokens == 0`（MQ-CA17 修订版；首轮 / 无读数 / agent 自压缩
+    也按冷），判定在 `cache_state.cold_reason`。🔴 **不看 TTL**：`_cache_warm`（TTL 反推）只留给
+    E4 冻结计划与路由粘性两个兜底消费方，不是这道门的依据。
+
+    返回 `{triggered, cold_reason, turns, min_units}`——落 `cap_info["trigger"]` 与 `assembly_done`
+    （`turns=` / `cold_reason=` / `gate=`），判据② 的回放以此为分子。
+    """
+    from bladex_core.flags import flag_number
+
+    min_units = int(flag_number("BLADEX_ASSEMBLY_MIN_UNITS"))
+    reason = _cache_registry().cold_reason(session_id, prefix_changed=prefix_changed)
+    return {"triggered": bool(reason) and n_turns > min_units, "cold_reason": reason,
+            "turns": n_turns, "min_units": min_units}
 
 
 class InjectionSource:
     """注入源：**只注硬规则**（2026-09-03 S1 起）。
 
-    `index` 仍收——冷启相关性裁剪（`_prune_if_cold`，ADR-0028 E4.3）要用它 embed。
+    `index` 仍收——ADR-0033 冷轮复核（`_review_cold_round` → `assembly_review`）用它 embed。
     `last_facts` / `last_facts_wide` / `last_exposure_filtered` 是 server 侧的既有
     读点（路由 facts / L2 摘要复用 / T7 指标），S1 后恒为空——与 08-30 拍板后
     `_index_recall_on()=False` 时的 live 形态逐字相同。
@@ -240,7 +184,7 @@ class InjectionSource:
     def __init__(
         self,
         hard_rules: list[str] | None = None,
-        index: Any | None = None,  # noqa: ANN401  # MemoryIndex，可选（只供冷启裁剪 embed）
+        index: Any | None = None,  # noqa: ANN401  # MemoryIndex，可选（只供装配冷轮复核 embed）
         top_k: int = 10,
         min_relevance: float | None = None,
         retrieval_top_k: int | None = None,
@@ -464,9 +408,8 @@ def do_inject(
     # 模块自己的开关管）、task_units 写侧认知照常——关掉注入不许连带废掉
     # 记忆写入质量（与 ADR-0024 §4.3 装配解耦同一条理由）。
     inject_on = module_enabled("inject")
-    # ADR-0028 E6.1：检索用的 query 先过理解层（原 query 不改，只影响召回）
-    if _should_understand(inject_on, auxiliary, agent_id):
-        query = _understand(messages, query, source, session_id)
+    # （ADR-0028 E6.1 理解层 `_understand` 已于批 U · U1.4 删除：S1 后它唯一的消费者是
+    #  E4.3 冷启相关性裁剪 `_prune_if_cold`，该路径并入 ADR-0033 复核后理解层成了孤儿。）
 
     if not inject_on:
         facts = []
@@ -507,7 +450,7 @@ def do_inject(
     # CAP: 上下文感知压缩（ADR-0016），在注入前压缩旧历史
     cleaned, cap_info = _apply_cap(
         cleaned, assembler, wide_facts, prefix_changed, session_id=session_id,
-        source=source, query=query, agent_id=agent_id,
+        agent_id=agent_id,
     )
 
     # ADR-0024 T1：单元化是**认知**、降解是**改写**，两者解耦——
@@ -528,29 +471,7 @@ def do_inject(
     # `ReconstructionRecord.clarify_text` 字段保留（schema 不动），恒为空。
     clarify_text = ""
 
-    # U2/U9：reconstruction 记录（A/B 层降解决策 + B 指纹 + C 澄清 → 落 Memory Hub 审计，
-    # Memory Index 蒸馏永不读它——G3/I5，见 test_index_never_consumes_reconstruction）。
-    _recon = None
-    _prune = cap_info.get("prune") or {}
-    _pruned_units = list(_prune.get("pruned") or [])
-    if cap_info.get("degrade_plan") or clarify_text or cap_info.get("b_layer") or _pruned_units:
-        _recon = {
-            "layer": ("A" + ("B" if cap_info.get("b_layer") else "")
-                      + ("C" if clarify_text else "") + ("P" if _pruned_units else "")),
-            "degrade_plan": {int(k): v for k, v in (cap_info.get("degrade_plan") or {}).items()},
-            "fingerprint": {"terms": list(cap_info.get("b_fingerprint") or [])},
-            "clarify_text": clarify_text,
-        }
-        if _pruned_units:
-            # ADR-0028 §3 约束4：裁剪决策整体落 reconstruction 审计，可回放可解释。
-            _recon["prune"] = {
-                "pruned": _pruned_units,
-                "scores": _prune.get("scores", {}),
-                "target": _prune.get("target", 0),
-                "kept_chars": _prune.get("kept_chars", 0),
-                "chars_before": _prune.get("chars_before", 0),
-            }
-    cap_info["reconstruction"] = _recon
+    cap_info["reconstruction"] = _build_reconstruction(cap_info, clarify_text)
 
     new_messages, injected_text = inject_memory(
         cleaned, facts, config.inject_max_chars,
@@ -564,6 +485,79 @@ def do_inject(
     return new_messages, injected_text, elapsed_ms, route_facts, cap_info
 
 
+def _build_reconstruction(cap_info: dict, clarify_text: str) -> dict | None:
+    """U2：reconstruction 记录（A 层降解决策 + C 澄清（恒空）+ P 裁剪 + ADR-0033 复核判定）→ 落 Memory Hub
+    审计，Memory Index 蒸馏永不读它——G3/I5，见 test_index_never_consumes_reconstruction。
+    同步 / 异步两个入口共用（此前两份逐字副本）。
+
+    B 层已删（MQ-CA9 清账）：`layer` 不再可能含 "B"，`fingerprint` 不再写（schema 字段保留、恒空）。
+    批 U · U1.3：`verdicts`（逐单元判定，ADR-0033 §2.7 写穿 Hub）+ `review`（本轮复核摘要）。
+    """
+    prune = cap_info.get("prune") or {}
+    pruned_units = list(prune.get("pruned") or [])
+    verdicts = list(cap_info.get("verdicts") or [])
+    review = dict(cap_info.get("review") or {})
+    if not (cap_info.get("degrade_plan") or clarify_text or pruned_units or verdicts or review):
+        return None
+    recon: dict[str, Any] = {
+        "layer": ("A" + ("C" if clarify_text else "") + ("P" if pruned_units else "")),
+        "degrade_plan": {int(k): v for k, v in (cap_info.get("degrade_plan") or {}).items()},
+        "clarify_text": clarify_text,
+    }
+    if pruned_units:
+        # ADR-0028 §3 约束4：裁剪决策整体落 reconstruction 审计，可回放可解释。
+        recon["prune"] = {
+            "pruned": pruned_units,
+            "scores": prune.get("scores", {}),
+            "target": prune.get("target", 0),
+            "kept_chars": prune.get("kept_chars", 0),
+            "chars_before": prune.get("chars_before", 0),
+        }
+    if verdicts:
+        recon["verdicts"] = verdicts
+    if review:
+        recon["review"] = review
+    return recon
+
+
+def _review_summary(res: Any, trigger: dict) -> dict[str, Any]:  # noqa: ANN401  ReviewResult
+    return {"mode": res.mode, "candidates": res.candidates, "reviewed": res.reviewed,
+            "reused": res.reused, "gray": res.gray, "model_calls": res.model_calls,
+            "model_units": res.model_units, "timeout": res.timeout,
+            "elapsed_ms": round(res.elapsed_ms, 2), "trigger": dict(trigger)}
+
+
+async def _review_cold_round(
+    messages: list[dict],
+    session_id: str,
+    goal: Any,  # noqa: ANN401  assembly_review.GoalAnchor | None
+    source: Any,  # noqa: ANN401  InjectionSource（取 embedder）
+    verdict_loader: Any,  # noqa: ANN401  () -> dict | None（Hub 最近一条带判定的 reconstruction）
+) -> Any:  # noqa: ANN401  ReviewResult
+    """冷轮两级复核（ADR-0033 §2.4/§2.5/§2.7）。只在触发门打开的轮次调；热轮不进这里。
+
+    进程内缓存为空时先从 Hub 读回本会话最近的判定（重启可恢复），读取算进 embed 子预算。
+    """
+    from bladex_proxy import assembly_review as ar
+
+    cfg = ar.ReviewConfig.from_env()
+    st = ar.cache().session(session_id)
+    if verdict_loader is not None and not st.hydrated:
+        try:
+            loop = asyncio.get_running_loop()
+            rec = await asyncio.wait_for(loop.run_in_executor(None, verdict_loader),
+                                         timeout=cfg.embed_budget_ms / 1000)
+            n = ar.cache().hydrate(session_id, (rec or {}).get("verdicts") or [])
+            if n:
+                logger.info("assembly_review_hydrated", session_id=session_id[:16], verdicts=n)
+        except Exception as e:  # noqa: BLE001 —— 读不回就重新判，不打死请求
+            st.hydrated = True
+            logger.warning("assembly_review_hydrate_failed", error=str(e))
+    embedder = getattr(source, "_index_for_hits", None)
+    return await ar.review_units(messages, build_task_units(messages), session_id=session_id,
+                                 config=cfg, goal=goal, embedder=embedder)
+
+
 def _apply_cap(
     messages: list[dict],
     assembler: ContextAssembler | None,
@@ -571,114 +565,90 @@ def _apply_cap(
     prefix_changed: bool,
     session_id: str = "",
     *,
-    source: Any = None,  # noqa: ANN401  InjectionSource（取 embedder，冷启裁剪用）
-    query: str = "",
-    q_vec: list[float] | None = None,
     agent_id: str = "",  # MQ-CA3：只为 assembly_done 的归属维度透传，不参与任何判定
+    review: Any = None,  # noqa: ANN401  ReviewResult（异步入口在触发轮次先跑好传进来）
 ) -> tuple[list[dict], dict]:
-    """上下文装配（ADR-0019）+ Prompt Cache TTL 感知（ADR-0028 §2/§3 / E4）。
+    """上下文装配 = ADR-0033 裁法（批 U · U1.4）。`wide_facts` 保留签名兼容（S1 后恒空、不消费）。
 
-    L1 证据降解（closed 单元巨型 tool 结果 → 占位摘录）常开；
-    L2 单元摘要（条数/体积触发 → 最老单元换 Memory Index 摘要）承接原 CAP 语义。
+    - **触发轮**（`_assembly_trigger`：轮次数 > N ∧ 上一轮上游 cache 命中为 0）：按本轮复核判定
+      （`review`，异步入口先跑好）裁 `trimmed` 单元的 tool 结果，并把判定冻结给后续热轮。
+      同步入口没有事件循环跑复核 ⇒ 只记 `review.skipped=sync_entry`、沿用冻结判定。
+    - **非触发轮**（热轮 / 轮次不够）：原样重放冻结判定——不新增任何裁剪，前缀逐字稳定。
+    - 两级复核都关 ⇒ `reviewed=0`、不产判定 ⇒ 正文逐字不变（只观测，判据⑤）。
 
-    ADR-0028 E4 在其上加一道 **cache 温热门**：
-
-      - **温热**（同模型 + 未过 TTL + agent 没自己压缩过）→ 只跑 L1（内容纯函数、
-        前缀稳定）+ 原样复用上一轮冻结的 L2/裁剪计划，**禁止新增**任何降解/裁剪；
-      - **冷**（模型换了 / TTL 过期 / 首轮）→ 装配正常跑 + E4.3 相关性裁剪，
-        跑完把计划冻结起来给后续温热轮复用。
-
-    不触发时原样返回（走叠加模式）。assembler=None 或关闭也原样返回。
-    T4(ADR-0018 §4.4 C4): cap_info 供 Turn.decision_meta 记录
-    （triggered/summary_hash/kept_recent_n + ADR-0019 新增 evidence_degraded/units_dropped/chars_*）。
+    `assembly_done` 对开了装配的 agent **每轮都打**：`triggered`（门）/ `reviewed` / `trimmed` /
+    `turns` / `cold_reason`（判据②④⑤ 的读数面）。`cap_info["triggered"]` 仍是"本轮改没改正文"
+    （decision_meta `cap_triggered` 的既有语义），门的读数在 `cap_info["trigger"]`。
     """
     cap_info: dict[str, Any] = {
-        "triggered": False, "summary_hash": "", "kept_recent_n": 0,
+        "triggered": False,
+        # 🔴 `summary_hash` / `kept_recent_n` 两个键 **2026-09-18 退役**（MQ-CA14，拍板 (11)），
+        # 守卫 `test_ca14_summary_producer_guard.py`。
+        # `evidence_degraded` 键名保留（decision_meta / 读数面），ADR-0033 起数的是**被裁的 tool 条数**；
+        # `units_dropped` 恒 0（整单元替换已随 E4.3 冷启裁剪并入复核删除，键保留给读数面）。
         "evidence_degraded": 0, "units_dropped": 0,
         "chars_before": 0, "chars_after": 0,
         # ADR-0024 T1：由调用方在 _apply_cap 之后填（索引基 = 未剥离的 messages）。
-        # 放在这里保证 key 恒存在，下游 .get("units", []) 不必兜 None。
         "units": [],
-        # ADR-0028 E4：本轮 cache 判定与裁剪决策（落 Memory Hub reconstruction 审计）。
+        # `cache_warm` = TTL 口径的读数（`_cache_warm`，只作对照，不参与任何判定——ADR-0033 §2.3）；
+        # `prune` 恒 None（E4.3 已删，键保留给读数面）。
         "cache_warm": False, "prune": None,
+        # ADR-0033 §2.3 触发门读数（批 U · U1.2）。
+        "trigger": {},
     }
     if assembler is None or not assembler.enabled:
         return messages, cap_info
+    # 未开装配的 agent 也算一次：`assembly_done` 的 turns / cold_reason 是全 agent 的仪器
+    # （cap_info 仍与 assembler=None 路径逐字相同——那条不变式见 test_assembly_agent_gate）。
+    trigger = _assembly_trigger(session_id, prefix_changed, len(turn_starts(messages)))
     if not assembly_enabled_for(agent_id):
         # 2026-09-03 拍板 e（MQ-CA6）：装配只对 `BLADEX_ASSEMBLY_AGENTS` 清单内的
-        # agent 开；其余走与 `assembler=None` **逐字相同**的原样返回。仪器不关：
-        # `assembly_done` 照打（evidence_degraded=0、chars 前后相等），验收判据
-        # "非 CC evidence_degraded=0 ∧ chars_after/chars_before ≥ 0.95" 才有读数。
+        # agent 开；其余走与 `assembler=None` **逐字相同**的原样返回。仪器不关。
         _n = estimate_context_chars(messages)
         logger.info("assembly_done", evidence_degraded=0, units_dropped=0,
                     chars_before=_n, chars_after=_n,
                     msgs_before=len(messages), msgs_after=len(messages),
                     session_id=session_id, agent_id=agent_id,
-                    skipped="agent_not_enabled")
+                    skipped="agent_not_enabled",
+                    turns=trigger["turns"], cold_reason=trigger["cold_reason"],
+                    gate=trigger["triggered"])
         return messages, cap_info
 
-    warm = _cache_warm(session_id, prefix_changed)
-    cap_info["cache_warm"] = warm
-
-    try:
-        assembled, info = assembler.assemble(
-            messages, wide_facts, prefix_changed=prefix_changed, session_id=session_id,
-            allow_l2=not warm, agent_id=agent_id,
-        )
-    except TypeError:
-        # 旧签名的 assembler（测试替身）——退回不带新参数
-        try:
-            assembled, info = assembler.assemble(
-                messages, wide_facts, prefix_changed=prefix_changed, session_id=session_id,
-            )
-        except TypeError:
-            assembled, info = assembler.assemble(
-                messages, wide_facts, prefix_changed=prefix_changed)
-
-    if warm:
-        # 温热：原样复用冻结计划（不新增任何降解/裁剪）
-        plan = _cache_registry().frozen_plan(session_id)
-        assembled, touched = apply_frozen_plan(assembled, plan)
-        if touched:
-            info = dict(info)
-            info["changed"] = True
-            info["units_dropped"] = info.get("units_dropped", 0) + touched
-        logger.info("cache_warm_full_forward", session_id=session_id[:16],
-                    frozen_units=touched)
+    cap_info["trigger"] = trigger
+    cap_info["cache_warm"] = _cache_warm(session_id, prefix_changed)
+    reg = _cache_registry()
+    reviewed = 0
+    if trigger["triggered"] and review is not None:
+        # 冷轮：本轮判定（含会话内复用的 frozen）→ 裁；冻结给后续热轮原样重放
+        cap_info["review"] = _review_summary(review, trigger)
+        cap_info["verdicts"] = [v.as_record() for v in review.verdicts.values()]
+        verdicts = {k: (v.verdict, v.source) for k, v in review.verdicts.items()}
+        reg.freeze_plan(session_id, {"verdicts": {k: t for k, (t, _src) in verdicts.items()}})
+        reviewed = review.reviewed
     else:
-        # 冷启：允许相关性裁剪（cache 反正要重建，此时裁剪只赚不赔）
-        assembled, prune_decision = _prune_if_cold(assembled, source, query, q_vec, session_id)
-        cap_info["prune"] = prune_decision
-        if prune_decision and prune_decision.get("pruned"):
-            info = dict(info)
-            info["changed"] = True
-        _cache_registry().freeze_plan(session_id, {
-            "l2_summary_msg": info.get("l2_summary_msg"),
-            "l2_dropped_unit_keys": list(info.get("l2_dropped_unit_keys") or []),
-            "pruned_unit_keys": list((prune_decision or {}).get("pruned") or []),
-        })
-    cap_info["evidence_degraded"] = info.get("evidence_degraded", 0)
-    cap_info["units_dropped"] = info.get("units_dropped", 0)
-    cap_info["chars_before"] = info.get("chars_before", 0)
-    cap_info["chars_after"] = info.get("chars_after", 0)
-    # U2/U9：A/B 层降解决策 + B 层指纹（reconstruction 落 Memory Hub 的原料）
-    cap_info["degrade_plan"] = info.get("degrade_plan", {}) or {}
-    cap_info["b_fingerprint"] = info.get("b_fingerprint", []) or []
-    cap_info["b_layer"] = bool(info.get("b_layer", False))
-    if not info.get("changed"):
+        if trigger["triggered"]:
+            # 同步入口（仅测试 / 离线脚本）没有事件循环跑复核 ⇒ 只记"触发了但没复核"
+            cap_info["review"] = {"mode": "skipped", "skipped": "sync_entry", "reviewed": 0,
+                                  "trigger": dict(trigger)}
+        frozen = (reg.frozen_plan(session_id).get("verdicts") or {})
+        verdicts = {k: (t, "frozen") for k, t in frozen.items()}
+
+    chars_before = estimate_context_chars(messages)
+    assembled, plan, n_trim = assembler.trim(messages, verdicts)
+    chars_after = estimate_context_chars(assembled) if n_trim else chars_before
+    cap_info.update({"evidence_degraded": n_trim, "chars_before": chars_before,
+                     "chars_after": chars_after, "degrade_plan": plan})
+    logger.info("assembly_done", evidence_degraded=n_trim, units_dropped=0,
+                chars_before=chars_before, chars_after=chars_after,
+                msgs_before=len(messages), msgs_after=len(assembled),
+                session_id=session_id, agent_id=agent_id,
+                triggered=int(trigger["triggered"]), reviewed=reviewed, trimmed=n_trim,
+                turns=trigger["turns"], cold_reason=trigger["cold_reason"],
+                verdicts_applied=len(verdicts),
+                review_mode=(cap_info.get("review") or {}).get("mode", ""))
+    if not n_trim:
         return messages, cap_info
     cap_info["triggered"] = True
-    # 从装配结果反推 summary_hash + kept_recent_n（摘要消息含 SUMMARY_OPEN 标记）
-    import hashlib
-    summary_idx = -1
-    for i, m in enumerate(assembled):
-        c = m.get("content", "")
-        if isinstance(c, str) and SUMMARY_OPEN in c:
-            summary_idx = i
-            cap_info["summary_hash"] = hashlib.sha256(c.encode()).hexdigest()[:16]
-            break
-    if summary_idx >= 0:
-        cap_info["kept_recent_n"] = len(assembled) - summary_idx - 1
     return assembled, cap_info
 
 
@@ -695,6 +665,8 @@ async def do_inject_async(
     allowed_exposure: str = "public",
     session_id: str = "",
     agent_id: str = "",
+    goal: Any = None,  # noqa: ANN401  assembly_review.GoalAnchor | None（本会话激活账本的 Goal 锚点）
+    verdict_loader: Any = None,  # noqa: ANN401  () -> dict | None（Hub 读回判定，重启恢复）
 ) -> tuple[list[dict], str, float, list[Fact], dict]:
     """异步注入流程：检索进线程池 + 真超时降级（F3，ADR-0008 §6.2）。
 
@@ -713,9 +685,8 @@ async def do_inject_async(
     # V-A3：inject 模块开关（与同步 do_inject 同一道门——两个入口一个判据，
     # 语义见 do_inject 内注释；测试 test_module_inject_gate.py 两个入口都钉）。
     inject_on = module_enabled("inject")
-    # ADR-0028 E6.1：检索用的 query 先过理解层（原 query 不改，只影响召回）
-    if _should_understand(inject_on, auxiliary, agent_id):
-        query = _understand(messages, query, source, session_id)
+    # （ADR-0028 E6.1 理解层 `_understand` 已于批 U · U1.4 删除：S1 后它唯一的消费者是
+    #  E4.3 冷启相关性裁剪 `_prune_if_cold`，该路径并入 ADR-0033 复核后理解层成了孤儿。）
 
     if not inject_on:
         facts = []
@@ -765,10 +736,20 @@ async def do_inject_async(
             injected_ids = []
             injected_matter_ids = []
 
+    # ADR-0033（批 U · U1.3）：触发门打开的冷轮先跑两级复核（异步：embed 进线程池、模型经
+    # Router 网关），判定交 `_apply_cap` 落 reconstruction。热轮 / 未开装配的 agent 不进这里。
+    review = None
+    if (assembler is not None and assembler.enabled and assembly_enabled_for(agent_id)
+            and _assembly_trigger(session_id, prefix_changed, len(turn_starts(cleaned)))["triggered"]):
+        try:
+            review = await _review_cold_round(cleaned, session_id, goal, source, verdict_loader)
+        except Exception as e:  # noqa: BLE001 —— 复核失败绝不打死请求（按未复核处理）
+            logger.warning("assembly_review_failed", error=str(e), session_id=session_id[:16])
+
     # CAP: 上下文感知压缩（ADR-0016），在注入前压缩旧历史
     cleaned, cap_info = _apply_cap(
         cleaned, assembler, wide_facts, prefix_changed, session_id=session_id,
-        source=source, query=query, agent_id=agent_id,
+        agent_id=agent_id, review=review,
     )
 
     # ADR-0024 T1：单元化是**认知**、降解是**改写**，两者解耦——
@@ -789,29 +770,7 @@ async def do_inject_async(
     # `ReconstructionRecord.clarify_text` 字段保留（schema 不动），恒为空。
     clarify_text = ""
 
-    # U2/U9：reconstruction 记录（A/B 层降解决策 + B 指纹 + C 澄清 → 落 Memory Hub 审计，
-    # Memory Index 蒸馏永不读它——G3/I5，见 test_index_never_consumes_reconstruction）。
-    _recon = None
-    _prune = cap_info.get("prune") or {}
-    _pruned_units = list(_prune.get("pruned") or [])
-    if cap_info.get("degrade_plan") or clarify_text or cap_info.get("b_layer") or _pruned_units:
-        _recon = {
-            "layer": ("A" + ("B" if cap_info.get("b_layer") else "")
-                      + ("C" if clarify_text else "") + ("P" if _pruned_units else "")),
-            "degrade_plan": {int(k): v for k, v in (cap_info.get("degrade_plan") or {}).items()},
-            "fingerprint": {"terms": list(cap_info.get("b_fingerprint") or [])},
-            "clarify_text": clarify_text,
-        }
-        if _pruned_units:
-            # ADR-0028 §3 约束4：裁剪决策整体落 reconstruction 审计，可回放可解释。
-            _recon["prune"] = {
-                "pruned": _pruned_units,
-                "scores": _prune.get("scores", {}),
-                "target": _prune.get("target", 0),
-                "kept_chars": _prune.get("kept_chars", 0),
-                "chars_before": _prune.get("chars_before", 0),
-            }
-    cap_info["reconstruction"] = _recon
+    cap_info["reconstruction"] = _build_reconstruction(cap_info, clarify_text)
 
     new_messages, injected_text = inject_memory(
         cleaned, facts, config.inject_max_chars,

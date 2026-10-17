@@ -259,10 +259,15 @@ def main() -> int:  # pragma: no cover —— 入口点（env 读取只在这里
     from bladex_proxy.embedding import build_embedder
 
     ap = argparse.ArgumentParser(description="BladeX embedding module (V-A6)")
+    ap.add_argument("--bladex-home", default="",
+                    help="deployment root for this server (passed by `bladex start`; "
+                          "empty = BLADEX_HOME / config discovery)")
     ap.add_argument("--transport", default="", help="uds|tcp（空=启动期自动决断）")
     ap.add_argument("--address", default="", help="socket 路径或 host:port")
     ap.add_argument("--bulk-slice", type=int, default=0)
     args = ap.parse_args()
+    if args.bladex_home:
+        os.environ["BLADEX_HOME"] = os.path.abspath(os.path.expanduser(args.bladex_home))
 
     decision = embed_transport.resolve(explicit=args.transport,
                                        explicit_address=args.address)
@@ -273,11 +278,16 @@ def main() -> int:  # pragma: no cover —— 入口点（env 读取只在这里
                      hint="transport resolved to 'local'; the module has nothing to serve")
         return 2
 
-    # 🔴 **服务端必须真加载本地模型**：它就是那份被共享的模型。
-    # `.env` 里 `BLADEX_EMBED_BACKEND=ipc` 是给**客户端**（proxy/consolidator）看的，
-    # 服务端读到它会去连自己（2026-08-25 live：日志出现 `embedder_backend
-    # backend=ipc role=proxy` + `embed_socket_missing`）——与 `backend=proxy` 档下
-    # "proxy 侧强制 local"同一形态、同一修法（embedding.py 已有先例）。
+    # 🔴 **服务端必须真加载本地模型**：它就是那份被共享的模型。`.env` 里的
+    # `BLADEX_EMBED_BACKEND` 是给**客户端**（proxy/consolidator）看的，服务端
+    # 对两档都必须拒绝、各有各的理由（G18.2，MQ-W9）：
+    #   - `ipc`：服务端读到会去**连自己**（2026-08-25 live：日志出现
+    #     `embedder_backend backend=ipc role=proxy` + `embed_socket_missing`）——
+    #     与 `backend=proxy` 档下"proxy 侧强制 local"同一形态、同一修法；
+    #   - `api`：向量来自线上供应商，本模块**无事可做**（起了也没有消费方）。
+    #     正常情况下走不到这里——`cli/lifecycle._embed_wanted()` 在 api 档下
+    #     根本不拉起本进程并打 `embed_module_skipped`；这里的强制 local 是
+    #     手动 `python -m bladex_proxy.embed_server` 时的兜底。
     os.environ["BLADEX_EMBED_BACKEND"] = "local"
     cfg = ProxyConfig()
     embedder = build_embedder(cfg, role="proxy")

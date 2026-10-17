@@ -241,10 +241,12 @@ IDS = [f"{p}·{'流式' if s else '非流式'}" for p, s in MATRIX]
 @pytest.mark.parametrize("proto,stream", MATRIX, ids=IDS)
 class TestNoneIsZeroDiff:
 
-    def test_identical_with_and_without_interception(self, monkeypatch,
+    def test_identical_with_and_without_interception(self, monkeypatch, fresh_redis_stream,
                                                      proto, stream):
         """🔴 三红线之 3 的直接表达：开关拦截，响应逐字相同。"""
         off = _normalize(_run(monkeypatch, proto, stream, interception=False))
+        # 两个独立 app，不是重启语义：第二个换一条 stream，免等 4 s 实例判活窗口（批 GS）
+        monkeypatch.setenv("BLADEX_REDIS_STREAM", fresh_redis_stream())
         on = _normalize(_run(monkeypatch, proto, stream, interception=True))
         assert on == off, (
             f"{proto}/{'stream' if stream else 'nonstream'}：拦截开启改变了 "

@@ -369,12 +369,27 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
             logger.debug("admin_status_disk_failed", error=str(e))
             disk = {}
 
+        # Memory Flash 新鲜度（MQ-F4 / F2）：daemon 写 `.flash_state.json`，这里只读文件。
+        # 没有读数时给 `available=False`，**不补 0**——lag 恒 0 得能证明是"真没新轮"。
+        flash_info: dict[str, Any] = {"available": False}
+        try:
+            from bladex_core.behavior import FLASH_LAG_BOUND_S
+            from bladex_core.flash import read_behavior_status, summarize_tree
+            st = read_behavior_status(_flash_dir())
+            flash_info["ledgers_projected"] = summarize_tree(_flash_dir()).ledgers
+            if st:
+                flash_info.update({"available": True, **st})
+                flash_info.setdefault("lag_bound_s", FLASH_LAG_BOUND_S)
+        except Exception as e:  # noqa: BLE001 —— status 不因 Flash 读数失败而 500
+            logger.debug("admin_status_flash_failed", error=str(e))
+
         from . import __version__
         return JSONResponse(content={
             "version": __version__,
             "pipeline": pipeline_info,
             "hub": hub_info,
             "index": index_info,
+            "flash": flash_info,
             "sync_job": sync_job,
             "consolidator": heartbeat,
             "routing": {"source_counts": route_sources},
@@ -428,6 +443,40 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
     ) -> JSONResponse:
         rules = list(getattr(cfg, "effective_hard_rules", None) or [])
         return JSONResponse(content={"hard_rules": rules, "count": len(rules)})
+
+    # ── GET /admin/behavior ────────────────────────────────────────
+
+    @app.get("/admin/behavior")
+    async def admin_behavior(  # noqa: ANN202
+        request: Request,
+        cfg: Any = admin_dep,
+    ) -> JSONResponse:
+        """行为画像卡（F3）：经唯一读取点 `behavior_read.read_behavior_card()`。
+
+        视图 = `dashboard_view()`（全字段：活跃时段 / 工具失败率 / variants）。
+        （模型面 `bladex_flash_read` 10-17 F5 判决退出注册，此后本端点是画像的唯一读者面。）
+        🔴 不在这里重算任何东西——dashboard 另算一遍就是给同一个读数造第二个口径。
+
+        空态返回 **200 + `available=false` + `reason`**，不是 404：端点自己是在的，
+        没有的是数据；404 会让 dashboard 把"daemon 没跑"显示成"这个功能不存在"。
+        """
+        from .behavior_read import read_behavior_card
+
+        card = read_behavior_card()
+        body: dict[str, Any] = {
+            "available": card.ok,
+            "reason": card.reason,
+            "path": card.path,
+            "age_s": card.age_s,
+            "mtime": card.mtime,
+            # `flash_lag_s` 等来自 `.flash_state.json` 的 `behavior_status` 段；
+            # 段不在 ⇒ 空 dict（**不补 0**：`read_behavior_status` 的契约，
+            # "没有读数"与 "lag=0" 必须分得开）。
+            "status": card.status,
+        }
+        if card.behavior is not None:
+            body["behavior"] = card.behavior.dashboard_view()
+        return JSONResponse(content=body)
 
     # ── GET /admin/facts ───────────────────────────────────────────
 
@@ -676,9 +725,13 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
         offset: int = 0,
         cfg: Any = admin_dep,
     ) -> JSONResponse:
-        """turn key 列表（Beta T20 回放页数据源）：scan_meta 惰性，按 ts 降序。
+        """turn key 列表（Beta T20 回放页数据源）：按 ts 降序。
 
         prefix 通常是 /admin/sessions 返回的会话前缀（user/agent/session/）。
+
+        MQ-A91（2026-09-29）：此前每次请求对全 Hub `scan_meta` 再排序（17.7k 轮 ≈ 4 s，
+        随 Hub 线性增长，把 `doctor --e2e` 的 3 s 默认超时读成 None）。改走
+        `MemoryHub.recent_turns`：进程内索引，结果与旧实现逐条相同，见其 docstring。
         """
         hub: MemoryHub | None = request.app.state.hub
         if hub is None:
@@ -686,13 +739,11 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
         limit = _clamp_limit(limit)
         offset = max(0, offset)
         try:
-            items = [{"key": k, "ts": ts} for k, ts in hub.scan_meta(prefix=prefix)]
+            page, total = hub.recent_turns(prefix, limit=limit, offset=offset)
         except Exception as e:  # noqa: BLE001
             return _err(500, f"turn scan failed: {e}", "storage_error")
-        items.sort(key=lambda x: x["ts"], reverse=True)
-        total = len(items)
         return JSONResponse(content={
-            "turns": items[offset:offset + limit],
+            "turns": [{"key": k, "ts": ts} for k, ts in page],
             "total": total, "limit": limit, "offset": offset,
         })
 

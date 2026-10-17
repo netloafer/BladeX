@@ -247,8 +247,10 @@ def test_injected_chars_counts_every_bladex_surface_not_only_hard_rules():
     assert 0 < rows[0]["inject_ratio"] < 1
 
 
-def test_warning_does_not_change_response_body():
+def test_warning_does_not_change_response_body(monkeypatch, fresh_redis_stream):
     a, _ = _run("chat", stream=False, finish_reason="length")
+    # 两个独立 app 做对照、不是重启语义：换一条 stream，免等 4 s 实例判活窗口（批 GS）
+    monkeypatch.setenv("BLADEX_REDIS_STREAM", fresh_redis_stream())
     b, _ = _run("chat", stream=False, finish_reason="stop")
     ja, jb = a.json(), b.json()
     assert ja["choices"][0]["message"]["content"] == jb["choices"][0]["message"]["content"]

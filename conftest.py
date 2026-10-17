@@ -53,6 +53,7 @@ _env(...))`，构造时才读 env，所以这里的覆盖对所有未显式传�
 from __future__ import annotations
 
 import atexit
+import itertools
 import os
 import shutil
 import tempfile
@@ -111,8 +112,22 @@ _ISOLATED = {
     # 的 `data/agent_registry.json`，用例之间互相污染（2026-08-26 当场踩到：
     # 一个全新用例启动时打出 `pending=4`，那 4 条是上一个用例留下的）。
     "BLADEX_AGENT_REGISTRY_CACHE": os.path.join(_TMP_ROOT, "agent_registry.json"),
+    # Z1.2（MQ-W18）：硬规则热加载会读**部署根**的 config/.env 与 Hub 里的
+    # `hard_rules_set`，并压过 `ProxyConfig(hard_rules=[...])` 的显式值——不关的话，
+    # 每个跑 lifespan 的用例拿到的硬规则随开发机当天的 .env 而变（与上面两条同型）。
+    # 热加载自己的用例显式传 `interval_s` / monkeypatch 这个变量。
+    "BLADEX_HARD_RULES_RELOAD_S": "0",
 }
 os.environ.update(_ISOLATED)
+
+# 🔴 批 Z1b（MQ-A77）：测试进程闸——任何测试连 live 默认 Redis stream 一律抛错。
+# 放模块属性不放 env：要拦的缺陷形状正是"夹具删光 BLADEX_* 环境变量"（见 pipeline_redis 注释）。
+try:
+    from bladex_proxy.storage import pipeline_redis as _pipeline_redis
+
+    _pipeline_redis.TEST_PROCESS_GUARD = True
+except ImportError:  # 只装了 bladex-core 的环境：没有 Redis 管线可守
+    pass
 
 # ── 🔴 测试面禁止联网下载 embedding 模型（2026-09-01，gate 挂死 driven）──
 #
@@ -221,6 +236,207 @@ def _reset_agent_registry():
         _ar.cache_path().unlink(missing_ok=True)
     except OSError:
         pass
+
+
+# ── 四、每个用例一条自己的 Redis stream（批 GS，2026-09-29，gate 变慢 driven）──
+#
+# 病灶：上面第二节给整个 run 只分了**一条** stream / 一个组 / 一个消费者名。
+# Z1.3（`612a20e`，09-23）起 lifespan 启动先跑 `InstanceClaim.acquire()`：登记已被
+# 上一个用例的 app 在关停时删掉 ⇒ 组里却有一个 4 s 内刚动过的消费者（就是上一个用例的
+# worker）⇒ 按"同一实例刚重启"的设计**等满一个判活窗口 `LIVENESS_WINDOW_S`（4 s）**
+# 再采样。生产上一次重启付一次；测试里每个起 TestClient 的用例都付一次。
+# 实测：同一文件 `test_admin_memory_classes.py` 在 `612a20e~1` 2.29 s、在 `612a20e`
+# 26.10 s（每例 0.03 s → 4.08 s）；HEAD 全量 5,532 例里 ≥2 s 的有 259 例、合计 1,279 s
+# （09-18 只有 16 例），gate 两段各吃一遍。
+#
+# 修法：共享的是测试之间的状态，就在测试之间断开——每个用例一条新 stream（消费组挂在
+# stream 之下、登记键由 stream 名派生，随之全新），用例结束删掉。**不改 `LIVENESS_WINDOW_S`**：用例内
+# 真的重启两次 app 的场景照旧走完整判活，那正是它要测的东西。
+# 顺带：此前每个 run 在 Redis 里留一条 `bladex:test:<run>` 从不回收（09-29 数到 1,547 条）。
+_STREAM_SEQ = itertools.count()
+_stream_janitor: list = []  # [redis.Redis | None]；首次用到时建，连不上就记 None 不再试
+
+
+def _drop_test_stream(stream: str) -> None:
+    """删掉本用例的 stream 及其实例登记键；Redis 不在 / 出错都不影响用例结论。"""
+    if not stream.startswith("bladex:test:"):  # 只清测试命名空间，别的一概不碰
+        return
+    if not _stream_janitor:
+        try:
+            import redis
+            from bladex_proxy.config import ProxyConfig
+
+            client = redis.Redis.from_url(ProxyConfig().redis_url,
+                                          socket_connect_timeout=0.5, socket_timeout=1.0)
+            client.ping()
+            _stream_janitor.append(client)
+        except Exception:  # noqa: BLE001 —— 没装 redis / 没起 Redis：没有东西要清
+            _stream_janitor.append(None)
+    client = _stream_janitor[0]
+    if client is None:
+        return
+    try:
+        client.delete(stream, f"bladex:instance:{stream}")
+    except Exception:  # noqa: BLE001 —— 清理失败不许把一个绿用例染红
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _per_test_redis_stream():
+    """本用例的 `BLADEX_REDIS_STREAM` = `bladex:test:t<序号>:<run id>`；结束后删 stream。
+
+    run id 仍是最后一段（`test_stream_and_group_unique_per_run` 按这个约定解析）。
+    排在 `_restore_bladex_env_baseline` 之后 setup、之前 teardown ⇒ 用例结束时
+    env 仍由那个 fixture 恢复成 run 级基线（守卫断言的基线不变）。
+    """
+    stream = _next_test_stream()
+    os.environ["BLADEX_REDIS_STREAM"] = stream
+    yield
+    _drop_test_stream(stream)
+
+
+def _next_test_stream() -> str:
+    return f"bladex:test:t{next(_STREAM_SEQ)}:{_RUN_ID}"
+
+
+@pytest.fixture
+def fresh_redis_stream():
+    """给"一个用例里先后起两个 app"的场景再分一条 stream（用例结束一并删除）。
+
+    用法：两次 `create_app` 之间 `monkeypatch.setenv("BLADEX_REDIS_STREAM", fresh_redis_stream())`。
+    第二个 app 若沿用第一个的 stream，会被当成"同一实例刚重启"而等满 4 s 判活窗口——
+    被测的若不是重启语义，这 4 s 就是纯等待。**真在测重启的用例别用它。**
+    """
+    made: list[str] = []
+
+    def _make() -> str:
+        made.append(_next_test_stream())
+        return made[-1]
+
+    yield _make
+    for stream in made:
+        _drop_test_stream(stream)
+
+
+# ── 五、测试不许连 live 的 embed 服务，默认也不加载真实模型（批 GS2 · MQ-A87，2026-09-29）──
+#
+# 病灶：tracked 的 `config/routing.toml` 写着 `[embedding] backend = "ipc"`，而 socket 地址由
+# `embed_transport.default_uds_path()` 经 `deployment.find_root()` 解析——主仓有 `config/.env`
+# ⇒ 解析到**部署根的 `run/embed.sock`，也就是 live 的 embed_server 进程**。每个跑 lifespan 的用例
+# 都会 `embedder.embed(["warmup"])` 打过去（修前实测：一次全量 507 次连接、243 个用例）。
+# 快照 / 公开树没有那个 socket ⇒ `embed_ipc_fallback_local` 在 pytest 进程里加载 e5-large
+# （RSS 15–16 GB）。**同一套测试，行为随"在哪个目录跑"而变，而且碰到了生产进程。**
+#
+# 修法（测试侧，产品代码不动）：
+#   1. 默认：`build_embedder` 在它的两个消费方模块上换成确定性假 embedder（不连 socket、不加载模型）。
+#      与 `test_responses_endpoint` / `test_sync_cli` 早就在用的 patch 点同一处；用例自己再 patch 的照旧后写者赢。
+#      测工厂本身的 `test_embedding_backends` 在模块顶层按名字导入了原函数，不受影响。
+#   2. 守卫：任何 IPC adapter 的地址解析到部署根 `run/embed.sock` ⇒ 抛错，并在用例 teardown
+#      `pytest.fail` 点名（lifespan 会把 embedder 构建异常降级吞掉，只抛不记就是静默）。
+#      与 Z1b「测试进程连 live Redis 命名空间即抛」同一形状。
+#   批 GS2 盘点：修前打 live 的 243 个用例换成**每次返回随机向量**的 embedder 仍全绿，关键词候选的
+#   30 个文件都用各自的 mock ——**没有用例依赖真语义**，所以不设"真模型"夹具。将来真要语义：
+#   直接构造 `FastEmbedAdapter(model_name=..., cache_dir=<仓库>/data/fastembed_cache)`（HF 离线，
+#   不走 `build_embedder` / IPC）。
+
+class LiveEmbedInTestError(RuntimeError):
+    """测试进程试图连部署根下的 live embed socket。"""
+
+
+def _live_embed_sockets() -> frozenset[str]:
+    """清洗前后都算：部署根（cwd 祖先 / `~/.bladex`）+ 被清洗掉的 `BLADEX_HOME`。"""
+    roots: set[str] = set()
+    try:
+        from bladex_proxy import deployment
+
+        found = deployment.find_root()
+        if found:
+            roots.add(found)
+        roots.add(deployment._expand(deployment.DEFAULT_HOME))
+    except ImportError:  # 只装了 bladex-core：没有 embed 客户端可守
+        pass
+    if SCRUBBED_ENV.get("BLADEX_HOME"):
+        roots.add(os.path.expanduser(SCRUBBED_ENV["BLADEX_HOME"]))
+    return frozenset(os.path.realpath(os.path.join(r, "run", "embed.sock")) for r in roots)
+
+
+LIVE_EMBED_SOCKETS = _live_embed_sockets()
+
+try:
+    from bladex_proxy import embed_client as _embed_client
+
+    # 🔴 状态挂在 embed_client 模块对象上、包装只做一次：有用例 `import conftest`（importlib 模式下
+    # 是第二份模块副本，会把本文件顶层再跑一遍）——若各副本各包一层、各记各的列表，最外层那份
+    # 记下的违规 pytest 这份 teardown 看不见，守卫就静默了。
+    if not hasattr(_embed_client, "_TEST_LIVE_VIOLATIONS"):
+        _embed_client._TEST_LIVE_VIOLATIONS = []
+        _embed_client._TEST_LIVE_SOCKETS = LIVE_EMBED_SOCKETS
+        _orig_ipc_init = _embed_client.IPCEmbedAdapter.__init__
+
+        def _guarded_ipc_init(self, transport, address, *a, **k):  # type: ignore[no-untyped-def]
+            if transport == "uds" and os.path.realpath(str(address)) in LIVE_EMBED_SOCKETS:
+                who = os.environ.get("PYTEST_CURRENT_TEST", "?").split(" ")[0]
+                _embed_client._TEST_LIVE_VIOLATIONS.append(f"{who} → {address}")
+                raise LiveEmbedInTestError(
+                    f"测试进程试图连 live embed socket {address}（{who}）。"
+                    "默认应走 conftest 的假 embedder（FakeEmbedder）。")
+            _orig_ipc_init(self, transport, address, *a, **k)
+
+        _embed_client.IPCEmbedAdapter.__init__ = _guarded_ipc_init
+    _live_embed_violations: list[str] = _embed_client._TEST_LIVE_VIOLATIONS
+except ImportError:
+    _live_embed_violations = []
+
+
+class FakeEmbedder:
+    """确定性假 embedder：词 + 字二元组哈希到 64 维、L2 归一化。
+
+    同一文本 ⇒ 同一向量；共享词越多余弦越高（够"去重 / 召回自身"类用例用，不冒充真语义）。
+    `hash()` 受 PYTHONHASHSEED 影响，这里用 blake2b 保证跨进程稳定。
+    """
+
+    DIM = 64
+    model_identity = "test:fake-hash-64"
+    model_name = "test/fake-hash-64"
+    available = True
+
+    def _vec(self, text: str) -> list[float]:
+        import hashlib
+        import math
+        import re
+
+        v = [0.0] * self.DIM
+        s = text.lower()
+        feats = re.findall(r"\w+", s) + [s[i:i + 2] for i in range(len(s) - 1)]
+        for f in feats or [s]:
+            h = int.from_bytes(hashlib.blake2b(f.encode(), digest_size=8).digest(), "big")
+            v[h % self.DIM] += 1.0 if (h >> 32) & 1 else -1.0
+        n = math.sqrt(sum(x * x for x in v)) or 1.0
+        return [x / n for x in v]
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [self._vec(t) for t in texts]
+
+    embed_passage = embed
+    embed_query = embed
+
+
+@pytest.fixture(autouse=True)
+def _default_fake_embedder(monkeypatch):
+    try:
+        from bladex_proxy import embedding as _emb
+        from bladex_proxy.server import app_factory as _af
+
+        fake = lambda cfg, role="proxy": FakeEmbedder()  # noqa: E731
+        monkeypatch.setattr(_emb, "build_embedder", fake)
+        monkeypatch.setattr(_af, "build_embedder", fake)
+    except ImportError:
+        pass
+    start = len(_live_embed_violations)
+    yield
+    if len(_live_embed_violations) > start:
+        hits = _live_embed_violations[start:]
+        pytest.fail(f"用例连了 live embed socket（{len(hits)} 次）：{hits[0]}", pytrace=False)
 
 
 @pytest.fixture

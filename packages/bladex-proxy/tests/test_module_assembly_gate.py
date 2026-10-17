@@ -1,8 +1,7 @@
-"""V-A3.2：assembly 模块开关（`BLADEX_MODULE_ASSEMBLY`）。
+"""V-A3.2 / 批 U · U1.4：装配只剩一个开关——模块开关 `BLADEX_MODULE_ASSEMBLY`。
 
-与既有细粒度开关 `BLADEX_ASSEMBLY_ENABLED` 是**与**关系：
-模块门 = 注册表单一真相源的粗粒度开关；细粒度 env 保留为兼容通道。
-两者默认都开 = 现状零回归；任一为关即关。
+细粒度 `BLADEX_ASSEMBLY_ENABLED` 与旧名 `BLADEX_CAP_ENABLED` 已于 2026-09-23 删除
+（与模块开关重复，ADR-0033 §2.8）：设了也不读——下面最后一条钉住"不读"。
 """
 
 from __future__ import annotations
@@ -10,22 +9,18 @@ from __future__ import annotations
 from bladex_proxy.assembly import AssemblyConfig
 
 
-def test_default_both_on(monkeypatch):
+def test_default_on(monkeypatch):
     monkeypatch.delenv("BLADEX_MODULE_ASSEMBLY", raising=False)
-    monkeypatch.delenv("BLADEX_ASSEMBLY_ENABLED", raising=False)
-    monkeypatch.delenv("BLADEX_CAP_ENABLED", raising=False)
     assert AssemblyConfig.from_env().enabled is True
 
 
-def test_module_switch_off_wins(monkeypatch):
+def test_module_switch_off(monkeypatch):
     monkeypatch.setenv("BLADEX_MODULE_ASSEMBLY", "0")
-    monkeypatch.setenv("BLADEX_ASSEMBLY_ENABLED", "true")
-    assert AssemblyConfig.from_env().enabled is False, \
-        "模块门关时，细粒度开也不许把装配打开"
+    assert AssemblyConfig.from_env().enabled is False
 
 
-def test_legacy_switch_off_still_respected(monkeypatch):
+def test_retired_fine_grained_switches_are_not_read(monkeypatch):
     monkeypatch.setenv("BLADEX_MODULE_ASSEMBLY", "1")
     monkeypatch.setenv("BLADEX_ASSEMBLY_ENABLED", "false")
-    assert AssemblyConfig.from_env().enabled is False, \
-        "细粒度关是既有回归通道，模块门开不许压过它"
+    monkeypatch.setenv("BLADEX_CAP_ENABLED", "false")
+    assert AssemblyConfig.from_env().enabled is True, "已删的旋钮不许被偷偷读回来"

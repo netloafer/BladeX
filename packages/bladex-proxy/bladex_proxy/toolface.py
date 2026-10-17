@@ -123,8 +123,8 @@ def resolve_ledger_tiers(raw: str = "") -> frozenset[str]:
     bad = tiers - set(LEDGER_TIER_NAMES)
     if bad:
         raise ValueError(
-            f"BLADEX_LEDGER_TIERS 含未知档位 {sorted(bad)}；"
-            f"可用：{list(LEDGER_TIER_NAMES)} 或 auto/all/none")
+            f"BLADEX_LEDGER_TIERS has unknown tiers {sorted(bad)}; "
+            f"allowed: {list(LEDGER_TIER_NAMES)} or auto/all/none")
     return frozenset(tiers)
 
 
@@ -411,8 +411,49 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                                        "a new independent task, even if another "
                                        "ledger is currently active.",
                     },
+                    # 🔴 批 Y · Y1c（MQ-L91）：轮数防抖改为**举证**。BladeX 对照本轮用户原话
+                    # （剥信封）校验它是不是真摘录，结果进 Hub `LEDGER_SWITCH.evidence_ok`。
+                    # **可选**、不进 required：观测阶段不给也照常切换——设成必填会让弱模型的
+                    # 工具调用直接失败，那本身就是一个新的误拦（守卫 test_switch_evidence.py）。
+                    "evidence": {
+                        "type": "string",
+                        "description": "when switching to an EXISTING ledger: copy the "
+                                       "words from the user's message in THIS turn "
+                                       "that show they moved to that task (verbatim, "
+                                       "a short phrase is enough). Not needed when "
+                                       "creating a new ledger.",
+                    },
                 },
                 "required": ["ledger_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bladex_ledger_close",
+            # 🔴 批 Z · Z3（README 承诺的 close / supersede；Z3.3 模型侧引导就是这一段）。
+            # 「何时关」写在顶层描述——与 update 的"完成 = 两次编辑"同理：决定调不调它的
+            # 那一刻读的是这一段。Y0：做完不关占第一红线错边 54 / 141（泰山 44 条 Verified
+            # 已答完 Open 却一直绑着，4.8–8.9h 后换题的轮次全被吸进去）。
+            # 措辞刻意短：新工具的 schema 本身就是一份注入（ADR-0029 加注入者举证）。
+            "description": "Close a finished ledger: when Verified answers the Goal "
+                           "and Open/Next are empty, or before moving to unrelated "
+                           "work. Never changes the Goal; switching back reopens it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ledger_id": {"type": "string", "description": "'' = the active one"},
+                    "superseded_by": {"type": "string",
+                                      "description": "ledger that continues this work"},
+                    # 拍板 (40)：关本举证，与 switch 的 evidence 同一套校验；**可选**、不进
+                    # required（设必填 = 拦截，守卫 test_e4_closed_recent_reopen.py）。
+                    "evidence": {
+                        "type": "string",
+                        "description": "the user's words in THIS turn saying it is done "
+                                       "or dropped (verbatim; omit if none).",
+                    },
+                },
             },
         },
     },
@@ -420,11 +461,21 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 
 TOOL_NAMES: tuple[str, ...] = tuple(t["function"]["name"] for t in TOOL_SCHEMAS)
 
+#: 工具面 schema 总长的注意力预算（字符，`json.dumps(schema, ensure_ascii=False)` 口径；ADR-0029）。
+#: **单一定义**——`test_toolface.py` 与 `test_f_b_batch_toolface.py` 两把尺都从这里读，
+#: 此前各写一份 8000，改一处漏一处（批 E · E4 撞上）。
+#: 8,000 → 8,200（2026-09-29，拍板 (40)）：`bladex_ledger_close` 加可选 `evidence`（+135），
+#: 换回来的是可机读的关本举证 `evidence_ok`（R3「关本对不对」此前只能人读 Hub 逐条判）。
+#: 再要加字，先说明它比它挤掉的上下文更值，再改这个数。
+TOOL_FACE_SCHEMA_BUDGET_CHARS = 8200
+
 #: 工具族（2026-08-30 Jason 拍板"按工具族拆"）。
 #:
 #: 砍掉 Memory Index 主动注入之后，工具面里装着两族取舍完全不同的东西：
 #:   memory —— `bladex_memory_search` 是模型取记忆的**唯一**通道，
 #:             对谁关掉就是让谁彻底没有记忆 ⇒ **始终注入**；
+#:             （F3 的 `bladex_flash_read` 曾同族，10-17 F5 判决退出注册——
+#:             观察窗 1,712 轮调用 0 次，画像只留 dashboard / `/admin/behavior`）；
 #:   ledger —— 账本读/改/切 + 首步指令，是"这件事需不需要账本"的策略，
 #:             用户可配（`BLADEX_LEDGER_TIERS`，默认 auto 不变）。
 #: 原来一刀切按档位注入，把这两族绑在一起——而 `BLADEX_LEDGER_TIERS` 的立卡
@@ -476,6 +527,20 @@ def anthropic_tool_schemas() -> list[dict[str, Any]]:
             for t in TOOL_SCHEMAS]
 
 
+def family_schema_chars(fmt: str = "openai") -> dict[str, int]:
+    """各工具族 schema 的字符数（`json.dumps(ensure_ascii=False)`，与 Z2.0 读数同口径）。
+
+    Z2.3 稳定层计划用：`AgencyRuntime.stable_sizes` 读它决定首轮裁不裁账本族 / 记忆族。
+    """
+    import json
+    ours = anthropic_tool_schemas() if fmt == "anthropic" else TOOL_SCHEMAS
+    out: dict[str, int] = {FAMILY_MEMORY: 0, FAMILY_LEDGER: 0}
+    for t in ours:
+        fam = tool_family(str((t.get("function", t)).get("name", "")))
+        out[fam] = out.get(fam, 0) + len(json.dumps(t, ensure_ascii=False))
+    return out
+
+
 # ── 注入（D3：追加末尾、不重排；会话首轮定格由调用方的稳定层机制保证）──────────
 
 def inject_tools(
@@ -486,8 +551,12 @@ def inject_tools(
     model_tier: str = "",
     ledger_allowed: bool | None = None,
     fmt: str = "openai",
+    memory_allowed: bool = True,
 ) -> tuple[list[dict], bool]:
     """把 bladex_* 工具定义追加进请求的 tools 数组。返回 (新列表, 是否注入)。
+
+    `memory_allowed`（批 Z · Z2.3）：记忆族本来无条件注入；只有"注入面按预算裁剪"走到
+    `TRIM_ORDER` 的最后一步（窗口连记忆工具都放不下）时才由 `AgencyRuntime` 传 False。
 
     不注的条件（任一满足）：aux 轮 / dsh 系 agent / 已注过（幂等）。
 
@@ -529,7 +598,9 @@ def inject_tools(
                  else bool(ledger_allowed))
 
     def _keep(name: str) -> bool:
-        return tool_family(name) == FAMILY_MEMORY or ledger_ok
+        if tool_family(name) == FAMILY_MEMORY:
+            return bool(memory_allowed)
+        return ledger_ok
 
     to_add = [t for t in ours
               if (nm := (t.get("function", t)).get("name")) not in existing_names

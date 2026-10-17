@@ -33,9 +33,22 @@ def _isolate_env(tmp_path: Path, monkeypatch, isolated_home):
     """隔离：cli.main 会把 cwd 下 config/.env 灌进 os.environ（且不回收）--
     在仓库根跑会吸入真实配置（同 test_cli_memory_matter 的坑）。"""
     monkeypatch.chdir(tmp_path)
+    # 🔴 批 Z1（MQ-A38）：删光之前先记下 conftest 的 Redis 命名空间隔离值，删完放回。
+    # 此前这里把它们一起删了 ⇒ 下面 `live_endpoint` 的 `create_app(ProxyConfig())` 回落默认值
+    # = live 的 `redis://127.0.0.1:6379/0` + `bladex:turns` + `bladex-workers` + `worker-1`，
+    # 每跑一次 gate 就在 live stream 上起一个 PipelineWorker（有流量时会把 live 轮次吞进
+    # 临时目录的 Hub）。Z1.3 的实例检测上线后它被当场拒绝，才暴露出来。
+    keep = {k: os.environ[k] for k in _KEEP_ISOLATION if k in os.environ}
     for k in list(os.environ):
         if k.startswith("BLADEX_"):
             monkeypatch.delenv(k, raising=False)
+    for k, v in keep.items():
+        monkeypatch.setenv(k, v)
+
+
+#: conftest 设的隔离值里，指向**本机共享资源**（live Redis）或会改变进程行为的那几个。
+_KEEP_ISOLATION = ("BLADEX_REDIS_STREAM", "BLADEX_REDIS_GROUP", "BLADEX_REDIS_CONSUMER",
+                   "BLADEX_HARD_RULES_RELOAD_S")
 
 
 class _Recorder:
@@ -271,7 +284,19 @@ def test_ledger_family_is_read_only(rec):
     # 2026-08-28 加 `doctor` 时当场变红，迫使加的人回来确认它确实只读。
     # `doctor` = 账本健康检查，只报告不修改（守卫见 test_cli_ledger_doctor.py
     # 的 `test_is_read_only`：全程只有 GET + 输出明写 "Nothing was changed"）。
-    assert set(command_names) <= {"list", "show", "doctor"}, command_names
+    # `tombstone`（2026-09-18 批 S · S3，拍板 0.3.0-(2)）：唯一的写动作，且**不是**账本正文的
+    # 写——它是用户对账本对象的删除（墓碑），作者边界不涉及；守卫见 test_cli_ledger_tombstone.py。
+    # `tombstone-memory`（2026-09-22 批 T0b 路径①，MQ-I23）：同族的第二个写动作——只清
+    # 该账本窗口的**派生记忆**，账本正文一字不动（作者边界同样不涉及）。它之所以不是
+    # `tombstone --with-memory` 的一个开关：那条命令的 404 语义是「不在活池」，而补清
+    # 记忆必须够得着**已墓碑**的账本；两个口径合进一个 404 就谁也读不出来。
+    # `close` / `reopen` / `supersede`（2026-09-24 批 Z · Z3，README 承诺的 close / supersede）：
+    # 账本**对象**的生命周期写——只动 `status` / `superseded_by`，Goal 与五段正文一字不碰
+    # （守卫见 test_ledger_lifecycle_z3.py / core test_ledger_lifecycle.py::test_close_never_touches_goal_or_sections），
+    # 与 tombstone 同理不涉及作者边界；且三者互为撤销（追加式事件，reopen 撤 close）。
+    assert set(command_names) <= {"list", "show", "doctor", "tombstone",
+                                  "tombstone-memory", "close", "reopen",
+                                  "supersede"}, command_names
     # 以及防御性断言：将来有人加写命令时，这里先炸。
     assert not (set(command_names) & set(write_verbs))
     # 全程只有 GET：跑一遍两个命令，录制桩里不允许出现非 GET。
@@ -322,7 +347,7 @@ def live_endpoint(monkeypatch):
     class _StubAgency:
         def __init__(self):
             self.pool = pool
-            self.activation = ActivationTable(debounce_turns=0)
+            self.activation = ActivationTable()
             self.activation.restore(bindings)
 
     with TestClient(app) as c:

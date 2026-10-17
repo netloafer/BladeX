@@ -35,6 +35,7 @@ from bladex_core.attribution import (
 )
 from bladex_core.consolidation_proxy import (
     EmbedderProtocol,
+    InRunNeighborSource,
     ProxyConsolidator,
     embed_passage_compat,
     embed_query_compat,
@@ -53,6 +54,7 @@ from bladex_core.matter import (
     MatterOrigin,
     MatterStatus,
 )
+from bladex_core.task_unit import index_unit_key as _index_unit_key
 from rocksdict import Rdict
 
 from bladex_proxy.models import (
@@ -363,7 +365,9 @@ def _goal_context(ledger: MemoryHub, ledger_key: str) -> tuple[str, str] | None:
         return None
     if turn is None:
         return None
-    turn_class, _rule = classify_turn_disposition(turn.request_messages)
+    turn_class, _rule = classify_turn_disposition(
+        turn.request_messages, agent_id=turn.identity.agent_id,
+        headers=turn.identity.request_headers)
     return turn_class, last_user_text(turn.request_messages)
 
 
@@ -783,6 +787,28 @@ def build_agent_claim_map(ledger: MemoryHub) -> dict[str, str]:
     return mapping
 
 
+
+class _LazyFactTombstones:
+    """fact 墓碑集合的惰性视图（Z4）：只在第一次 `in` 时扫一次 Hub 墓碑。
+
+    重放循环里绝大多数事件用不到它；fact_correct 才用——不为不用的东西付全表扫描。
+    """
+
+    def __init__(self, ledger: Any) -> None:
+        self._ledger = ledger
+        self._ids: set[str] | None = None
+
+    def __contains__(self, fact_id: object) -> bool:
+        if self._ids is None:
+            try:
+                self._ids = {
+                    t.target_key for _, t in self._ledger.scan_tombstones()
+                    if str(getattr(t.target_type, "value", t.target_type)) == "fact"}
+            except Exception as e:  # noqa: BLE001 —— 读不到墓碑 ⇒ 宁可不复活
+                logger.warning("index_correct_replay_tombstone_scan_failed", error=str(e))
+                return True
+        return fact_id in self._ids
+
 class MemoryIndex:
     """Memory Index 派生层：事实存储 + LanceDB 向量索引。
 
@@ -818,6 +844,11 @@ class MemoryIndex:
         self._catchup_throttle_s = catchup_throttle_s
         # ③ 上轮 rebuild 是否因 max_turns 截断（还有积压 -> 调用方应立即续跑不 sleep）
         self._last_rebuild_backlog = False
+        # MQ-W17：上轮扫描过筛的候选轮次数（consolidator 据此判"这一轮是不是空载"）。
+        # 🔴 纯读数，不参与任何判定——见 `last_rebuild_candidates` 的 docstring。
+        self._last_rebuild_candidates = 0
+        # MQ-I33：上轮 rebuild 是否被中断守卫明确中止。None = 正常完成（含空库 0 条）。
+        self._last_rebuild_abort_reason: str | None = None
         # MQ-R1：上次 facts 压缩的时刻（节流用，见 _COMPACT_MIN_INTERVAL_S）
         self._last_fact_compact_monotonic = 0.0
         # MQ-I15 ②：上次版本 vacuum 的时刻（节流理由同上——清理窗口内判据仍超阈值）
@@ -869,6 +900,8 @@ class MemoryIndex:
         self._rebuild_id: str = _dtm.now(_UTC).strftime("%Y%m%dT%H%M%S")
         # ANN 索引维护的最近一次尝试时刻（T8b B17：与"有没有新 turn"解耦）
         self._ann_last_maintain_ts: float = 0.0
+        # MQ-W19：上次 maintain_projects 重算**之后**的输入指纹（None = 本进程还没算过）
+        self._projects_inputs_fp: str | None = None
         self._distiller = distiller
         # ADR-0018 §3.2: L4 链接裁决器 + top-k 召回（注入后归属走五层链接）
         self._link_judge = link_judge
@@ -1395,8 +1428,8 @@ class MemoryIndex:
         """
         if rec.verdict not in TASKSTATE_VERDICTS:
             raise ValueError(
-                f"taskstate verdict 必须是 {TASKSTATE_VERDICTS} 之一，收到 {rec.verdict!r}"
-                " —— 封闭枚举，别把 L4 的 link:/none/uncertain 写进来（MS-17）")
+                f"taskstate verdict must be one of {TASKSTATE_VERDICTS}, got {rec.verdict!r}"
+                " -- a closed enum; L4 verdicts (link:/none/uncertain) do not belong here")
         seq = _ledger_entry_id()
         key = f"{_TASKSTATE_JUDGMENT_PREFIX}{rec.turn_key}/{seq}"
         db = self.meta_db
@@ -2500,13 +2533,69 @@ class MemoryIndex:
 
         空闲轮调用（与 ANN / lifecycle 同址）。识别②（tool 路径高频前缀）由
         `discover_project_from_paths` 在需要时补充；识别③是 CLI 手动。
-        返回 upsert 的 Project 数。
-        """
-        from bladex_core.project import Project, name_from_root, project_id_for
+        返回 upsert 的 Project 数（短路命中 = 0）。
 
+        MQ-W19（批 Q3C）：**输入没变就不重算**。重算（`_maintain_projects_recompute`）
+        每条 Matter 两次 `get_edges` 全库扫描，生产副本一次 57 s、占空载轮 83%，
+        而产出恒为同一个 Project。判据 = `_project_inputs_fingerprint()`：
+        重算读到的全部四类 meta 条目（fact / matter / edge / project）逐字节指纹，
+        上次重算**之后**记下；本轮相同 ⇒ 重算结果必然相同（它是这四类条目的
+        确定性函数，重算一次即到不动点），跳过。指纹进程内保存，进程重启先重算一次。
+        """
         self._ensure_meta_db()
         if self.meta_db is None or self._read_only:
             return 0
+        fp = self._project_inputs_fingerprint()
+        if self._projects_inputs_fp is not None and fp == self._projects_inputs_fp:
+            logger.info("index_projects_maintained", skipped=True,
+                        reason="inputs_unchanged", projects=0)
+            return 0
+        reason = "first_run" if self._projects_inputs_fp is None else "inputs_changed"
+        n = self._maintain_projects_recompute()
+        # 重算自己会写 project / edge（版本号、边的 created_at 都会变）⇒ 指纹取写之后的
+        self._projects_inputs_fp = self._project_inputs_fingerprint()
+        logger.info("index_projects_maintained", skipped=False, reason=reason, projects=n)
+        return n
+
+    # 重算读的全部条目前缀（MQ-W19 短路判据的完整输入清单）：
+    #   fact/    all_facts（规则文件根）+ get_fact（边指向的 file_ref 路径）
+    #   matter/  all_matters（id / title / summary）
+    #   edge/    get_edges（FACT 边 → 路径；PART_OF 边 → 归属）
+    #   project/ get_project（已有记录：name / languages 等保留字段）
+    # 其余输入只有代码常量（规则文件名表、UNASSIGNED_MATTER_ID）与纯函数
+    # （bladex_core.project 的 compose_* / languages_of / matter_belongs_to_project）。
+    _PROJECT_INPUT_PREFIXES: tuple[str, ...] = (
+        _FACT_PREFIX, _MATTER_PREFIX, _EDGE_PREFIX, _PROJECT_PREFIX)
+
+    def _project_inputs_fingerprint(self) -> str:
+        """`maintain_projects` 全部输入的逐字节指纹（按前缀 seek，出前缀即停）。
+
+        取整条 value 而非挑字段：宁可无关字段变了多算一次，也不许漏掉一个输入
+        让项目字段悄悄过期。生产副本 16k 条、约 27 MB，≈35 ms。
+        Index 的 meta key 全部以 bytes 写入（`f"...".encode()` / bytes 常量），
+        故 bytes 前缀 seek 覆盖 `startswith` 全扫看得到的每一条。
+        """
+        import hashlib
+
+        h = hashlib.blake2b(digest_size=16)
+        for prefix in self._PROJECT_INPUT_PREFIXES:
+            p = prefix.encode()
+            h.update(b"\x00" + p)
+            for key_raw, value_raw in self.meta_db.items(from_key=p):
+                k = key_raw if isinstance(key_raw, bytes) else str(key_raw).encode()
+                if not k.startswith(p):
+                    break
+                v = value_raw if isinstance(value_raw, bytes) else repr(value_raw).encode()
+                h.update(len(k).to_bytes(4, "big"))
+                h.update(k)
+                h.update(len(v).to_bytes(8, "big"))
+                h.update(v)
+        return h.hexdigest()
+
+    def _maintain_projects_recompute(self) -> int:
+        """`maintain_projects` 的重算本体（MQ-W19 前的函数体原样，不含短路）。"""
+        from bladex_core.project import Project, name_from_root, project_id_for
+
         roots: set[str] = set()
         for f in self.all_facts():
             if f.item_kind != ItemKind.FILE_REF:
@@ -2526,8 +2615,6 @@ class MemoryIndex:
             self.link_matters_to_project(pid, root)
             self.refresh_project_fields(pid)
             n += 1
-        if n:
-            logger.info("index_projects_maintained", projects=n)
         return n
 
     def discover_project_from_paths(self, paths: list[str]) -> str:
@@ -2658,29 +2745,8 @@ class MemoryIndex:
             proj.languages = languages_of(paths)
         self.upsert_project(proj)
 
-    def project_card_for(self, text: str) -> list[str]:
-        """E7.2 ①平面 Project 卡：请求文本里出现某 Project 的 root_path 前缀就注。
-
-        确定性匹配（不做模糊），命中多个取 root_path 最长（最具体）的那个。
-        """
-        from bladex_core.project import render_project_card
-
-        if not text:
-            return []
-        best = None
-        for proj in self.all_projects():
-            if proj.root_path and proj.root_path in text:
-                if best is None or len(proj.root_path) > len(best.root_path):
-                    best = proj
-        if best is None:
-            return []
-        active = sum(
-            1 for m in self.all_matters()
-            if m.status == MatterStatus.ACTIVE
-            and any(e.relation == EdgeRelation.PART_OF and e.target_key == best.project_id
-                    for e in self.get_edges(m.matter_id))
-        )
-        return render_project_card(best, active_matters=active)
+    # （`project_card_for`——E7.2 ①平面 Project 卡——已于 2026-09-18 批 S 删除，
+    #  理由同 `get_profile_cards`；`Project` 对象与 `all_projects()` 保留，dashboard 读。）
 
     # ── ADR-0028 E7.1：文件内容索引 ──
 
@@ -3037,65 +3103,10 @@ class MemoryIndex:
                 f"{_PROFILE_PREFIX}agent_md/{agent_base}").get("content", "")
         return user_md, agent_md
 
-    # 画像卡渲染细节
-    _PROFILE_TOP_TOOLS = 5
-    _PROFILE_MAX_RULES = 3
-
-    def get_profile_cards(self, user_id: str | None, agent_id: str = "") -> list[list[str]]:
-        """U7 ①平面消费：渲染 User 画像卡 + Agent 习惯卡（audience 隔离）。
-
-        Agent 习惯卡只发给对应 agent（按 base 匹配）——codex 的工具习惯
-        不出现在 hermes 的注入里（U10 验收）。确定性渲染（同版本同文本）。
-        """
-        self._ensure_meta_db()
-        if self.meta_db is None:
-            return []
-        cards: list[list[str]] = []
-        base = agent_id.split(":")[0] if agent_id else ""
-
-        # ── ADR-0028 E7.3：画像卡 render v2 ──
-        # 旧渲染是 "[User 画像] 使用规则文件 CLAUDE.md：<一段路径串联的乱码>"，
-        # 而且**每轮都在注**（trace 报告实测那两行逐轮出现）。
-        # v2 改为从 USER.md / agent 习惯文件里节选**完整句子**（≤5 行）。
-        from bladex_core.rulefile import render_profile_card
-
-        user_md, agent_md = self.get_profile_md(user_id, base)
-        v2_lines = render_profile_card(user_md, agent_md)
-        if v2_lines:
-            cards.append(v2_lines)
-            return cards
-
-        # 回退（画像文件尚未生成——全新库/首轮）：保留 v1 渲染，不至于一片空白。
-        if user_id:
-            prof = self._profile_get(f"{_PROFILE_PREFIX}user/{user_id}")
-            rules = prof.get("rules", {})
-            if rules:
-                lines = []
-                for name in sorted(rules.keys())[:self._PROFILE_MAX_RULES]:
-                    excerpt = rules[name].get("excerpt", "")
-                    suffix = f"：{excerpt}" if excerpt else ""
-                    lines.append(f"[User 画像] 使用规则文件 {name}{suffix}")
-                cards.append(lines)
-        if base:
-            # E7.4：工具习惯带上"用得顺不顺"（成功率 + 常见失败），不只是"用过几次"
-            stats = self.get_tool_stats(base, top=self._PROFILE_TOP_TOOLS)
-            if stats:
-                parts = []
-                for t in stats:
-                    calls = int(t.get("calls", 0))
-                    ok = int(t.get("ok", 0))
-                    rate = (ok / calls * 100) if calls else 0.0
-                    parts.append(f"{t['name']}({calls}, ok {rate:.0f}%)")
-                cards.append([f"[Agent 习惯: {base}] 常用工具: {', '.join(parts)}"])
-            else:
-                prof = self._profile_get(f"{_PROFILE_PREFIX}agent/{base}")
-                tools = prof.get("tools", {})
-                if tools:
-                    top = sorted(tools.items(), key=lambda kv: (-kv[1], kv[0]))
-                    top = top[:self._PROFILE_TOP_TOOLS]
-                    joined = ", ".join(f"{n}({c})" for n, c in top)
-                    cards.append([f"[Agent 习惯: {base}] 常用工具: {joined}"])
-        return cards
+    # （`get_profile_cards`——U7 ①平面画像卡 + 习惯卡渲染——已于 2026-09-18 批 S 删除：
+    #  注入面 09-03 S1 起不读它，全仓零生产调用点，live 484 轮 `planes=False`；
+    #  拍板 0.3.0-(5)，ADR-0034 §3.2。写侧画像捕获与 `get_profile_md` / `get_tool_stats`
+    #  保留——它们是 USER.md/AGENT.md 投影与 `/admin/profiles` 的数据源。）
 
     def _apply_matter_injection_hits(self, hit_ts: Mapping[str, str]) -> int:
         """M3-1：把 Matter 卡的注入命中回写成 `Matter.last_hit_at`（相关钟）。
@@ -5226,11 +5237,24 @@ class MemoryIndex:
         self.add_edge(edge)
         # T2: manual 反哺 — 手动指定后重算质心，后续 auto 归属用新质心判
         if target_type == EdgeTargetType.FACT:
+            # Z4：fact.matter_id 跟着改（merge_matters ① 同款 meta upsert，不动向量）。
+            # 不改的话字段仍指旧卡，Obsidian 导出器下次重写这条 fact 会把行挪回旧页 ——
+            # 用户的挪动在 vault 里被悄悄撤销，而 Index 里其实已归新卡。
+            self._set_fact_matter(target_key, matter_id)
             self.recompute_centroid(matter_id)
             self.update_matter_summary(matter_id)
         logger.info("index_manual_assign", matter_id=matter_id,
                      target_key=target_key, target_type=target_type.value)
         return edge
+
+    def _set_fact_matter(self, fact_id: str, matter_id: str) -> None:
+        """只改 fact.matter_id（meta upsert，不重写向量）；fact 不存在 ⇒ 无操作。"""
+        f = self.get_fact(fact_id)
+        if f is None or f.matter_id == matter_id:
+            return
+        f.matter_id = matter_id
+        f.embedding = None
+        self.add_fact(f)
 
     def detach_edge(self, edge_id: str) -> bool:
         """手动摘除归属边。"""
@@ -5317,6 +5341,8 @@ class MemoryIndex:
                 removed += 1
         for k in keys_to_delete:
             del self.meta_db[k]
+        if removed > 0 and target_type == EdgeTargetType.FACT:
+            self._set_fact_matter(target_key, "")  # Z4：同 assign_manual
         if removed > 0:
             logger.info("index_edges_detached_for_target",
                          target_key=target_key, count=removed)
@@ -5624,6 +5650,46 @@ class MemoryIndex:
                      facts_deleted=len(facts_to_delete), total_removed=removed)
         return removed
 
+    # ── Z4（MQ-P33）：外部工具回流的 fact 更正 ───────────────────────────
+    #: 已被用户更正过的 fact_id 集合（msgpack list）。放 `__meta__/` 下：`clear()` 不清它，
+    #: 而 full rebuild 的重放又会把它逐条重写——两条路都保证"用户改过"这个事实不丢。
+    _FACT_CORRECTED_KEY = b"__meta__/fact_corrected_ids"
+
+    def corrected_fact_ids(self) -> frozenset[str]:
+        """用户更正过的 fact_id（manual 压过 auto 的判据；单 key 读，每 pass 付得起）。"""
+        if self.meta_db is None:
+            return frozenset()
+        raw = self.meta_db.get(self._FACT_CORRECTED_KEY)
+        if not raw:
+            return frozenset()
+        try:
+            return frozenset(str(x) for x in msgpack.unpackb(raw, raw=False))
+        except (ValueError, TypeError, msgpack.ExtraData) as e:
+            logger.warning("index_fact_corrected_ids_corrupt", error=str(e))
+            return frozenset()
+
+    def correct_fact(self, fact: Fact) -> None:
+        """应用一条 FACT_CORRECT（proxy admin 端点即时应用与 Hub 重放共用这一个实现点）。
+
+        🔴 先删旧向量行再写：`add_fact` 对 LanceDB 是 `table.add`（追加），同 id 二次写会
+        留下旧文字的向量行 ⇒ 按旧文字仍能召回（判据①"搜不到旧文字"就是冲这一点）。
+        FTS 与 meta 本就是 upsert。随后把 fact_id 记入已更正集合（manual 压过 auto）。
+        """
+        if self._table is not None:
+            try:
+                self._table.delete(f"id = '{fact.id.replace(chr(39), chr(39) * 2)}'")
+            except Exception as e:  # noqa: BLE001 —— 表未建等：随后 add 会建
+                logger.debug("index_correct_vector_delete_skip", fact_id=fact.id, error=str(e))
+        self.add_fact(fact)
+        if self.meta_db is not None:
+            ids = set(self.corrected_fact_ids())
+            if fact.id not in ids:
+                ids.add(fact.id)
+                self.meta_db[self._FACT_CORRECTED_KEY] = msgpack.packb(
+                    sorted(ids), use_bin_type=True)
+        logger.info("index_fact_corrected", fact_id=fact.id,
+                    content_len=len(fact.content))
+
     def delete_fact(self, fact_id: str) -> bool:
         """删除单条 Fact（meta + LanceDB 向量 + 指向它的归属边）。
 
@@ -5736,10 +5802,16 @@ class MemoryIndex:
         self._try_catch_up()
         if self.meta_db is None:
             return 0
-        return sum(
-            1 for k in self.meta_db.keys()
-            if (k.decode() if isinstance(k, bytes) else str(k)).startswith(_CONSUMED_PREFIX)
-        )
+        # 批 Q3C：从 consumed 前缀 seek、出前缀即停（与 MQ-A91 改 `scan_tombstones` 同手法）。
+        # 此前迭代全部 meta key（生产 12.5 万），W4 每 60 s 采一次、`/admin/status` 每次调。
+        # key 按字节序排列且全部以 bytes 写入（`_mark_consumed`），结果与全扫逐条相同。
+        p = _CONSUMED_PREFIX.encode()
+        n = 0
+        for k in self.meta_db.keys(from_key=p):
+            if not (k if isinstance(k, bytes) else str(k).encode()).startswith(p):
+                break
+            n += 1
+        return n
 
     @property
     def last_rebuild_backlog(self) -> bool:
@@ -5749,6 +5821,27 @@ class MemoryIndex:
         积压时空转 60s/批 = 6793 轮要多睡 3.8 小时。
         """
         return self._last_rebuild_backlog
+
+    @property
+    def last_rebuild_abort_reason(self) -> str | None:
+        """上轮 rebuild 被哪个中断守卫明确中止；None = 正常完成。
+
+        MQ-I33：调用方不能用“返回 0 条”推断中止——空库 full rebuild 也合法地返回 0。
+        这个属性只由守卫命中点写入，是 full CLI 判断 done/aborted 的唯一信号。
+        """
+        return self._last_rebuild_abort_reason
+
+    @property
+    def last_rebuild_candidates(self) -> int:
+        """上轮 rebuild 扫描后过筛得到的候选轮次数（= `index_rebuild_scan_sorted` 的 `candidates`）。
+
+        MQ-W17：consolidator 的空载退避据此判"这一轮是不是真的什么都没有"。
+        🔴 **不能用 `new_facts == 0` 代替**——候选非空但判重/裁决全丢也得 0，
+        那是"干了活没产出"、不是空载；拿它当空载信号会在真有流量时退避。
+        🔴 本属性只被**读**，rebuild 的行为一行不依赖它（判据③：candidates>0
+        那一轮逐字不变）。
+        """
+        return self._last_rebuild_candidates
 
     def unconsume_matching(
         self,
@@ -5770,8 +5863,8 @@ class MemoryIndex:
         返回删除的标记数。
         """
         if not (since or until or agents or exclude_agents):
-            raise ValueError("unconsume_matching 至少需要一个过滤条件"
-                             "（since/until/agents/exclude_agents）")
+            raise ValueError("unconsume_matching needs at least one filter "
+                             "(since/until/agents/exclude_agents)")
         if self.meta_db is None:
             return 0
         removed = 0
@@ -5831,6 +5924,7 @@ class MemoryIndex:
         watermark = raw.decode() if isinstance(raw, bytes) else (raw or "")
         replayed = 0
         last_key = ""
+        fact_tombs = _LazyFactTombstones(ledger)
         for key_str, event in ledger.scan_admin_events():
             entry_id = key_str.split("/", 1)[-1]
             if watermark and entry_id <= watermark:
@@ -5838,7 +5932,7 @@ class MemoryIndex:
             if event.event_type == "scope_promote":
                 if self._apply_scope_promote_event(event):
                     replayed += 1
-            elif self._apply_admin_event(event):
+            elif self._apply_admin_event(event, fact_tombstones=fact_tombs):
                 replayed += 1
             last_key = max(last_key, entry_id)
         if last_key:
@@ -5861,11 +5955,12 @@ class MemoryIndex:
         """
         replayed = 0
         last_entry = ""
+        fact_tombs = _LazyFactTombstones(ledger)
         for key_str, event in ledger.scan_admin_events():
             last_entry = max(last_entry, key_str.split("/", 1)[-1])
             if event.event_type == "scope_promote":
                 continue  # scope 由 _replay_scope_promotions 单独重放（既有分工）
-            if self._apply_admin_event(event):
+            if self._apply_admin_event(event, fact_tombstones=fact_tombs):
                 replayed += 1
         if last_entry:
             self._set_admin_events_watermark(last_entry)
@@ -5873,11 +5968,31 @@ class MemoryIndex:
             logger.info("index_admin_events_replayed", count=replayed)
         return replayed
 
-    def _apply_admin_event(self, event: AdminEvent) -> bool:
-        """应用单条管理事件（scope_promote 除外）。返回是否成功计数。"""
+    def _apply_admin_event(self, event: AdminEvent,
+                           fact_tombstones: Any = None) -> bool:
+        """应用单条管理事件（scope_promote 除外）。返回是否成功计数。
+
+        `fact_tombstones`：支持 `in` 的 fact 墓碑集合（重放侧传 `_LazyFactTombstones`，
+        只在真遇到 fact_correct 时才付一次墓碑扫描）。None = 不查（即时应用路径）。
+        """
         replayed = 0
         if event is not None:
             try:
+                if event.event_type == "fact_correct":
+                    # Z4：状态式完整载荷，重放 = 覆盖（FACT_IMPORT 先例）。
+                    # 🔴 被墓碑覆盖的不复活（重建 = 重放会话 + 重放管理事件 − 墓碑）。
+                    fact = Fact.model_validate(event.payload.get("entity") or {})
+                    if fact_tombstones is not None and fact.id in fact_tombstones:
+                        return False
+                    fact.embedding = None
+                    if self._embedder is not None:
+                        try:
+                            fact.embedding = embed_passage_compat(
+                                self._embedder, [fact.content])[0]
+                        except Exception as ee:  # noqa: BLE001 —— 无向量仍入 meta
+                            logger.debug("index_correct_replay_embed_skip", error=str(ee))
+                    self.correct_fact(fact)
+                    return True
                 if event.event_type == "audience_set":
                     # MQ-L27 修法③：人设事实 audience 补标（payload 带 fact_id，
                     # matter_id 留空——MQ-A7 护栏）。幂等：重复应用同值无害。
@@ -6158,8 +6273,13 @@ class MemoryIndex:
         返回新提炼的 Fact 数。
         """
         self._last_rebuild_backlog = False
+        self._last_rebuild_candidates = 0   # MQ-W17 读数，每轮先清零
+        self._last_rebuild_abort_reason = None   # MQ-I33：每轮先清掉上一轮的中止信号
+        self._last_unit_key_sources: dict[str, int] = {}   # 批 U · U1b 读数，每轮先清零
         if self._embedder is None:
             logger.warning("index_rebuild_skip", reason="no_embedder")
+            # MQ-I33：full CLI 不能把“没做”报成 done；增量路径不读这个信号。
+            self._last_rebuild_abort_reason = "no_embedder"
             return 0
 
         # MS-13：全量重建 = 新的一轮 run，刷新 rebuild_id（增量 pass 沿用进程 run id
@@ -6247,6 +6367,12 @@ class MemoryIndex:
             progress_cb=progress_cb,
             funnel=self._funnel,          # M4-2：写入侧漏斗埋点
             adjudicator=self._adjudicator,  # M2-2：写入时裁决
+            # 🔴 2026-09-18（批 S · S2.1，MQ-I20）：库内邻居用 meta 里的完整 Fact 补齐坐标
+            # （向量表无 subject/attribute 列 ⇒ 此前库内同键从不命中快路径）。
+            neighbor_source=InRunNeighborSource(
+                checker=novelty_checker,
+                hydrate=(self.get_fact
+                         if flag_enabled("BLADEX_ADJUDICATE_LIBRARY_HYDRATE") else None)),
         )
 
         def _prog(**ev: Any) -> None:
@@ -6267,6 +6393,9 @@ class MemoryIndex:
         # 从 Memory Hub 读未消费的 turns（consumed-key 集合去重，替代字典序水位游标）
         turns: list[ConversationTurn] = []
         new_consumed_keys: list[str] = []
+        # 批 U · U1b（MQ-I29）：本轮扫描里 unit_key 的来源计数（recomputed / legacy_stored / none）。
+        # 算不出来的老轮次不许静默混用：计数进日志 `index_unit_key_sources` 与 `_last_unit_key_sources`。
+        unit_key_sources: dict[str, int] = {}
         # T1: ledger_key → user 消息文本（供归属管线续接语/点名检测）
         ledger_key_to_user_msg: dict[str, str] = {}
         # U4B-B2: ledger_key → turn 时间戳 iso（lifecycle 事件用 turn 时间，保重建等价性 G6）
@@ -6275,6 +6404,9 @@ class MemoryIndex:
         # 归属循环里只有 `fact.source_ledger_key`、拿不到 Turn，故在扫描阶段建映射
         # （与上面两个 dict 同款）。缺键 = 该 turn 没有这个字段 ⇒ 按旧行为锚定。
         ledger_key_to_face: dict[str, bool | None] = {}
+        # MQ-L88（批 Y · Y1a）：ledger_key → 该轮 `identity.project_id`，供锚层按轮次自己的
+        # project scope 查激活账本（与 `ledger_memory` 同一字段；同上两个 dict 的建法）。
+        ledger_key_to_project: dict[str, str] = {}
         # ── GM-1（MQ-S13）：对话延续 → 上一轮的 ledger_key ──
         # 任务身份的载体是**延续关系**，不是标题相似度（三轮读数否掉了键匹配路线：
         # 开卡那一刻种子键达标率只有 3.8%）。信号 `Turn.session_id_source ==
@@ -6361,6 +6493,9 @@ class MemoryIndex:
             for _a, _b in zip(_keys, _keys[1:], strict=False):
                 _prev_of[_b] = _a
         _scan_batch.sort()
+        # MQ-W17：这一行日志此前是"空载 consolidator 每 134s 全扫一遍"的唯一证据，
+        # 但只有人去 tail 日志才看得到。把同一个数留给调用方（空载退避的输入）。
+        self._last_rebuild_candidates = len(_scan_batch)
         logger.info("index_rebuild_scan_sorted", candidates=len(_scan_batch),
                     skipped_filtered=skipped_filtered)
 
@@ -6418,7 +6553,9 @@ class MemoryIndex:
             # G12.3：三分收进 `classify_turn_disposition`（原地展开的那一行判据
             # 现在有第二个消费者——goal 捕获；两处各抄一份就是 MQ-S4 的形态）。
             # 语义逐字不变：dropped = 原 `is_aux and rule not in DISTILL_ONLY_AUX_RULES`。
-            _turn_class, _aux_rule = classify_turn_disposition(turn.request_messages)
+            _turn_class, _aux_rule = classify_turn_disposition(
+                turn.request_messages, agent_id=turn.identity.agent_id,
+                headers=turn.identity.request_headers)   # 批 E：header 快照参与重判
             is_aux = _turn_class != TURN_REAL
             # 🔴 MS-2：整轮丢**只对 Hermes 原生 aux 规则**（委派回执、压缩检查点这类
             # 从头到尾都是内部通信的轮次）。信封类指纹（`DISTILL_ONLY_AUX_RULES`）说的是
@@ -6499,8 +6636,12 @@ class MemoryIndex:
             else:
                 mapped_uid = legacy_map.get(raw_uid, raw_uid) if legacy_map else raw_uid
             # ADR-0024 §4.5 / U4：本轮当前（open）单元 unit_key（供蒸出 facts 继承 → L0）。
-            _task_units = getattr(turn, "task_units", None) or []
-            _unit_key = _task_units[-1].unit_key if _task_units else ""
+            # 🔴 批 U · U1b（MQ-I29）：**按现行轮次规则从 request_messages 重算**，不读存量
+            # Turn.task_units（U1.1 起口径变了，读它 = 重建后新旧混在一个库里）。取法唯一实现点
+            # `task_unit.index_unit_key`；算不出来的老轮次沿用存下的 key 并加 `legacy:` 前缀、计数。
+            # 守卫 `test_u1b_index_unit_key.py`：本文件不许再出现任何 task_units 读法。
+            _unit_key, _uk_src = _index_unit_key(turn)
+            unit_key_sources[_uk_src] = unit_key_sources.get(_uk_src, 0) + 1
             conv_turn = ConversationTurn(
                 session_id=turn.identity.session_id,
                 user_id=mapped_uid,
@@ -6528,6 +6669,8 @@ class MemoryIndex:
                 ledger_key_to_user_msg[key_str] = "\n".join(user_messages)
             ledger_key_to_ts[key_str] = conv_turn.timestamp
             ledger_key_to_face[key_str] = getattr(turn, "ledger_face", None)
+            ledger_key_to_project[key_str] = str(
+                getattr(turn.identity, "project_id", "") or "")
 
             # ── GM-1：判「延续 ∧ 无新主体」，登记上一轮 key（不做任何归属决定）──
             if _cont_enabled and not is_aux:
@@ -6595,6 +6738,10 @@ class MemoryIndex:
                 logger.info("index_rebuild_max_turns_reached",
                             max_turns=max_turns, consumed_so_far=len(new_consumed_keys))
                 break
+
+        self._last_unit_key_sources = dict(unit_key_sources)
+        if unit_key_sources:
+            logger.info("index_unit_key_sources", **unit_key_sources)
 
         # 无新非 auxiliary 轮次：标记 auxiliary 已消费后返回
         if not turns:
@@ -6682,6 +6829,8 @@ class MemoryIndex:
             new_facts = consolidator.consolidate_turns(turns, existing_facts=existing)
         except Exception as e:
             logger.warning("index_rebuild_consolidation_failed", error=str(e))
+            # MQ-I33：给 full CLI 一个明确信号；0 条不是判据（空库也返回 0）。
+            self._last_rebuild_abort_reason = "consolidation_failed"
             # 不标记消费 → 下轮重试；full=True 时旧数据未清，完整保留。
             # backlog 保持 False：失败要退避，不能立即空转重试。
             return 0
@@ -6744,6 +6893,8 @@ class MemoryIndex:
                          "distill_parse_failed to tell the two apart. "
                          "Disable this guard with BLADEX_DISTILL_OUTAGE_ABORT_RATIO=0",
                 )
+                # MQ-I33：给 full CLI 一个明确信号；0 条不是判据（空库也返回 0）。
+                self._last_rebuild_abort_reason = "distill_outage"
                 # backlog 保持 False：中断期要退避，不能立即空转重试
                 #（空转正是把积压烧光的加速器）。
                 return 0
@@ -6800,6 +6951,8 @@ class MemoryIndex:
                      "adjudicate_parse_failed to tell the two apart. Disable this guard "
                      "with BLADEX_ADJUDICATE_OUTAGE_ABORT_RATIO=0",
             )
+            # MQ-I33：给 full CLI 一个明确信号；0 条不是判据（空库也返回 0）。
+            self._last_rebuild_abort_reason = "adjudicate_outage"
             # 与蒸馏中断同一处置：不写、不消费、退避（backlog 保持 False）。
             return 0
         if _degraded:
@@ -6877,6 +7030,18 @@ class MemoryIndex:
             if self._matter_table is None else []
         )
 
+        # Z4（MQ-P33）：manual 压过 auto（ADR-0012）——用户在外部更正过的 fact，本轮蒸馏
+        # 若再产出同 id（同源轮次 + 同原文 ⇒ 确定性同 id）一律让路，不许把更正写回原文。
+        # 位置有讲究：必须在 full rebuild 的 clear+重放**之后**（已更正集合此时才完整），
+        # 在 add_fact **之前**。
+        _corrected = self.corrected_fact_ids()
+        if _corrected:
+            before = len(new_facts)
+            new_facts = [f for f in new_facts if f.id not in _corrected]
+            if len(new_facts) != before:
+                logger.info("index_rebuild_fact_corrections_protected",
+                            skipped=before - len(new_facts))
+
         # 先存所有 fact（metadata + LanceDB）
         added_facts: list[Fact] = []
         for fact in new_facts:
@@ -6902,8 +7067,12 @@ class MemoryIndex:
         # ── M2-2：应用裁决产生的旧条改动 + 写 judgment 台账（kind=consolidation）──
         # core 决策、proxy 落盘（与 supersede_plan 同一分工）。
         # 台账让 rebuild 重放**零 LLM**：同一批候选 + 同一组邻居 → 直接读结论。
+        _corrections_guarded = 0
         for _rec in (getattr(consolidator, "adjudication_records", None) or []):
             for _old in _rec.get("changed") or []:
+                if _old.id in _corrected:  # Z4：自动裁决不改用户更正过的条目
+                    _corrections_guarded += 1
+                    continue
                 _old.embedding = None      # 只 upsert meta，不重复写向量
                 try:
                     self.add_fact(_old)
@@ -6930,12 +7099,18 @@ class MemoryIndex:
         _plan = getattr(consolidator, "supersede_plan", None)
         if _plan is not None and (_plan.bump or _plan.invalidate):
             for old_fact, _s in _plan.bump:
+                if old_fact.id in _corrected:  # Z4：同上
+                    _corrections_guarded += 1
+                    continue
                 old_fact.embedding = None  # 只更新 meta，不重复写向量
                 try:
                     self.add_fact(old_fact)
                 except Exception as e:
                     logger.warning("index_supersede_bump_failed", fact_id=old_fact.id, error=str(e))
             for old_fact, _nid in _plan.invalidate:
+                if old_fact.id in _corrected:  # Z4：同上
+                    _corrections_guarded += 1
+                    continue
                 old_fact.embedding = None
                 try:
                     self.add_fact(old_fact)
@@ -6943,6 +7118,9 @@ class MemoryIndex:
                     logger.warning("index_supersede_invalidate_failed", fact_id=old_fact.id, error=str(e))
             logger.info("index_supersede_applied", bumped=len(_plan.bump),
                         invalidated=len(_plan.invalidate))
+        if _corrections_guarded:
+            logger.info("index_auto_change_to_corrected_fact_skipped",
+                        skipped=_corrections_guarded)
 
         # 顺序归属（mid-batch 可见：本 pass 新建的 Matter 立即成为后续 fact 的候选，
         # 使 L4 在 full rebuild 也能跑 + judgment 台账可重放，ADR-0018 §4.1）。
@@ -7058,6 +7236,7 @@ class MemoryIndex:
         _la_pool: dict[str, Any] = {}
         _la_titles: dict[str, str] = {}
         _la_matter_by_ledger: dict[str, str] = {}
+        _la_tombstoned: set[str] = set()
         _la_created: set[str] = set()
         _la_counters: Counter[str] = Counter()
         if _la_enabled:
@@ -7072,8 +7251,16 @@ class MemoryIndex:
                 #
                 # ⚠️ 别在注释里复现那个前缀匹配的字面量：守卫按字面量扫全树，
                 # 一句解释会被它当成新的违规抓住（同日 env 名那次同型）。
-                from bladex_proxy.ledger_events import load_ledger_events
-                _la_events = load_ledger_events(ledger)
+                from bladex_proxy.ledger_events import (
+                    load_ledger_events,
+                    tombstoned_ledger_ids,
+                )
+                # 🔴 2026-09-18（批 S · S2.1，MQ-I19）：墓碑从其发生时刻起生效（不倒填），
+                # 墓碑前窗口里的轮次仍锚到该账本的锚卡 ⇒ 池里要有它的标题/matter_id
+                # （`keep_tombstoned_pool`，只有本处传）。锚卡**不预物化**（下面按需建）：
+                # 墓碑本没有窗口 fact 就不该有卡。
+                _la_events = load_ledger_events(ledger, keep_tombstoned_pool=True)
+                _la_tombstoned = tombstoned_ledger_ids(ledger)
                 _la_pool, _la_bind = _la_replay(_la_events)
                 _la_timeline = _la_tl(_la_events)
                 _la_titles = {lid: (lg.title or lid) for lid, lg in _la_pool.items()}
@@ -7144,39 +7331,67 @@ class MemoryIndex:
             """
             n = 0
             for lid in sorted(_la_pool):
+                if lid in _la_tombstoned:
+                    continue   # 墓碑本只按需建卡（S2.1）
                 before = len(_la_created)
                 _la_ensure_matter(lid, proposed=_la_matter_by_ledger.get(lid, ""))
                 n += len(_la_created) - before
             return n
 
-        def _la_ledger_at(lk: str) -> str:
+        def _la_project_of(lk: str) -> str:
+            """该轮自己的 `identity.project_id`。本 pass 扫过的轮免费；批边界外付一次
+            `get()`（与 `_prev_ref` 同价）——**取不到不当 Global 猜**：缺数就是空，
+            与老轮次无该字段同一落点，但必须是真的"没有"，不是"没去取"。"""
+            if lk in ledger_key_to_project:
+                return ledger_key_to_project[lk]
+            try:
+                _t = ledger.get(lk)
+            except Exception as e:  # noqa: BLE001 —— 取不到只影响这一轮的锚定
+                logger.warning("ledger_anchor_project_get_failed", key=lk, error=str(e))
+                _t = None
+            pid = str(getattr(getattr(_t, "identity", None), "project_id", "") or "") if _t else ""
+            ledger_key_to_project[lk] = pid
+            return pid
+
+        def _la_ledger_at(lk: str, *, label: bool = False) -> str:
             """这一轮**发生时**激活的账本（点时查找；MQ-L15）。
 
             🔴 键是 `activation_scope(agent, project)`，**不是 session**
             （MQ-L14：MQ-L11 把绑定键从 session 改成 scope，这个消费方没跟上，
             于是锚层对 100% 的轮次返回空、静默落回 D1，却照常打
             `ledger_anchor_ready` —— 一个报告自己就绪的死机制）。
-            project 段在 V-F1 落地前恒 `Global`，与 switch 事件现状一致。
+
+            🔴 project 段 = **该轮自己的** `identity.project_id`（批 Y · Y1a，MQ-L88）。
+            此前这里写死 `activation_scope(agent, "")`，旁边的注释说"project 段在 V-F1
+            落地前恒 Global"——project 信号 08-29 就接通了，这句过期注释让锚层只查
+            `agent@Global` 又活了三周：模型在 project scope 里切对了账本，锚层看不见，
+            59 条错边（Y0）。判定本体只在 `ledger_runtime.turn_active_ledger` 一处
+            （与 `ledger_memory` 窗口查表共用，原则 13 层 2）。
+
+            🔴 批 Z · Z3.2：完结停锚也在同一函数里判（`turn_active_ledger` 读时间轴上的
+            `done_spans`）。写者用户轮豁免要本轮 `turn_index`——**惰性**给（只有命中完结
+            区间且会话对得上的轮才付一次 Hub `get`），不为绝大多数轮次多读一次库。
+            `label=True` = 标签口径（不停锚，只给 DPL 闸② 用，见 `_lg_reject`）。
             """
-            from bladex_core.ledger import ledger_active_at
-            from bladex_core.ledger_runtime import (
-                activation_scope,
-                agent_of_turn_key,
-                turn_key_ts_ms,
-            )
-            agent = agent_of_turn_key(lk)
-            if not agent:
-                return ""
-            scope = activation_scope(agent, "")
-            lid = ledger_active_at(_la_timeline, scope, turn_key_ts_ms(lk))
-            if lid:
-                return lid
-            # 时间轴给不出（无 ts 的历史事件 / 该刻早于第一次切换）：
-            # 只在**时间轴上这个 scope 压根没有条目**时退回终态绑定，
-            # 否则会把"建账本之前"的历史塞进锚定 Matter（MQ-L15 反向形状）。
-            if scope in _la_timeline:
-                return ""
-            return _la_bind.get(scope, "")
+            from bladex_core.ledger_runtime import turn_active_ledger
+            return turn_active_ledger(_la_timeline, lk, _la_project_of(lk),
+                                      bindings=_la_bind,
+                                      turn_index=lambda: _la_turn_index_of(lk),
+                                      apply_done_pause=not label)
+
+        _la_ti_cache: dict[str, int | None] = {}
+
+        def _la_turn_index_of(lk: str) -> int | None:
+            """该轮 `identity.turn_index`（完结停锚的写者用户轮判据用）；取不到 ⇒ None（不豁免）。"""
+            if lk not in _la_ti_cache:
+                try:
+                    _t = ledger.get(lk)
+                except Exception as e:  # noqa: BLE001 —— 取不到只影响这一轮的豁免
+                    logger.warning("ledger_anchor_turn_index_get_failed", key=lk, error=str(e))
+                    _t = None
+                _ti = getattr(getattr(_t, "identity", None), "turn_index", None) if _t else None
+                _la_ti_cache[lk] = int(_ti) if isinstance(_ti, int) else None
+            return _la_ti_cache[lk]
 
         _lg_enabled = flag_enabled("BLADEX_LEDGER_GATE")
 
@@ -7205,7 +7420,10 @@ class MemoryIndex:
             )
             _tl = _la_pool.get(_tgt)
             r = ledger_gate(
-                turn_ledger_id=_la_ledger_at(lk),
+                # 🔴 批 Z · Z3.2：标签口径（`apply_done_pause=False`）——完结停锚只摘 ANCHOR，
+                # 不摘"在谁的激活窗口里"：被停锚的轮次仍不许挂进**别的**账本锚卡（判据 ⑤
+                # 不换受害者）；挂回自己这本交给内容（CONT/L2–L4）。同一个单实现点，不另起判据。
+                turn_ledger_id=_la_ledger_at(lk, label=True),
                 turn_ms=turn_key_ts_ms(lk),
                 target_ledger_id=_tgt,
                 target_created_ms=iso_ms(getattr(_tl, "created_at", "") if _tl else ""),

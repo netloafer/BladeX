@@ -10,7 +10,7 @@
   `probe_turn_field_coverage.py`，不在这里（本文件只证明字段可达且往返不丢）。
 
 钉六件事：
-① 有账本轮：`sections` 之和 + about + roster == `bladex_added_chars`（逐字，不带余项）；
+① 有账本轮：`sections` 之和 + about == `bladex_added_chars`（逐字，不带余项；批 F4 前还有 roster）；
 ② 无账本轮：`ledger_id=""` ∧ `template>0` ∧ 五个账本段全 0；
 ③ `BLADEX_MODULE_LEDGER=0` ⇒ 锚为 None **且注入正文逐字同修前**；
    判别力：把锚组装挪到 module 门之前 ⇒ 本条必红；
@@ -61,14 +61,13 @@ def _seeded(ag: AgencyRuntime, agent: str = "hermes:default") -> AgencyRuntime:
     return ag
 
 
-# ── ① 恒等式：桶和 == 块正文；桶和 + about + roster == bladex_added_chars ──
+# ── ① 恒等式：桶和 == 块正文；桶和 + about == bladex_added_chars（批 F4 起名册退役）──
 
 
 def test_breakdown_sums_to_block_and_added_chars(monkeypatch):
     _on(monkeypatch)
     ag = _seeded(AgencyRuntime())
     ag.about = "BladeX keeps your task ledger."
-    ag.agents_roster = "- hermes: the agent"
     msgs = [_SYS, _USER]
 
     out = ag.insert_ledger_block(msgs, "hermes:default", tier="medium",
@@ -85,8 +84,8 @@ def test_breakdown_sums_to_block_and_added_chars(monkeypatch):
     # `bladex_added_chars` 的同一把差集（口径同 assembly.estimate_context_chars）
     from bladex_proxy.assembly import estimate_context_chars
     added = estimate_context_chars(out) - estimate_context_chars(msgs)
-    assert bd.total() + ag.last_about_chars + ag.last_roster_chars == added, \
-        "sections + about + roster 必须逐字等于 BladeX 加进正文的全部字符"
+    assert bd.total() + ag.last_about_chars == added, \
+        "sections + about 必须逐字等于 BladeX 加进正文的全部字符（批 F4 起无名册段）"
 
     # 五个账本段都有内容（这本账本 goal/verified/next 非空；core/open 是 _(empty)_ 行）
     for sec in _LEDGER_SECTIONS:
@@ -214,7 +213,8 @@ def _turn(**kw) -> Turn:
 def test_anchor_survives_dump_and_load():
     anchor = LedgerAnchor(ledger_id="ldg-fa1", rev=7,
                           sections={"header": 10, "goal": 20},
-                          about_chars=30, roster_chars=5, added_hash="abcdef0123456789")
+                          about_chars=30, roster_chars=5,   # 历史 Turn 的名册读数照读（F4 退役不删字段）
+                          added_hash="abcdef0123456789")
     back = Turn.model_validate(_turn(ledger_anchor=anchor).model_dump())
     assert back.ledger_anchor == anchor
 

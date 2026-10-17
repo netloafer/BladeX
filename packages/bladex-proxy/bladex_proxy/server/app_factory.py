@@ -16,6 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from bladex_proxy import __version__, router_sdk
+from bladex_proxy.admin_contract import ADMIN_CONTRACT_FIELD, ADMIN_CONTRACT_VERSION
 from bladex_proxy.agency import build_agency
 from bladex_proxy.assembly import AssemblyConfig, ContextAssembler
 from bladex_proxy.config import ProxyConfig
@@ -35,9 +36,10 @@ from bladex_proxy.server.orchestration import (
     _is_anthropic_client,
     _validate_sensitivity_judge,
 )
+from bladex_proxy.storage.instance_claim import InstanceClaim, InstanceConflictError
 from bladex_proxy.storage.memory_hub import MemoryHub
 from bladex_proxy.storage.memory_index import MemoryIndex
-from bladex_proxy.storage.pipeline_redis import DiskSpill, PipelineRedis
+from bladex_proxy.storage.pipeline_redis import DiskSpill, LiveNamespaceInTestError, PipelineRedis
 from bladex_proxy.storage.pipeline_worker import PipelineWorker
 
 logger = structlog.get_logger()
@@ -169,11 +171,28 @@ async def lifespan(app: FastAPI):
     try:
         await pipeline.connect()
         app.state.pipeline = pipeline
+    except LiveNamespaceInTestError:
+        raise  # 批 Z1b：测试进程闸不许被下面的"连不上就降级"吞掉（否则测试照样绿）
     except Exception as e:
         logger.warning("pipeline_redis_unavailable", error=str(e),
                        hint="proxy will run without storage; "
                             "lazy recovery will attempt to reconnect on first enqueue")
         app.state.pipeline = None
+    # 🔴 MQ-A38（批 Z1）：同一条 stream 只许一个 BLADEX_HOME。冲突 ⇒ InstanceConflictError
+    # **不在这里接**——原样上抛让 lifespan 失败、进程退出（拒绝启动），报错全文见
+    # `instance_claim.conflict_message`。放在上面那个 try 之外正是为此：那一段的
+    # `except Exception` 是"Redis 连不上就降级"，冲突不是连不上，不许被降级吞掉。
+    app.state.instance_claim = None
+    if app.state.pipeline is not None:
+        claim = InstanceClaim(pipeline.redis, stream=cfg.redis_stream, group=cfg.redis_group,
+                              consumer=cfg.redis_consumer, url=cfg.redis_url, port=cfg.port)
+        try:
+            await claim.acquire()
+        except InstanceConflictError:
+            await pipeline.close()
+            raise
+        claim.start_heartbeat()
+        app.state.instance_claim = claim
 
     # ADR-0021 section 2: identity registry -- load early so validation violations
     # (dup key / dangling ref / team cycle) refuse startup before opening resources.
@@ -189,6 +208,12 @@ async def lifespan(app: FastAPI):
     # Memory Hub RocksDB
     hub = MemoryHub(cfg.rocksdb_path)
     app.state.hub = hub
+
+    # Z1.2（MQ-W18）：硬规则热加载——`.env` ⊕ Hub `hard_rules_set`，后写者赢。
+    # 本进程所有读点都经 `cfg.effective_hard_rules`，arm 之后即读热值；启动时 Hub 里若已有
+    # Obsidian 改动，这里就同步生效并打 `hard_rules_reloaded`（Z4 落账 → 本批消费）。
+    from bladex_proxy import hard_rules as _hard_rules
+    _hard_rules.arm("proxy", hub=_hard_rules.hub_reader(hub), initial=cfg.effective_hard_rules)
 
     # ADR-0021 section 2.5: sync legacy_ids declarations to Memory Hub journal (idempotent).
     # Memory Index rebuild reads IDENTITY_MERGE events to map legacy user_id -> principal.
@@ -283,23 +308,20 @@ async def lifespan(app: FastAPI):
         app.state.index = None
         app.state.embedder = None  # T25: Memory Index 初始化失败时 embedder 也不可用
 
-    # 上下文装配（ADR-0019，取代 ADR-0016 CAP）：
-    # L1 证据降解常开 + L2 单元摘要触发式。env BLADEX_ASSEMBLY_*（兼容旧 BLADEX_CAP_*）。
+    # 上下文装配（ADR-0033，批 U · U1.4）：冷轮复核 + 按判定裁证据（L1 按位置降解已删）。
     assembly_config = AssemblyConfig.from_env()
     app.state.assembler = ContextAssembler(assembly_config)
-    # MQ-CA3：**每个影响降解行为的旋钮都要能在日志里读到**。
-    # 2026-08-28 止血调了 keep_recent_tool_results，而它此前不在这行里
-    # ——唯一控制 open 单元降解的参数读不到，只能从行为斜率反推它有没有生效。
-    # 「可配置但不可观测 = 半个旋钮」，与刚性原则 12 同源。
+    # MQ-CA3：**每个影响裁剪行为的旋钮都要能在日志里读到**（「可配置但不可观测 = 半个旋钮」）。
+    from bladex_core.flags import flag_csv, flag_number
+
+    from bladex_proxy.assembly_review import ReviewConfig
+    _rc = ReviewConfig.from_env()
     logger.info("assembly_initialized",
                 enabled=assembly_config.enabled,
-                budget_chars=assembly_config.budget_chars,
-                msg_threshold=assembly_config.msg_threshold,
-                evidence_min_chars=assembly_config.evidence_min_chars,
-                evidence_excerpt_chars=assembly_config.evidence_excerpt_chars,
-                keep_recent_closed=assembly_config.keep_recent_closed_units,
-                keep_recent_tool_results=assembly_config.keep_recent_tool_results,
-                preserve_units=assembly_config.preserve_units)
+                agents=sorted(flag_csv("BLADEX_ASSEMBLY_AGENTS")),
+                min_units=int(flag_number("BLADEX_ASSEMBLY_MIN_UNITS")),
+                review_embed=_rc.embed, review_model=_rc.model or "",
+                score_hi=_rc.hi, score_lo=_rc.lo, cold_budget_ms=_rc.cold_budget_ms)
 
     # MQ-A10：agent 注册表缓存（origin_key→agent 绑定 + 待认领桶）跨重启恢复。
     # 🔴 在这里调、不在 import 时调——副作用归入口点（2026-08-04 consolidator
@@ -348,8 +370,20 @@ async def lifespan(app: FastAPI):
                 "Fix routing.toml / env or set BLADEX_ROUTE_ENABLED=false."
             )
 
+    # MQ-W4：积压趋势采样（→ Hub / → Index），写 /metrics + 单调上升时打 `backlog_rising`。
+    from bladex_proxy.metrics import backlog_sampler_loop
+    app.state.backlog_sampler_stop = asyncio.Event()
+    app.state.backlog_sampler = asyncio.create_task(
+        backlog_sampler_loop(app.state, app.state.backlog_sampler_stop))
+
     logger.info("server_ready", listen=f"{cfg.host}:{cfg.port}")
     yield
+
+    sampler = getattr(app.state, "backlog_sampler", None)
+    if sampler is not None:
+        # 置位后等它采完手里这一次（见 backlog_sampler_loop 为什么不 cancel）
+        app.state.backlog_sampler_stop.set()
+        await asyncio.gather(sampler, return_exceptions=True)
 
     if app.state.pipeline_worker:
         await app.state.pipeline_worker.stop()
@@ -360,6 +394,10 @@ async def lifespan(app: FastAPI):
         if pending:
             logger.info("server_draining_bg_enqueue", count=len(pending))
             await asyncio.gather(*pending, return_exceptions=True)
+    from bladex_proxy import hard_rules as _hard_rules_stop
+    _hard_rules_stop.disarm()
+    if getattr(app.state, "instance_claim", None) is not None:
+        await app.state.instance_claim.release()
     if app.state.pipeline:
         await app.state.pipeline.close()
     if app.state.index:
@@ -432,9 +470,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         else:
             checks["upstream"] = True
         ready = checks["redis"] and checks["hub"]
+        # 🔴 MQ-I24（批 T0b）：不可逆 admin 操作前，CLI 要能问出"跑着的进程是不是这份
+        # 代码"。`admin_contract` 是**协议版本**（见 `admin_contract.py` 为什么不是 commit），
+        # `build` 只作诊断显示。两者都放在 /ready 而不是 /admin/status：免鉴权、
+        # CLI 已有 `_probe_ready`，且 503（未就绪）时同样读得到。
         return JSONResponse(
             status_code=200 if ready else 503,
-            content={"ready": ready, "checks": checks},
+            content={"ready": ready, "checks": checks,
+                     ADMIN_CONTRACT_FIELD: ADMIN_CONTRACT_VERSION,
+                     "build": __version__},
         )
 
     @app.get("/metrics")

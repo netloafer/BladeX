@@ -1,6 +1,6 @@
 [project]
 name = "bladex"
-version = "0.2.0"
+version = "0.3.0"
 description = "BladeX — memory-first LLM proxy middleware: a self-hosted personal memory layer any agent or model can adopt with near-zero changes."
 requires-python = ">=3.11"
 # Workspace root: no runtime deps; actual packages live in packages/*.

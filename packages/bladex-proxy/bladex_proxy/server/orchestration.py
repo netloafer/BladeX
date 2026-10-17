@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import subprocess
 import time
@@ -54,10 +55,23 @@ from bladex_proxy.models import (
 )
 from bladex_proxy.modules import module_enabled
 from bladex_proxy.project_identity import extract_cwd
-from bladex_proxy.route import NoCapableCandidateError, call_model, make_success_hook, resolve_route
+from bladex_proxy.route import (
+    NoCapableCandidateError,
+    UnknownRequestedModelError,  # V-A2 边界：core 的路由异常经 route.py 门面拿
+    call_model,
+    make_success_hook,
+    resolve_route,
+)
 from bladex_proxy.storage.memory_hub import MemoryHub
 from bladex_proxy.storage.pipeline_redis import DiskSpill, PipelineRedis
 from bladex_proxy.storage.pipeline_worker import PipelineWorker
+from bladex_proxy.surface_budget import (
+    FULL_PLAN,
+    chars_per_token_default,
+    estimate_tools_chars,
+    output_floor_tokens,
+    surface_budget_for,
+)
 
 logger = structlog.get_logger()
 
@@ -77,6 +91,8 @@ async def _resolve_with_memory(
     allowed_exposure: str = "public",
     principal_id: str | None = None,
     team_ids: list[str] | None = None,
+    prompt_tokens_est: int | None = None,
+    output_floor_tokens: int = 0,
 ) -> tuple[str, ModelRoute, list[ModelRoute]]:
     """路由决策（Phase 1：配置驱动确定性流水线 + RA 修复卡）。
 
@@ -98,6 +114,7 @@ async def _resolve_with_memory(
             auxiliary=auxiliary, session_id=session_id, context_chars=context_chars,
             allowed_exposure=allowed_exposure,
             principal_id=principal_id, team_ids=team_ids,
+            prompt_tokens_est=prompt_tokens_est, output_floor_tokens=output_floor_tokens,
         )
     # ADR-0021 T7: 路由 source 分布
     _m: Metrics | None = getattr(request.app.state, "metrics", None)
@@ -189,14 +206,55 @@ def _detect_prefix_changed(
         return False
 
 
+def _route_error_response(
+    message: str, *, error_type: str, log_event: str,
+    status_code: int = 422, **log_fields: object,
+) -> JSONResponse:
+    """路由侧快返错误的**唯一构造点**（三端点共用 `prep.error_response`）。
+
+    🔴 MQ-A18 / P7 的纪律：同一件事不许两处各做一次。成因不同的快返
+    （能力不足 / req_model 名未知）只允许**措辞与 type 不同**，
+    响应形态与状态码走这一个出口——否则就会长成 MQ-W16 那个形状：
+    两种成因合并成一句话，把用户指到错的地方去。
+    """
+    logger.warning(log_event, **log_fields)
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"message": message, "type": error_type}},
+    )
+
+
 def _capability_error_response(agent_id: str | None, requires: list[str]) -> JSONResponse:
     """§3.4 快返：能力过滤无合格候选 → 结构化错误（不静默降级到可能答非所问的模型）。"""
     who = f"agent {agent_id} 集合" if agent_id else "模型池"
     msg = f"{who}无 {requires} 能力，请补充对应多模态/能力模型"
-    logger.warning("route_no_capable_fastfail", agent=agent_id, requires=requires)
-    return JSONResponse(
-        status_code=422,
-        content={"error": {"message": msg, "type": "no_capable_candidate"}},
+    return _route_error_response(
+        msg, error_type="no_capable_candidate",
+        log_event="route_no_capable_fastfail",  # 事件名不改：既有 grep / 仪器在用
+        agent=agent_id, requires=requires,
+    )
+
+
+def _unknown_req_model_error_response(
+    agent_id: str | None, req_model: str,
+) -> JSONResponse:
+    """批 W W1（拍板 (12)）快返：[strategies.request] 开着 + model 名不在 [[models]]。
+
+    措辞必须指向**配置的那两处**（`[[models]]` 与该 agent 的 override），
+    不能复用能力不足那句——成因不同，指错地方等于没报。
+    """
+    who = f"agent {agent_id}" if agent_id else "该 agent"
+    msg = (
+        f"请求体里的 model \"{req_model}\" 不在 routing.toml 的 [[models]] 里，"
+        f"而 [strategies.request] 对 {who} 是开启的（= 你写哪个就用哪个）。"
+        f"BladeX 不替你换一个模型。两条修法：① 把 \"{req_model}\" 加进 "
+        f"routing.toml [[models]]；② 若本就想让 BladeX 自己选，"
+        f"把 [strategies.request.agent_overrides] 里该 agent 设为 false。"
+    )
+    return _route_error_response(
+        msg, error_type="unknown_requested_model",
+        log_event="route_unknown_req_model_fastfail",
+        agent=agent_id, req_model=req_model,
     )
 
 def _extract_output_modalities(body: dict) -> list[str]:
@@ -321,7 +379,8 @@ async def _prepare_round(
     prep = RoundPrep()
 
     t0 = time.perf_counter()
-    identity, agent_source = resolve_identity(headers, req, request.app.state.identity_registry)
+    identity, agent_source = resolve_identity(headers, req, request.app.state.identity_registry,
+                                               body=body)   # body：codex `client_metadata` 退路（批 E）
     # 项目识别第一档（2026-08-29）：cwd 标记 → git 指纹键；确定性、按 cwd 缓存。
     from bladex_proxy.project_identity import resolve_from_request as _resolve_project
     _proj = _resolve_project(headers, req.messages)
@@ -350,6 +409,8 @@ async def _prepare_round(
         assembler=request.app.state.assembler,
         prefix_changed=prefix_changed,
         session_id=identity.session_id, agent_id=identity.agent_id,
+        goal=_assembly_goal_anchor(request, identity),
+        verdict_loader=_assembly_verdict_loader(request, identity),
     )
     _record_inject_metrics(request, route_facts)
     # ADR-0024 T1：任务单元挂 request.state，_enqueue_turn 取用落 Memory Hub
@@ -359,6 +420,15 @@ async def _prepare_round(
 
     # T1（RA1）：上下文规模估算（注入后的 final messages = 真实发上游的规模）
     context_chars = _estimate_context_chars(injected_messages)
+    # 批 Z · Z2.2：窗口感知路由要的 prompt 估算（token）= 正文（含硬规则）+ agent 工具 schema，
+    # 按 chars/token 换算；输出下限一并传。窗口没配的模型在 router 里不参与判断，这里恒计算
+    # 的只是一个整数，零副作用。停进 request.state 供 `_apply_agency_surfaces` 裁注入面用。
+    _agent_tools_chars = estimate_tools_chars(req.tools)
+    _cpt = chars_per_token_default()
+    _floor = output_floor_tokens()
+    _prompt_tokens_est = int(math.ceil((context_chars + _agent_tools_chars) / _cpt)) if _cpt > 0 else None
+    request.state.bladex_agent_tools_chars = _agent_tools_chars
+    request.state.bladex_prompt_tokens_est = _prompt_tokens_est
     if log_route_debug:
         logger.info("route_debug", body_keys=sorted(body.keys()),
                      has_modalities="modalities" in body, has_audio="audio" in body,
@@ -378,16 +448,19 @@ async def _prepare_round(
     prep.cap_info = cap_info
 
     try:
-        prep.model, prep.route, prep.failover = await _resolve_with_memory(request, req.model, cfg, query, messages, facts=route_facts, agent_id=identity.agent_id, auxiliary=is_cheap_tier_auxiliary(identity.aux_source), output_modalities=output_modalities, session_id=identity.session_id, context_chars=context_chars, allowed_exposure=allowed_exposure, principal_id=identity.user_id, team_ids=identity.team_ids)
+        prep.model, prep.route, prep.failover = await _resolve_with_memory(request, req.model, cfg, query, messages, facts=route_facts, agent_id=identity.agent_id, auxiliary=is_cheap_tier_auxiliary(identity.aux_source), output_modalities=output_modalities, session_id=identity.session_id, context_chars=context_chars, allowed_exposure=allowed_exposure, principal_id=identity.user_id, team_ids=identity.team_ids, prompt_tokens_est=_prompt_tokens_est, output_floor_tokens=_floor)
     except NoCapableCandidateError:
         prep.error_response = _capability_error_response(identity.agent_id, _required_capabilities(messages, output_modalities=output_modalities, agent_id=identity.agent_id, cfg=cfg))
+        return prep
+    except UnknownRequestedModelError as e:
+        # 批 W W1：策略开 + 名字未知 ⇒ 到这里时**尚未发生任何上游调用**
+        # （call_model 在 _prepare_round 之后），零替换。
+        prep.error_response = _unknown_req_model_error_response(identity.agent_id, e.req_model)
         return prep
 
     prep.decision_meta = _build_decision_meta(
         prep.route,
         cap_triggered=cap_info.get("triggered", False),
-        cap_summary_hash=cap_info.get("summary_hash", ""),
-        cap_kept_recent_n=cap_info.get("kept_recent_n", 0),
         inject_position="before_last_user",
         injected_fact_ids=cap_info.get("injected_fact_ids") or [],
         injected_matter_ids=cap_info.get("injected_matter_ids") or [],
@@ -434,27 +507,66 @@ def _apply_agency_surfaces(
                   else "")
     ledgerless_aux = bool(aux_reason)
     memory_blocked = ledgerless_aux and aux_reason not in LEDGER_ONLY_AUX_REASONS
+    # ── 批 Z · Z2.3：BladeX 自己的注入面按预算裁剪（只在所选模型配了 context_window 时存在）──
+    # 预算 = (窗口 − 输出下限) × chars/token − agent 正文 − agent 工具 schema − 硬规则块。
+    # 稳定层计划按会话首轮冻结（`agency.stable_plan`）；动态层（账本块）每轮按剩余预算裁。
+    # 🔴 只裁 BladeX 加的东西：`prep.messages`（agent 正文）与 `tools_in` 在这里一字不动。
+    _window = int(getattr(prep.route, "context_window", 0) or 0)
+    _budget = None
+    if _window > 0:      # 没配窗口 ⇒ 这一段一行都不跑（判据 ① 逐字零行为）
+        _rc = getattr(getattr(request.app.state, "config", None), "routing_config", None)
+        _cpt = (_rc.chars_per_token_for(prep.model, chars_per_token_default())
+                if _rc is not None and hasattr(_rc, "chars_per_token_for")
+                else chars_per_token_default())
+        _budget = surface_budget_for(
+            context_window=_window,
+            agent_chars=(estimate_context_chars(prep.messages)
+                         + int(getattr(request.state, "bladex_agent_tools_chars", 0) or 0)),
+            hard_rules_chars=len(prep.injected_text or ""),
+            chars_per_token=_cpt)
+    # `hasattr`：只为测试替身（`test_f1_anchor_no_cross_talk` 的 `_Agency` 只带三个方法）；
+    # 真 `AgencyRuntime` 恒有 `stable_plan`，本批的编排级守卫走的是真实例。
+    _plan = (agency.stable_plan(identity.session_id or "", _budget)
+             if hasattr(agency, "stable_plan") else FULL_PLAN)
     tools_now, tf_injected = agency.augment_tools(
         tools_in, agent_id=identity.agent_id, stream=stream,
         auxiliary=memory_blocked, ledgerless=ledgerless_aux,
         aux_reason=aux_reason, tier=prep.route.tier,
+        stable_plan=_plan,
         # 🔴 账本族的第二个放行口需要这两个（2026-08-30）：本会话绑着激活账本
         # 时即使档位在集合外也给账本工具。与下面 insert_ledger_block 传的是
         # 同一组值、同一个判据（`session_owns_active_ledger`）。
         session_id=identity.session_id, project_id=identity.project_id)
+    # Z2.3 动态层剩余预算 = 总预算 − 这一轮实际注的稳定层（工具 schema 增量 + 自我介绍）。
+    _remaining: int | None = None
+    if _budget is not None:
+        _stable_now = ((estimate_tools_chars(tools_now) - estimate_tools_chars(tools_in))
+                       if tf_injected else 0)
+        if hasattr(agency, "about_block_chars"):
+            _stable_now += agency.about_block_chars(
+                ledger_face=bool(getattr(agency, "last_ledger_face", False)),
+                stable_plan=_plan, toolface_injected=tf_injected)
+        _remaining = _budget.available_chars - _stable_now
+        logger.info("agency_surface_budget", **_budget.as_log(), stable_chars=_stable_now,
+                    remaining_chars=_remaining, stable_trimmed=list(_plan.trimmed),
+                    model=prep.model, agent=identity.agent_id,
+                    session=(identity.session_id or "")[:24])
     prep.injected_messages = agency.insert_ledger_block(
         prep.injected_messages, identity.agent_id,
         project_id=identity.project_id,
         auxiliary=ledgerless_aux, with_instruction=tf_injected,
         # MQ-L28：块注入与工具面吃同一个档位判定 + 绑定会话判据
-        tier=prep.route.tier, session_id=identity.session_id)
+        tier=prep.route.tier, session_id=identity.session_id,
+        budget_chars=_remaining)
     # MQ-L77：说明书的账本段随账本面一起装卸。`last_ledger_face` 由上面那次
     # `augment_tools` 同步写入、中间无 await ⇒ 这里读的就是本请求的值（MQ-A49 的
     # 跨 await 陷阱在此不成立）。`getattr` 兜底与下面 `Turn.ledger_face` 同款：
     # 没走到 augment 那一步的形态里属性不存在，那一轮本就没有账本面。
     prep.injected_messages = agency.insert_system_notes(
         prep.injected_messages, toolface_injected=tf_injected,
-        ledger_face=bool(getattr(agency, "last_ledger_face", False)))
+        ledger_face=bool(getattr(agency, "last_ledger_face", False)),
+        # Z2.4：按会话定格落点与内容；Z2.3：同一份稳定层计划
+        session_id=identity.session_id or "", stable_plan=_plan)
     # MQ-A34 ③ 读数口径（2026-09-04）：BladeX 加进正文的**全部**字符 = 注入后正文 −
     # agent 原始正文。`_warn_if_output_truncated` 拿它当 `injected_chars` 的分子。
     # 修前分子是 `prep.injected_text`（inject 阶段的硬规则正文），而 32K 病例里
@@ -507,15 +619,19 @@ def _apply_agency_surfaces(
     #   ③ 每 agent 每进程只报一次，`extract_cwd` 这一次重算的代价可忽略
     #      —— 换来的是不必为一个日志字段去加宽 `Identity` 模型。
     # 🔴 要不要体检**只问 `_onb.pending`**（批 H 复核）：去重键归 onboarding 模块
-    # 唯一定义，这里不复述 `agent_id not in _seen`——G17.22 改键成 (agent_id, project_id)
-    # 时外面这句会静默挡住新行为。
+    # 唯一定义，这里不复述 `agent_id not in _seen`——键已于 MQ-A74 改成
+    # (agent_id, project_id)，外面若复述旧判据会静默挡住新行为。
     # 🔴 整段 try/except（批 H 复核）：体检是纯观测，`extract_cwd` 要在几十万字符的
     # 消息上跑正则；观测代码不该有能力让请求失败（热路径预算 200ms 之内的一段
     # 副作用，出错只许记一行）。
     _ident = prep.identity
     _agent_id = str(getattr(_ident, "agent_id", "") or "")
     _aux = bool(getattr(_ident, "auxiliary", False))
-    if _onb.pending(agent_id=_agent_id, auxiliary=_aux):
+    # MQ-A74：键 = (agent, project)，project 在 `_prepare_round` 里已经解出来了。
+    # 取值单独一行（不是风格偏好）：守卫 `test_onboarding_failure_never_escapes_hot_path`
+    # 按 `if _onb.pending([^)]*):` 认调用点，参数里再嵌一层括号它就认不出来了。
+    _proj_id = getattr(_ident, "project_id", "") or ""
+    if _onb.pending(agent_id=_agent_id, auxiliary=_aux, project_id=_proj_id):
         try:
             _onb.note_onboarding(
                 agent_id=_agent_id,
@@ -527,7 +643,7 @@ def _apply_agency_surfaces(
                 # `project_identity.resolve_from_request` 的 docstring 2026-08-29 就写了这条，
                 # 而 09-11 我照样把四个 agent 的 0% 全当成了缺陷。
                 cwd_found=bool(extract_cwd(prep.messages)),
-                project_id=getattr(_ident, "project_id", "") or "",
+                project_id=_proj_id,
                 project_source=getattr(_ident, "project_source", "") or "",
                 toolface_injected=bool(tf_injected),
             )
@@ -571,8 +687,8 @@ def _build_ledger_anchor(agency: Any, prep: RoundPrep) -> LedgerAnchor | None:
     """组 `Turn.ledger_anchor`（F-A1）。这一轮没注账本块 ⇒ `None`（缺数报缺数）。
 
     🔴 **仪器不许改行为**（批 F 高危 1）：整个函数只读 —— 读 agency 上每请求
-    覆写一次的三个读数（`last_ledger_breakdown` / `last_about_chars` /
-    `last_roster_chars`）与 prep 的两份正文，不碰任何注入结果。
+    覆写一次的两个读数（`last_ledger_breakdown` / `last_about_chars`）与 prep 的
+    两份正文，不碰任何注入结果。（`roster_chars` 随名册退役不再填，批 F4。）
     """
     bd = getattr(agency, "last_ledger_breakdown", None)
     if bd is None:
@@ -581,7 +697,6 @@ def _build_ledger_anchor(agency: Any, prep: RoundPrep) -> LedgerAnchor | None:
     return LedgerAnchor(
         ledger_id=bd.ledger_id, rev=bd.rev, sections=dict(bd.chars),
         about_chars=int(getattr(agency, "last_about_chars", 0) or 0),
-        roster_chars=int(getattr(agency, "last_roster_chars", 0) or 0),
         added_hash=hashlib.sha256(added.encode("utf-8")).hexdigest()[:16])
 
 
@@ -725,6 +840,39 @@ def _extract_bearer(authorization: str | None) -> str | None:
     return authorization.strip()
 
 
+def _assembly_goal_anchor(request: Request, identity: Identity) -> Any:  # noqa: ANN401
+    """ADR-0033 §2.4 装配复核的 goal 锚点：**本会话**绑着的激活账本的 Goal + Core（批 U · U1.3）。
+
+    未绑 / 继承来的绑定 ⇒ None（复核退化为只用 request 锚点）。键 = `(ledger_id, rev)`：
+    rev 变 ⇒ goal 向量与 goal 锚点的判定失效（§2.7）。取不到绝不打死请求。
+    """
+    agency = getattr(request.app.state, "agency", None)
+    if agency is None or not hasattr(agency, "session_active_ledger"):
+        return None
+    try:
+        led = agency.session_active_ledger(identity.agent_id, identity.project_id or "",
+                                           identity.session_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("assembly_goal_anchor_failed", error=str(e))
+        return None
+    if led is None or not (led.goal or "").strip():
+        return None
+    from bladex_proxy.assembly_review import GoalAnchor
+
+    core = "\n".join(e.text for e in led.entries("core") if getattr(e, "text", ""))
+    return GoalAnchor(ledger_id=led.ledger_id, rev=int(led.rev),
+                      text=(led.goal.strip() + ("\n" + core if core else "")))
+
+
+def _assembly_verdict_loader(request: Request, identity: Identity) -> Any:  # noqa: ANN401
+    """装配判定的重启恢复读点（批 U · U1.3）：Hub 里本会话最近一条带判定的 reconstruction。"""
+    hub = getattr(request.app.state, "hub", None)
+    if hub is None or not hasattr(hub, "latest_reconstruction"):
+        return None
+    prefix = identity.session_prefix()
+    return lambda: hub.latest_reconstruction(prefix)
+
+
 def _collect_headers(
     request: Request,
     authorization: str | None,
@@ -826,8 +974,11 @@ async def _try_recover_redis(request: Request) -> PipelineRedis | None:
     )
 
     # 1. 尝试直连
+    from bladex_proxy.storage.pipeline_redis import LiveNamespaceInTestError
     try:
         await pipeline.connect()
+    except LiveNamespaceInTestError:
+        raise  # 批 Z1b：测试进程闸不许被"连不上就拉起 redis"吞掉
     except Exception as connect_err:
         logger.info("pipeline_redis_connect_failed_trying_start", error=str(connect_err))
         # 2. 连不上 -> 尝试启动 Redis（仅本地实例）
@@ -843,14 +994,45 @@ async def _try_recover_redis(request: Request) -> PipelineRedis | None:
                      "Ensure the remote Redis is reachable.",
             )
             return None
+        # 🔴 拉起参数/日志路径/失败诊断收在 storage.redis_launch（单一真相源，
+        # 与 `bladex start` 同一份）。给 --logfile 是 2026-09-19 事故的直接产物：
+        # daemonize 且不给 logfile ⇒ redis 侧零日志，起不来时真因不可判定。
+        from bladex_proxy.storage.redis_launch import (
+            aof_manifest_problem,
+            launch_refusal,
+            redis_logfile_path,
+            redis_server_command,
+            tail_lines,
+            write_launch_record,
+        )
+        # 🔴 MQ-A90：data/ 已有 redis-server ⇒ 不拉第二个。09-22 批 F3 隔离实例配了
+        # `redis://127.0.0.1:1/0`（本意"连不上"），这里照常对生产 data/ 拉起 --port 1，
+        # 两个实例共用目录一周，关机时幽灵把过期 manifest 写回盘。
+        _refusal = launch_refusal(_redis_port)
+        if _refusal:
+            logger.error(
+                "pipeline_redis_autostart_refused",
+                port=_redis_port,
+                detail=_refusal,
+                hint="turns are NOT being stored until Redis on the configured port answers",
+            )
+            return None
+        _aof_problem = aof_manifest_problem()
+        if _aof_problem:
+            logger.error(
+                "pipeline_redis_aof_manifest_inconsistent",
+                detail=_aof_problem,
+                hint="Redis will fail to load the AOF and exit on start. Preview a verified "
+                     "fix with `bladex repair-aof`, then `bladex repair-aof --apply`.",
+            )
+        _redis_log = redis_logfile_path()
+        write_launch_record(_redis_log, "lazy-recovery", _redis_port)
         try:
             subprocess.Popen(
-                ["redis-server", "--daemonize", "yes", "--port", str(_redis_port),
-                 "--appendonly", "yes", "--appendfsync", "everysec",
-                 "--tcp-keepalive", "0",
-                 "--dir", "data/"],
+                redis_server_command(_redis_port, _redis_log),
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
+            logger.info("pipeline_redis_autostart", port=_redis_port, logfile=_redis_log)
             await asyncio.sleep(1)
             await pipeline.connect()
         except FileNotFoundError:
@@ -865,9 +1047,27 @@ async def _try_recover_redis(request: Request) -> PipelineRedis | None:
                 "pipeline_redis_recover_failed",
                 connect_error=str(connect_err),
                 start_error=str(start_err),
+                logfile=_redis_log,
+                redis_log_tail=tail_lines(_redis_log),
+                aof_manifest=_aof_problem or "consistent",
                 hint="Redis could not be started; turns are NOT being stored",
             )
             return None
+
+    # 🔴 MQ-A38（批 Z1）：懒恢复同样先登记。运行中无法"拒绝启动"，但同样不许偷——
+    # 另一个 BLADEX_HOME 占着这条流 ⇒ 不接（轮次继续落盘溢出），ERROR 已由 acquire 打出。
+    from bladex_proxy.storage.instance_claim import InstanceClaim, InstanceConflictError
+    claim = InstanceClaim(pipeline.redis, stream=cfg.redis_stream, group=cfg.redis_group,
+                          consumer=cfg.redis_consumer, url=cfg.redis_url, port=cfg.port)
+    try:
+        await claim.acquire()
+    except InstanceConflictError as conflict:
+        logger.error("pipeline_redis_recover_refused", error=str(conflict),
+                     hint="turns keep spilling to disk until the namespace conflict is fixed")
+        await pipeline.close()
+        return None
+    claim.start_heartbeat()
+    request.app.state.instance_claim = claim
 
     # 3. 连上了 -> 初始化 Pipeline + pipeline_worker
     request.app.state.pipeline = pipeline
@@ -1328,7 +1528,6 @@ def _inject_top_k() -> int:
 
 
 def _build_decision_meta(route: ModelRoute, *, cap_triggered: bool = False,
-                         cap_summary_hash: str = "", cap_kept_recent_n: int = 0,
                          inject_position: str = "",
                          injected_fact_ids: list[str] | None = None,
                          injected_matter_ids: list[str] | None = None,
@@ -1340,11 +1539,9 @@ def _build_decision_meta(route: ModelRoute, *, cap_triggered: bool = False,
     """
     return DecisionMeta(
         route={"source": route.source, "tier": route.tier, "reason": route.reason},
-        cap={
-            "triggered": cap_triggered,
-            "summary_hash": cap_summary_hash,
-            "kept_recent_n": cap_kept_recent_n,
-        },
+        # `summary_hash` / `kept_recent_n` 2026-09-18 退役（MQ-CA14）：L2 摘要机制已删，
+        # 两键再无生产者。历史 Turn 的 `cap` dict 里仍有旧键，读回照旧。
+        cap={"triggered": cap_triggered},
         inject_position=inject_position,
         injected_fact_ids=list(injected_fact_ids or []),
         injected_fact_keys=dict(injected_fact_keys or {}),

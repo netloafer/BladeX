@@ -20,7 +20,7 @@ from bladex_proxy.anthropic import (
     format_anthropic_response,
     parse_anthropic_request,
 )
-from bladex_proxy.capture import CaptureResult
+from bladex_proxy.capture import CaptureResult, bind_round
 from bladex_proxy.config import ModelRoute, ProxyConfig
 from bladex_proxy.models import (
     AgentSource,
@@ -222,6 +222,9 @@ async def _handle_anthropic_stream(
         # 生成器的 `t0` 在函数体第一行，而 async generator 创建时不执行函数体
         # ⇒ 等它跑起来，`await call_model` 早已返回，整段 TTFB 在窗口之外
         # （量出 0.32ms，而 tap 录的真值是 1,958ms）。
+        bind_round(result, agent_id=identity.agent_id, model=model,
+                   session_id=identity.session_id, path="/v1/messages",
+                   messages=messages)
         result.t_upstream = time.perf_counter()
         stream = await call_model(model, messages, stream=True, route=route, failover=failover,
                                   health=health, on_success=on_used, **extra_kwargs)

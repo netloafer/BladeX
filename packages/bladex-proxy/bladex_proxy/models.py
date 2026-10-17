@@ -189,7 +189,7 @@ class RequestParams(BaseModel):
 class DecisionMeta(BaseModel):
     """决策侧元数据（C4）：路由 + CAP + 注入位置--"模型实际看到什么"可重建。"""
     route: dict[str, str] = Field(default_factory=dict)    # {source, tier, reason}
-    cap: dict[str, Any] = Field(default_factory=dict)      # {triggered, summary_hash, kept_recent_n}
+    cap: dict[str, Any] = Field(default_factory=dict)      # {triggered}（summary_hash/kept_recent_n 2026-09-18 退役，MQ-CA14；历史值仍可读）
     inject_position: str = ""        # 注入位置标记
     # ADR-0028 E2.3：本轮**注入命中**的 fact id（cap 32）。
     # 为什么走 Memory Hub 而不是 proxy 直接写 Memory Index：写权只有 consolidator（ADR-0009 §7），
@@ -238,6 +238,30 @@ class ToolEvent(BaseModel):
     tool_call_id: str = ""
 
 
+class AssemblyVerdictRecord(BaseModel):
+    """装配复核的一条判定（ADR-0033 §2.7 `assembly_verdict` 派生记录，批 U · U1.3）。
+
+    随 `ReconstructionRecord.verdicts` 写穿 Memory Hub（与 reconstruction 一起落）：Hub 是真相源，
+    进程重启后 `assembly_review.cache().hydrate()` 从这里读回；离线可回放评估判定质量。
+
+    🔴 原则 13：**无损 + 来源可指认**。`source` 说是谁判的（embed 一级 / model 二级 / frozen = 复用），
+    `anchor_key` 说是对着哪个锚点判的（`req:<hash>` 本轮请求 / `goal:<ledger_id>@<rev>` 账本），
+    `decided_anchor_key` 说复用的判定**首次**在哪个锚点下做出（可回溯到首判那一轮），
+    `model` 说二级用的哪个模型。分数原样存（四位小数），不截断任何字段。
+    """
+
+    unit_key: str
+    verdict: str                          # kept | trimmed
+    source: str                           # embed | model | frozen
+    anchor_key: str = ""
+    score: float | None = None            # max(score_request, score_goal)；embed 未跑 = None
+    score_request: float | None = None
+    score_goal: float | None = None
+    model: str = ""
+    reason: str = ""                      # hi / lo / gray_kept / model / model_missing / timeout_kept …
+    decided_anchor_key: str = ""
+
+
 class ReconstructionRecord(BaseModel):
     """重构决策（ADR-0025 §5，Memory Hub 追加字段，标签区分原始 vs 重构）。
 
@@ -248,13 +272,20 @@ class ReconstructionRecord(BaseModel):
     """
 
     layer: str = "A"                              # A | AB | ABC | …P（P = ADR-0028 冷启裁剪）
-    degrade_plan: dict[int, str] = Field(default_factory=dict)  # msg_index -> full|excerpt|minimal
+    # msg_index -> 档位。ADR-0033（批 U · U1.4 起）：`{"tier": "kept"|"trimmed", "unit": unit_key,
+    # "source": "embed"|"model"|"frozen"}`（`assembly.replay_trim` 据此逐字复原）；历史 Hub 行是裸 str
+    # （L1 `excerpt` / B 层 `minimal`），类型放宽为两者并存，读回不受影响。
+    degrade_plan: dict[int, str | dict[str, str]] = Field(default_factory=dict)
     fingerprint: dict[str, list[str]] = Field(default_factory=dict)  # B 层关联指纹快照（可解释性）
     clarify_text: str = ""                        # C 层澄清块全文
     # ADR-0028 §3 约束4：冷启相关性裁剪决策（可回放可解释）。
     # {pruned: [unit_key], scores: {unit_key: float}, target, kept_chars, chars_before}
     prune: dict[str, Any] = Field(default_factory=dict)
     index_watermark: str = ""                        # 判定所依据的 Memory Index 时点（重放可定位）
+    # ADR-0033 §2.7（批 U · U1.3）：本轮装配复核的逐单元判定 + 本轮复核摘要
+    # （mode / candidates / reviewed / reused / gray / model_calls / model_units / timeout / trigger）。
+    verdicts: list[AssemblyVerdictRecord] = Field(default_factory=list)
+    review: dict[str, Any] = Field(default_factory=dict)
 
 
 class LedgerAnchor(BaseModel):
@@ -274,7 +305,8 @@ class LedgerAnchor(BaseModel):
       ——读数因此**可被第三方复算**，不必信 proxy 当时的自述。
     - `sections`：段级字符（键 = `agency.runtime.LEDGER_BLOCK_BUCKETS`，
       **按 key 读不按位置读**：账本可增段，新段自动多一个键）。
-      `sum(sections) + about_chars + roster_chars` = 本函数加进正文的全部字符
+      `sum(sections) + about_chars` = 本函数加进正文的全部字符（批 F4 前还要加
+      `roster_chars`，见该字段注释）
       （即 `bladex_added_chars`，在 `_apply_agency_surfaces` 之前无其它注入时逐字相等）。
     - `added_hash`：注入后正文 − 原正文 的拼接文本 sha256 前 16 位。用途是
       **对账**：两条记录 hash 相同 ⇒ 加进去的正文逐字相同，不必存全文。
@@ -287,6 +319,9 @@ class LedgerAnchor(BaseModel):
     rev: int = -1
     sections: dict[str, int] = Field(default_factory=dict)
     about_chars: int = 0
+    #: 🔴 **已退役（批 F4，2026-09-23）**：名册退出稳定层后生产者删除，新 Turn 恒 0。
+    #: 字段保留不删 = 历史 Turn（F4 前）上的非零值仍可读、跨 F4 的对账不断档；
+    #: 读数 0 在 F4 之后的含义是「没有名册段」，不是「生产者断线」（原则 13 层 3 的具名例外）。
     roster_chars: int = 0
     added_hash: str = ""
 
@@ -492,6 +527,10 @@ class Tombstone(BaseModel):
     target_key: str                                    # 被删条目的 Memory Hub key（turn/fact）或 matter_id / edge_id
     ts: datetime = Field(default_factory=lambda: datetime.now(UTC))
     source: TombstoneSource = TombstoneSource.USER
+    # Z4（MQ-P33，2026-09-23）：删除从哪条通道来（原则 13 层 4）。
+    # "" = 历史墓碑 / dashboard / CLI；"obsidian" / "postgres" = 外部工具回流。
+    # 加法式字段：存量墓碑缺省 ""，读写两侧零迁移。
+    origin: str = ""
 
 
 class AdminEventType(str, Enum):
@@ -558,6 +597,33 @@ class AdminEventType(str, Enum):
     # 惰性作用域迁移（08-29，MQ-A7 护栏：target 走 payload，matter_id 留空）
     LEDGER_SCOPE_MIGRATE = "ledger_scope_migrate"
     LEDGER_USER_EDIT = "ledger_user_edit"
+    # ── 批 Z · Z3（README 承诺的 close / supersede，MQ-L39 / MQ-L86）：账本生命周期。
+    # matter_id **留空**（本枚举 docstring 护栏），目标走 payload。**增量式**载荷：
+    #   payload = {ledger_id, origin ∈ {"model","user","cli"}, reason,
+    #              agent_id, project_id, session_id, turn_index}（后四个只有 model 来源带）
+    #   supersede 另带 superseded_by。
+    # 重放语义在 core `bladex_core.ledger`（close/supersede = 状态 closed + 解除它在各 scope
+    # 的激活、时间轴上切到空；reopen = 只恢复状态、不激活）。
+    LEDGER_CLOSE = "ledger_close"
+    LEDGER_REOPEN = "ledger_reopen"
+    LEDGER_SUPERSEDE = "ledger_supersede"
+    # ── Z4（MQ-P33，2026-09-23）：外部工具回流（Obsidian vault / Postgres 收件表）。
+    # matter_id **留空**（本枚举 docstring 护栏），目标走 payload。
+    #
+    # FACT_CORRECT：用户在外部改了一条 fact 的文字。**状态式完整载荷**（照抄 FACT_IMPORT：
+    # 重放 = 覆盖，不做 diff 重放）：
+    #   payload = {fact_id, entity: <更正后的 Fact 完整 dump，不含 embedding>,
+    #              previous_content, origin: "obsidian"|"postgres", submitter}
+    # 重放侧（`MemoryIndex.correct_fact`）先删旧向量行再写（LanceDB add 是追加），并把
+    # fact_id 记进"已更正"集合 —— 蒸馏 / 裁决 / 取代再碰到这条一律让路（manual 压过 auto，
+    # ADR-0012）。
+    FACT_CORRECT = "fact_correct"
+    # HARD_RULES_SET：Obsidian `Hard Rules.md` 被用户改过。状态式载荷：
+    #   payload = {rules: [str], previous: [str], origin: "obsidian", submitter}
+    # 🔴 Postgres 收件**永不**产生本事件（能写那张库的人 ≠ 能往每个 agent 塞指令的人）。
+    # 消费方 = Z1.2 硬规则热加载（MQ-W18）：它的单一解析 / 生效点读 Hub 里最近一条本事件
+    # 作为覆盖层；本批只负责采集与落账（结算稿 report-batch-Z4 §4 写明依赖）。
+    HARD_RULES_SET = "hard_rules_set"
 
 
 class AdminEvent(BaseModel):
@@ -575,6 +641,40 @@ class AdminEvent(BaseModel):
 
 
 # ── ADR-0012 §3.5: 管理端点请求模型（P6: Pydantic 校验，禁裸 dict）──
+
+
+#: Z4 回流通道白名单（原则 13 层 4：来源必须可指认，不收自由文本）。
+BACKFLOW_ORIGINS = frozenset({"obsidian", "postgres"})
+
+
+#: 账本生命周期 admin 端点可收的 `origin`（批 Z · Z3）。**不含 `model`**：模型只能经工具
+#: handler 关本（origin 由 handler 写死），HTTP 调用方不许冒充（原则 13 层 4）。
+LEDGER_LIFECYCLE_ADMIN_ORIGINS = frozenset({"user", "cli"})
+
+
+class LedgerLifecycleBody(BaseModel):
+    """POST /admin/ledgers/{id}/close | reopen | supersede 请求体（批 Z · Z3）。"""
+
+    origin: str = "user"         # ∈ LEDGER_LIFECYCLE_ADMIN_ORIGINS；CLI 传 "cli"
+    reason: str = ""
+    superseded_by: str = ""      # 只有 supersede 用（且必填）
+
+
+class CorrectFactBody(BaseModel):
+    """POST /admin/facts/{fact_id}/correct 请求体（Z4 外部工具回流）。"""
+
+    content: str = ""
+    origin: str = ""       # ∈ BACKFLOW_ORIGINS
+    submitter: str = ""    # 外部侧提交者（Obsidian = vault 路径；Postgres = 收件行 submitter）
+
+
+class HardRulesSetBody(BaseModel):
+    """POST /admin/hard-rules/set 请求体（Z4：仅 Obsidian 通道）。"""
+
+    rules: list[str] = Field(default_factory=list)
+    previous: list[str] = Field(default_factory=list)
+    origin: str = ""
+    submitter: str = ""
 
 
 class RememberFactBody(BaseModel):
@@ -598,6 +698,9 @@ class AssignMatterBody(BaseModel):
 
     target_type: str = "session"  # "session" | "fact"
     target_key: str = ""
+    # Z4 回流来源（空 = dashboard / CLI）；非空时进管理事件 payload（原则 13 层 4）
+    origin: str = ""
+    submitter: str = ""
 
 
 class MergeMattersBody(BaseModel):
@@ -623,6 +726,8 @@ class DetachEdgeBody(BaseModel):
     edge_id: str = ""
     target_key: str = ""
     target_type: str = "session"
+    origin: str = ""       # Z4 回流来源，同 AssignMatterBody
+    submitter: str = ""
 
 
 class SplitMatterBody(BaseModel):

@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from bladex_proxy import router_sdk
 from bladex_proxy.agency import intercept_responses_stream
-from bladex_proxy.capture import CaptureResult
+from bladex_proxy.capture import CaptureResult, bind_round
 from bladex_proxy.config import ModelRoute, ProxyConfig
 from bladex_proxy.models import (
     AgentSource,
@@ -26,6 +26,7 @@ from bladex_proxy.models import (
     TurnStatus,
 )
 from bladex_proxy.responses import (
+    empty_input_error,
     format_responses_response,
     parse_responses_request,
     responses_stream_generator,
@@ -125,6 +126,11 @@ def register_responses_routes(app: FastAPI) -> None:
 
         # 解析 Responses 请求 -> 归一成 OpenAI chat 格式
         messages, extra_kwargs = parse_responses_request(body)
+        # MQ-P24：input 一条都没认出来 ⇒ 400 快返，不把空对话发给上游。
+        empty = empty_input_error(body, messages)
+        if empty is not None:
+            logger.warning("responses_empty_input_rejected", message=empty["error"]["message"])
+            return JSONResponse(status_code=400, content=empty)
         is_stream = body.get("stream", False)
 
         # G11.1：完整 header 集合进身份解析（厂商前缀 header 此前被丢在门外）。
@@ -217,6 +223,9 @@ async def _handle_responses_stream(
         # 生成器的 `t0` 在函数体第一行，而 async generator 创建时不执行函数体
         # ⇒ 等它跑起来，`await call_model` 早已返回，整段 TTFB 在窗口之外
         # （量出 0.32ms，而 tap 录的真值是 1,958ms）。
+        bind_round(result, agent_id=identity.agent_id, model=model,
+                   session_id=identity.session_id, path="/v1/responses",
+                   messages=messages)
         result.t_upstream = time.perf_counter()
         stream = await call_model(model, messages, stream=True, route=route, failover=failover,
                                   health=health, on_success=on_used, **extra_kwargs)

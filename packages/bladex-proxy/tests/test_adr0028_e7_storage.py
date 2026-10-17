@@ -150,14 +150,12 @@ def test_project_fields_refreshed_deterministically(index):
     assert proj.progress_note == "E6 融合已落地"
 
 
-def test_project_card_triggered_by_root_path_in_request(index):
-    """触发条件是**确定性匹配**：请求正文里出现 root_path 前缀。"""
-    pid = project_id_for("/dev/BladeX")
-    index.upsert_project(Project(project_id=pid, root_path="/dev/BladeX",
-                              name="BladeX", description="记忆检索重构"))
-    lines = index.project_card_for("请看 /dev/BladeX/packages 下的实现")
-    assert lines and lines[0].startswith("[Project: BladeX]")
-    assert index.project_card_for("跟这个项目无关的一句话") == []
+def test_project_card_renderer_removed(index):
+    """E7.2 Project 卡注入 2026-09-18 批 S 删设计（拍板 0.3.0-(5)，ADR-0034 §3.2）：
+    `Project` 对象仍在（dashboard 读），注入渲染入口不许再出现。"""
+    assert not hasattr(index, "project_card_for")
+    import bladex_core.project as _proj
+    assert not hasattr(_proj, "render_project_card")
 
 
 def test_maintain_projects_discovers_from_rulefile(index):
@@ -219,19 +217,17 @@ def test_build_user_md_and_agent_md(index):
     assert got_user == user_md and got_agent == agent_md
 
 
-def test_profile_card_v2_used_when_profile_md_exists(index):
-    """render v2：画像卡改由 USER.md 节选，取代"路径串联乱码"的旧渲染。"""
+def test_profile_card_renderer_removed_but_user_md_kept(index):
+    """E7.3 画像卡注入 2026-09-18 批 S 删设计（ADR-0034 §3.2）：USER.md 投影（dashboard /
+    用户读）保留，注入渲染入口 `get_profile_cards` / `render_profile_card` 不许再出现。"""
     pref = Fact(id="pipeline", content="用户希望回复简洁不要 emoji",
                 item_kind=ItemKind.PREFERENCE, source_user_id="u1", importance=0.9)
     pref.agent_id = "hermes"
     index.add_fact(pref)
-    index.build_user_md("u1")
-
-    cards = index.get_profile_cards("u1", "hermes")
-    flat = [ln for card in cards for ln in card]
-    assert any("用户希望回复简洁不要 emoji" in ln for ln in flat)
-    assert all("使用规则文件" not in ln for ln in flat)   # 旧渲染退役
-    assert len(flat) <= 5
+    assert "用户希望回复简洁不要 emoji" in index.build_user_md("u1")
+    assert not hasattr(index, "get_profile_cards")
+    import bladex_core.rulefile as _rf
+    assert not hasattr(_rf, "render_profile_card")
 
 
 # ── E7.4 工具习惯：使用结果维度 ────────────────────────────────────────

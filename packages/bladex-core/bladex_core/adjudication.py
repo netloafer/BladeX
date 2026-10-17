@@ -149,6 +149,7 @@ class AdjudicatorProtocol(Protocol):
 
 def fast_path_verdict(
     candidate: Fact, neighbors: list[Fact], *, entity_overlap_min: float = 0.6,
+    library_ids: frozenset[str] | set[str] = frozenset(),
 ) -> AdjudicationVerdict | None:
     """精确取代键命中时直接出裁决，**不调 LLM**。命中不了返回 None。
 
@@ -177,6 +178,22 @@ def fast_path_verdict(
 
     🔴 为什么不是"有一条重述就 NOOP"：那会让 `[B(旧值), A(重述)]` 这种邻居顺序
     判成 NOOP，**B 原地留 current**——比旧行为还差。顺序不该决定结果。
+
+    ## 🔴 2026-09-18（批 S · S2.1，MQ-I20）：`library_ids` —— 库内同键邻居只走保守路径
+
+    此前库内视图的邻居（`InRunNeighborSource` 从 LanceDB 回来的行）**没有 subject /
+    attribute**（向量表压根没这两列），于是 `supersede_key(old)` 恒 None、本函数对
+    库内邻居从不命中——同键折叠只在**同一批内**发生过，跨批/跨 pass 的同键条目
+    一律并存（批 S 实测：374 个同键并存组里 358 组成员成对相似度 ≥ MIN_SIM，
+    即它们**进过同一个篮子**却没折叠）。库内邻居现在由 `hydrate` 补齐坐标。
+
+    但库内同键**不等于**同批同键：库里那条经过了裁决、已是 current；候选若只是
+    **重述**（`should_merge`）⇒ NOOP（去重，零丢失）；候选若是**新值** ⇒
+    本函数**不表态**（返回 None，交 LLM 裁决器按内容判 ADD/UPDATE/NOOP）——
+    不走同批那条"同键新值 ⇒ 强制 UPDATE 全部同键"的快路径。理由：实测 374 组里
+    **267 组没有一对是重述**（attribute 多为「交付约束 / 需求规格」这类一键多值的
+    用法），强制取代会让旧值退出 current 召回 = 以"知识丢失"换冗余，撞第一红线；
+    是不是同一个值，交给已有的裁决器判，本函数只做零风险的那一半。
     """
     key = supersede_key(candidate)
     if key is None:
@@ -196,6 +213,9 @@ def fast_path_verdict(
             candidate_id=candidate.id, op=AdjudicationOp.NOOP,
             target_fact_ids=[restated[0].id], reason="fast_path:same_key_restated",
         )
+    if library_ids and any(old.id in library_ids for old in same_key
+                           if old not in restated):
+        return None   # 库内同键新值：不强制取代，交裁决器（S2.1 保守路径）
     return AdjudicationVerdict(
         candidate_id=candidate.id, op=AdjudicationOp.UPDATE,
         target_fact_ids=[old.id for old in same_key],

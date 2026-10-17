@@ -28,6 +28,7 @@ from bladex_core.routing import (
     RouteDecision,
     RoutingError,
     StickyOrigin,
+    UnknownRequestedModelError,
 )
 
 from bladex_proxy import router_sdk
@@ -273,6 +274,8 @@ async def resolve_route(
     session_id: str | None = None,
     context_chars: int | None = None,
     allowed_exposure: str = "public",
+    prompt_tokens_est: int | None = None,
+    output_floor_tokens: int = 0,
     # Phase 2 预留（本卡不实现，签名保持兼容）
     facts: list[Fact] | None = None,
     hard_rules: list[HardRule] | None = None,
@@ -293,6 +296,8 @@ async def resolve_route(
                 session_id=session_id, context_chars=context_chars,
                 req_model=req_model or None, allowed_exposure=allowed_exposure,
                 principal_id=principal_id, team_ids=team_ids,
+                prompt_tokens_est=prompt_tokens_est,
+                output_floor_tokens=output_floor_tokens,
                 facts=facts, hard_rules=hard_rules,
             )
             # 🔴 `agent`/`session_id` 进日志（2026-09-16，MQ-V32）：两者**本来就在参数里**，
@@ -305,6 +310,9 @@ async def resolve_route(
                 source=decision.source.value, tier=decision.tier,
                 model=decision.model, reason=decision.reason,
                 agent=agent_id or "", session_id=session_id or "",
+                # Z2.2：窗口读数并排（0 = 该模型未配窗口；est None = 调用方没估）
+                context_window=decision.context_window,
+                prompt_tokens_est=prompt_tokens_est,
             )
             primary = ModelRoute(
                 model=decision.model,
@@ -314,6 +322,7 @@ async def resolve_route(
                 source=decision.source.value,
                 tier=decision.tier,
                 reason=decision.reason,
+                context_window=decision.context_window,
             )
             failover = [
                 ModelRoute(model=c.model, api_base=c.api_base, api_key=c.api_key,
@@ -321,8 +330,12 @@ async def resolve_route(
                 for c in router.failover_candidates(decision)
             ]
             return decision.model, primary, failover
-        except NoCapableCandidateError:
+        except (NoCapableCandidateError, UnknownRequestedModelError):
             # T4：能力过滤无合格候选 → 不降级，透传给调用方返结构化错误。
+            # 🔴 批 W W1（拍板 (12)）：`UnknownRequestedModelError` 必须与它同档 re-raise。
+            # 少这一行，下面那个 `except Exception` 会把它吞成 `route_decision_failed`
+            # → 回落单一上游 = **仍然替换**，而且比改之前更难发现（MQ-CA15 同款形态：
+            # 宽 except 把新异常静默降级）。守卫 `test_route_unknown_req_model_wiring.py`。
             raise
         except Exception as e:  # noqa: BLE001
             logger.warning("route_decision_failed", error=str(e), hint="degrade to default upstream")

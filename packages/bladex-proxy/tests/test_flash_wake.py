@@ -167,28 +167,36 @@ class TestAdoptionReemit:
             "采纳未收敛 + 重启 ⇒ 零覆盖窗口必须还在"
 
 
-class TestTreeTrafficGating:
-    def test_tree_only_rescans_after_push(self, tmp_path):
+class TestBehaviorTrafficGating:
+    """画像轨道只在有新流量后重扫（批 F4 前这条节流由目录树与画像共用，树删后只剩画像）。"""
+
+    def test_behavior_only_rescans_after_push(self, tmp_path):
         calls = []
 
-        def tree_source():
+        def behavior_source():
             calls.append(1)
-            return {"sessions": {}, "session_ledgers": {}, "agent_last_seen": {},
-                    "agent_prompts": {}, "excluded": []}
+            return {"rows": [], "tombstone_hash": ""}
 
         d = FlashDaemon(root=str(tmp_path), principal="u1",
                         ledger_source=lambda: ({}, {}),
                         emit_admin_event=lambda t, p: None,
-                        tree_source=tree_source, tree_every_s=0.0)
+                        behavior_source=behavior_source, behavior_every_s=0.0)
         d.run_once()
         assert len(calls) == 1
         d.run_once()                    # 没有新流量 ⇒ 不重扫（wake 驱动的意义）
         assert len(calls) == 1
-        assert d.tree_wait_s() is None
+        assert d.behavior_wait_s() is None
         d.push()
-        assert d.tree_wait_s() == 0.0
+        assert d.behavior_wait_s() == 0.0
         d.run_once()
         assert len(calls) == 2
+
+    def test_no_behavior_source_no_wait(self, tmp_path):
+        d = FlashDaemon(root=str(tmp_path), principal="u1",
+                        ledger_source=lambda: ({}, {}),
+                        emit_admin_event=lambda t, p: None)
+        d.push()
+        assert d.behavior_wait_s() is None, "轨道不启用 ⇒ 主循环不该为它压超时"
 
 
 class TestReservedHooks:

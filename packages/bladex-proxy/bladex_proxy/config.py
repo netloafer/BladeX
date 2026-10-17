@@ -14,17 +14,14 @@ from typing import Any
 from bladex_core.flags import flag_number as _flag_number
 
 from bladex_proxy.auth import KeyStore
+from bladex_proxy.hard_rules import DEFAULT_HARD_RULES as _HARD_RULES_DEFAULT
+from bladex_proxy.hard_rules import live_rules as _live_hard_rules
+from bladex_proxy.hard_rules import parse_hard_rules_env as _parse_hard_rules_env
 from bladex_proxy.routing_config import RoutingConfig
 
 
 def _env(key: str, default: str) -> str:
     return os.environ.get(key, default)
-
-
-def _env_list(key: str, default: str) -> list[str]:
-    """环境变量按 || 分隔读成 list。"""
-    raw = _env(key, default)
-    return [item for item in raw.split("||") if item]
 
 
 def _flag_number_default(name: str) -> float:
@@ -52,6 +49,12 @@ def _flag_number_default(name: str) -> float:
 # `bladex_rocksdb` 那种名字在换存储引擎的那天就名不副实了。
 # 2026-09-05 目录名 `bladex_ledger` → `bladex_hub`（与 P3 层名 Memory Hub 对齐，
 # ADR-0032 §2.2；旧值与账本 LEDGER.md 撞名）。物理目录同日 mv，不留软链。
+#: Redis 命名空间三旋钮的默认值（= live 形态）。单一真相源：`ProxyConfig` 的字段默认与
+#: `storage.pipeline_redis` 的测试进程闸（批 Z1b，MQ-A77）都读这里，不许各抄一份字面量。
+DEFAULT_REDIS_STREAM = "bladex:turns"
+DEFAULT_REDIS_GROUP = "bladex-workers"
+DEFAULT_REDIS_CONSUMER = "worker-1"
+
 DEFAULT_HUB_DIR = "data/bladex_hub"
 DEFAULT_INDEX_DIR = "data/bladex_index"
 # P1 Memory Flash（ADR-0031 §5.2）：MD 文件形态的预装配注入包。
@@ -105,6 +108,8 @@ class ModelRoute:
     source: str = ""     # RouteSource.value（如 agent/filter/capability/upstream_default）
     tier: str = ""       # weak/medium/strong
     reason: str = ""     # 决策理由（可解释性）
+    # 批 Z · Z2.1：所选模型的上下文窗口（token；0 = 未配置）。`surface_budget` 裁注入面用。
+    context_window: int = 0
 
 
 @dataclass
@@ -124,9 +129,9 @@ class ProxyConfig:
 
     # ── Pipeline Redis ──
     redis_url: str = field(default_factory=lambda: _env("BLADEX_REDIS_URL", "redis://127.0.0.1:6379/0"))
-    redis_stream: str = field(default_factory=lambda: _env("BLADEX_REDIS_STREAM", "bladex:turns"))
-    redis_group: str = field(default_factory=lambda: _env("BLADEX_REDIS_GROUP", "bladex-workers"))
-    redis_consumer: str = field(default_factory=lambda: _env("BLADEX_REDIS_CONSUMER", "worker-1"))
+    redis_stream: str = field(default_factory=lambda: _env("BLADEX_REDIS_STREAM", DEFAULT_REDIS_STREAM))
+    redis_group: str = field(default_factory=lambda: _env("BLADEX_REDIS_GROUP", DEFAULT_REDIS_GROUP))
+    redis_consumer: str = field(default_factory=lambda: _env("BLADEX_REDIS_CONSUMER", DEFAULT_REDIS_CONSUMER))
     queue_max_len: int = field(default_factory=lambda: int(_env("BLADEX_QUEUE_MAX_LEN", "10000")))
 
     # ── Pipeline 背压（ADR-0009 §5b，阈值待真实流量校准）──
@@ -210,7 +215,9 @@ class ProxyConfig:
     hotpath_budget_ms: int = field(default_factory=lambda: int(_env("BLADEX_HOTPATH_BUDGET_MS", "200")))
 
     # ── 硬规则（每轮无条件注入）──
-    hard_rules: list[str] = field(default_factory=lambda: _env_list("BLADEX_HARD_RULES", ""))
+    # 解析唯一实现点在 `hard_rules.parse_hard_rules_env`；运行中的热加载见
+    # `effective_hard_rules`（Z1.2，MQ-W18）。
+    hard_rules: list[str] = field(default_factory=lambda: _parse_hard_rules_env(_env("BLADEX_HARD_RULES", "")))
 
     # ── 注入 ──
     # 2026-08-14 随 MAX_PREFETCH_K 3→15 连带 1800→4000（与 core 默认一致；基准标定见
@@ -218,13 +225,9 @@ class ProxyConfig:
     inject_max_chars: int = field(default_factory=lambda: int(_env("BLADEX_INJECT_MAX_CHARS", "4000")))
     inject_merge_system: bool = field(default_factory=lambda: _env("BLADEX_INJECT_MERGE_SYSTEM", "false").lower() in ("true", "1", "yes"))
 
-    # ── CAP 上下文感知代理（ADR-0016）──
-    # 超阈值时主动压缩旧历史为 Memory Index 蒸馏摘要，保近期对话原文。
-    # 关闭时回退纯叠加模式（向后兼容）。
-    cap_enabled: bool = field(default_factory=lambda: _env("BLADEX_CAP_ENABLED", "true").lower() in ("true", "1", "yes"))
-    cap_msg_threshold: int = field(default_factory=lambda: int(_env("BLADEX_CAP_MSG_THRESHOLD", "30")))
-    cap_preserve_turns: int = field(default_factory=lambda: int(_env("BLADEX_CAP_PRESERVE_TURNS", "6")))
-    cap_summary_max_chars: int = field(default_factory=lambda: int(_env("BLADEX_CAP_SUMMARY_MAX_CHARS", "1000")))
+    # （ADR-0016 CAP 的 cap_* 四个字段已于 2026-09-18 MQ-CA9 清账删除：全仓零消费方；
+    #   `BLADEX_CAP_ENABLED` / `BLADEX_ASSEMBLY_ENABLED` 已于 2026-09-23 批 U · U1.4 删除，
+    #   装配总开关只剩模块开关 `BLADEX_MODULE_ASSEMBLY`，ADR-0033 §2.8。）
 
     # ── 上游模型路由 ──
     upstream_model: str = field(default_factory=lambda: _env("BLADEX_UPSTREAM_MODEL", "openai/gpt-4o-mini"))
@@ -280,6 +283,14 @@ class ProxyConfig:
 
     @property
     def effective_hard_rules(self) -> list[str]:
+        """三个进程（proxy / consolidator / flash_daemon）读硬规则的**唯一咽喉**。
+
+        本进程 `hard_rules.arm()` 过 ⇒ 返回热加载器的当前值（`.env` ⊕ Hub `hard_rules_set`，
+        后写者赢）；否则逐字旧行为（启动时读的 env，空则默认两条）。
+        """
+        live = _live_hard_rules()
+        if live is not None:
+            return live
         if self.hard_rules:
             return self.hard_rules
         return _DEFAULT_HARD_RULES
@@ -357,8 +368,5 @@ class ProxyConfig:
         return None
 
 
-# 默认硬规则
-_DEFAULT_HARD_RULES = [
-    "NEVER use emojis in responses.",
-    "MUST respond in the same language as the user's message.",
-]
+# 默认硬规则（值的唯一定义在 hard_rules.DEFAULT_HARD_RULES）
+_DEFAULT_HARD_RULES = _HARD_RULES_DEFAULT

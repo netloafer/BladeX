@@ -68,7 +68,16 @@ class ModelSpec(BaseModel):
     exposure: str = EXPOSURE_PUBLIC
     # ADR-0028 §2：该模型的 Prompt Cache TTL（秒）。默认 300；`0` = 该模型无 cache，
     # 视为永远冷（每轮都允许重新规划裁剪）。
+    # 🔴 仅兜底、不作 cache 冷热的触发依据（MQ-CA17；地位与消费方清单见
+    # `bladex_core.routing.ModelCandidate.cache_ttl_s` 上方注释）。
     cache_ttl_s: int = 300
+    # 批 Z · Z2.1（MQ-A34 ①）：上下文窗口（token）。**缺省 0 = 未配置 = 逐字零行为**
+    # （不参与选池判断、不告警、不裁剪）。值由用户从 `ollama show <model>`（num_ctx）/
+    # 厂商文档抄进来，BladeX 不猜、不自动探测；`bladex doctor` 只提示"本地模型没配窗口"。
+    context_window: int = 0
+    # Z2.0 读数④：字符 → token 的换算（chars/token）。0 = 用全局 `BLADEX_CHARS_PER_TOKEN`。
+    # 各模型分布见 `docs/benchmarks/surface-budget-z2/`，按模型不同时在这里覆盖。
+    chars_per_token: float = 0.0
 
     # 解析后填充（不来自 TOML）
     api_key: str = ""
@@ -318,7 +327,39 @@ class RoutingConfig(BaseModel):
         cfg._validate_capabilities()
         cfg._validate_model_refs()
         cfg._validate_tier_consistency()
+        cfg._validate_context_windows()
         return cfg
+
+    def _validate_context_windows(self) -> None:
+        """Z2.1：`context_window` / `chars_per_token` 非负；负值是配置错误，拒绝启动（同 api_base 一族）。"""
+        for m in self.models:
+            if m.context_window < 0:
+                raise RoutingConfigError(
+                    f"routing.toml [[models]] name={m.name!r}: context_window={m.context_window} "
+                    f"must be >= 0 (0 = not configured; positive = tokens)")
+            if m.chars_per_token < 0:
+                raise RoutingConfigError(
+                    f"routing.toml [[models]] name={m.name!r}: chars_per_token={m.chars_per_token} "
+                    f"must be >= 0 (0 = use BLADEX_CHARS_PER_TOKEN)")
+
+    def local_models_without_context_window(self) -> list[str]:
+        """`bladex doctor` 提示用：看起来是本地模型（exposure=local 或 api_base 指本机）却没配窗口的。
+
+        只提示不填值——窗口是硬件常量，由用户从 `ollama show` 抄（MQ-A34 原拍板）。
+        """
+        from urllib.parse import urlparse
+        out: list[str] = []
+        for m in self.models:
+            host = ""
+            try:
+                host = (urlparse(m.api_base).hostname or "") if m.api_base else ""
+            except ValueError:
+                host = ""
+            is_local = (m.exposure == "local"
+                        or host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"})
+            if is_local and not m.context_window:
+                out.append(m.name)
+        return out
 
     def _derive_providers(self) -> None:
         """T4（RA4）：provider 未显式配置时从 api_base host 推导。"""
@@ -392,9 +433,9 @@ class RoutingConfig(BaseModel):
             val = os.environ.get(env_name)
             if not val:
                 raise RoutingConfigError(
-                    f"{what}: api_base_env 指向的环境变量 {env_name!r} 未设置或为空。\n"
-                    f"  请在 config/.env 里 export {env_name}=\"https://...\"，"
-                    f"或改用字面值 api_base = \"https://...\"。"
+                    f"{what}: api_base_env points to {env_name!r}, which is unset or empty.\n"
+                    f"  Set {env_name}=\"https://...\" in config/.env, "
+                    f"or use a literal api_base = \"https://...\" instead."
                 )
             literal = val
         if not literal:
@@ -406,22 +447,23 @@ class RoutingConfig(BaseModel):
         # ── 非法：给出精确诊断，不做"你是不是想…"式的猜测 ──
         looks_like_env = literal.replace("_", "").isalnum() and literal.isupper()
         detail = (
-            f"  实际值：api_base = {literal!r}\n"
-            f"  问题：缺少协议头，URL 必须以 http:// 或 https:// 开头"
-            f"（解析得到 scheme={scheme!r}）。\n"
+            f"  value: api_base = {literal!r}\n"
+            f"  problem: no scheme -- the URL must start with http:// or https://"
+            f" (parsed scheme={scheme!r}).\n"
         )
         if looks_like_env:
             detail += (
-                "  说明：该值形如环境变量名。`api_base` 字段**只接受字面 URL，不做环境变量解析**——\n"
-                "        这一点与 `api_key_env` 不同（后者存的是变量名）。\n"
+                "  note: this looks like an environment variable name. `api_base` only takes a\n"
+                "        literal URL and does not expand variables (unlike `api_key_env`, which\n"
+                "        holds a variable name).\n"
             )
         raise RoutingConfigError(
-            f"{what}: api_base 不是合法 URL，拒绝启动。\n"
+            f"{what}: api_base is not a valid URL; refusing to start.\n"
             + detail
-            + "  两种正确写法（二选一）：\n"
-            '    ① 字面 URL：    api_base = "https://api.example.com/v1"\n'
-            '    ② 引用环境变量：api_base_env = "BLADEX_UPSTREAM_API_BASE"\n'
-            "       （同时配置时 api_base_env 优先）"
+            + "  Use one of:\n"
+            '    1. a literal URL:          api_base = "https://api.example.com/v1"\n'
+            '    2. an environment variable: api_base_env = "BLADEX_UPSTREAM_API_BASE"\n'
+            "       (api_base_env wins if both are set)"
         )
 
     def _resolve_api_keys(self) -> None:
@@ -548,10 +590,18 @@ class RoutingConfig(BaseModel):
                 provider=m.provider,
                 exposure=m.exposure,
                 cache_ttl_s=m.cache_ttl_s,
+                context_window=m.context_window,
             )
             for m in self.models
             if m.available
         }
+
+    def chars_per_token_for(self, model: str, default: float) -> float:
+        """Z2：该模型的 chars/token（[[models]].chars_per_token 覆盖，0 = 用全局默认）。"""
+        for m in self.models:
+            if m.name == model and m.chars_per_token > 0:
+                return float(m.chars_per_token)
+        return float(default)
 
     def agent_strategy(self) -> AgentStrategyData:
         """产 core 的 AgentStrategyData。"""

@@ -5,6 +5,10 @@
 #   - 失败指数退避（目标不可达只降级不阻塞主管线）
 #   - 墓碑同步（BladeX 删除 → 目标侧删除）
 #   - 敏感联动：exporter 声明 exposure，Fact.exposure_ceiling 越级不出境
+#   - 回流（Z4）：外部编辑 → proxy admin 正门 → Memory Hub 管理事件 → Index 生效。
+#     先回流后导出；proxy 不在时本轮不导出（不盖掉还没落账的用户改动）。
+#     删除闸：一次要删的 fact > BLADEX_BACKFLOW_MAX_DELETES（config/.env，默认 5）
+#     或整页消失 ⇒ 一条都不删、只告警。
 # 凭证纪律：toml 只写 env 变量名，密钥放 config/.env。
 
 # ── 参考实现：JSONL 目录（调试/自定义管道）──
@@ -26,6 +30,9 @@
 # exposure = "private"
 # [exporters.options]
 # vault_dir = "~/Documents/Obsidian/BladeX"   # vault 内子目录（会自动创建）
+# backflow = true             # 默认开：改 fact 行文字 = 更正、挪行到别的 Matter 页 =
+#                             # 换归属（挪进 Inbox = 摘除）、删行 = 忘掉、改 Hard Rules.md
+#                             # = 硬规则整表。false = 只导出不回流。
 
 # ── PostgreSQL（T15）──
 # [[exporters]]
@@ -35,3 +42,10 @@
 # exposure = "private"
 # [exporters.options]
 # dsn_env = "BLADEX_PG_DSN"   # 连接串放 env（如 postgresql://user:pw@host/db）
+# inbox = false               # 默认关。true = 建只追加收件表 bladex_edit_inbox 并轮询：
+#                             #   INSERT INTO bladex_edit_inbox (target_type, target_id, op, new_value, submitter)
+#                             #   VALUES ('fact', '<fact id>', 'update', '新文字', 'alice');
+#                             # op ∈ update | assign（new_value = matter_id，'' = 摘除）| delete。
+#                             # 处理后原地回写 status = accepted | rejected + result_reason。
+#                             # 🔴 硬规则改动一律 rejected（能写这张库 ≠ 能往每个 agent 塞指令）。
+#                             # facts / matters 等导出表仍是只读镜像：直接改它们会被下一轮同步覆盖。

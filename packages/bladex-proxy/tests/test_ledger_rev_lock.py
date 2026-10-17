@@ -184,9 +184,11 @@ class TestProjectScopeWiring:
         assert src.count("project_id=project_id") >= sites
 
 
-class TestLazyScopeMigration:
-    """惰性作用域迁移（08-29 收尾拍板）：项目键 miss ∧ Global hit ∧ 有项目
-    信号 ⇒ 搬。实测依据：自发自愈 0/2、codex desktop 指纹跨天不换。"""
+class TestNoLazyScopeMigration:
+    """批 Y · Y1d（2026-09-28，拍板 (30)，MQ-L93）：惰性作用域迁移（08-29 收尾拍板）已停产。
+
+    原规则「项目键 miss ∧ Global hit ∧ 有项目信号 ⇒ 搬」T1 §7a 实测全库 4 次迁移 3 次跨项目。
+    这里保留原用例的形状、断言反过来；完整判据见 `test_y1d_no_scope_migration.py`。"""
 
     def _rt_global_bound(self, agent="codex"):
         led = _led(ledger_id="ldg-legacy0000001")
@@ -195,25 +197,25 @@ class TestLazyScopeMigration:
         rt.activation.restore({activation_scope(agent, ""): led.ledger_id})
         return rt, led
 
-    def test_tool_path_migrates_and_finds_ledger(self):
+    def test_tool_path_does_not_borrow_global_ledger(self):
         rt, led = self._rt_global_bound()
         out = _update(rt, {"section": "verified", "op": "add", "text": "迁移后可写"},
                       project="p-10ad1f61d0c2")
-        assert out.startswith("added"), out
-        assert rt.activation.active(
-            activation_scope("codex", "p-10ad1f61d0c2")) == led.ledger_id
-        assert rt.activation.active(activation_scope("codex", "")) == "", \
-            "搬 = Global 侧清除，不是复制"
+        assert not out.startswith("added"), out
+        assert rt.activation.active(activation_scope("codex", "p-10ad1f61d0c2")) == ""
+        assert rt.activation.active(activation_scope("codex", "")) == led.ledger_id, \
+            "Global 绑定原地不动（改前是 pop 走）"
 
-    def test_injection_path_migrates(self):
+    def test_injection_path_offers_global_ledger_as_candidate(self):
         rt, led = self._rt_global_bound()
         out = rt.insert_ledger_block(
             [dict(m) for m in _MSGS_STUB], "codex",
             project_id="p-10ad1f61d0c2")
-        assert any(led.ledger_id in (m.get("content") or "") for m in out), \
-            "迁移后注入面立即看见账本（正是 live 卡死的对偶）"
+        blk = "\n".join(m.get("content") or "" for m in out)
+        assert f"- {led.ledger_id}: " in blk, "落空时旧本必须在候选里（一次 switch 接上）"
+        assert "Active task ledger" not in blk, "不再把 Global 那本当项目键的激活本渲染"
 
-    def test_no_signal_no_migration(self):
+    def test_no_signal_untouched(self):
         rt, led = self._rt_global_bound()
         rt.insert_ledger_block([dict(m) for m in _MSGS_STUB], "codex",
                                project_id="")
@@ -232,28 +234,26 @@ class TestLazyScopeMigration:
         assert rt.activation.active(
             activation_scope("codex", "p-x")) == led2.ledger_id
         assert rt.activation.active(
-            activation_scope("codex", "")) == led.ledger_id, \
-            "项目键已有绑定 ⇒ 不迁移不清 Global"
+            activation_scope("codex", "")) == led.ledger_id
 
-    def test_migration_emits_replayable_event(self):
+    def test_no_event_emitted_on_first_project_request(self):
         events = []
         rt, led = self._rt_global_bound()
         rt._emit = lambda t, p: events.append(
             {"type": t.value, "payload": p})
         rt.insert_ledger_block([dict(m) for m in _MSGS_STUB], "codex",
                                project_id="p-abc")
-        assert events and events[0]["type"] == "ledger_scope_migrate"
-        # 重放等价：switch@Global + migrate ⇒ 只剩项目键
-        from bladex_core.ledger import binding_sessions, replay_ledger_events
+        assert events == [], "改前这里会发 ledger_scope_migrate"
+        # 历史事件仍按原样重放（判据②，冻结夹具见 core `test_scope_migrate_replay_frozen.py`）
+        from bladex_core.ledger import replay_ledger_events
         stream = [{"type": "ledger_switch", "payload": {
                        "agent_id": "codex", "session_id": "s0",
                        "to_ledger_id": led.ledger_id}},
-                  events[0]]
+                  {"type": "ledger_scope_migrate", "payload": {
+                       "agent_id": "codex", "from_project": "",
+                       "to_project": "p-abc", "ledger_id": led.ledger_id}}]
         _, bindings = replay_ledger_events(stream)
-        assert bindings == {
-            activation_scope("codex", "p-abc"): led.ledger_id}
-        # MQ-L28 保守：迁移后来源会话作废（dst 不设 ⇒ weak 档按继承不注）
-        assert binding_sessions(stream) == {}
+        assert bindings == {activation_scope("codex", "p-abc"): led.ledger_id}
 
 
 _MSGS_STUB = [{"role": "system", "content": "sys"},

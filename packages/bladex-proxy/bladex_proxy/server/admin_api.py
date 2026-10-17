@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from collections.abc import Callable
@@ -22,12 +23,17 @@ from bladex_proxy.admin_read import register_admin_read_routes
 from bladex_proxy.config import ProxyConfig
 from bladex_proxy.identity import _SYSTEM_ROLES, LOCAL_USER_ID
 from bladex_proxy.models import (
+    BACKFLOW_ORIGINS,
+    LEDGER_LIFECYCLE_ADMIN_ORIGINS,
     AdminEventType,
     AgentClaimBody,
     AgentRuleBody,
     AssignMatterBody,
+    CorrectFactBody,
     CreateMatterBody,
     DetachEdgeBody,
+    HardRulesSetBody,
+    LedgerLifecycleBody,
     MergeMattersBody,
     PromoteScopeBody,
     RememberFactBody,
@@ -46,6 +52,34 @@ logger = structlog.get_logger()
 
 _INDEX_WRITE_RETRIES = 3
 _INDEX_WRITE_RETRY_DELAY_S = 0.05
+
+#: 备份软闸：`data/backup_*` 目录名前缀（`data/` = Hub 目录的父目录）。
+_BACKUP_DIR_GLOB = "backup_*"
+
+
+def _newest_backup_age_days(hub: Any) -> float | None:
+    """最近一次 `data/backup_*` 距今多少天；没有备份 / 路径不可读 ⇒ `None`（NO-DATA ≠ 0）。
+
+    不可逆操作（账本墓碑 / `--with-memory`）前的**软闸**（MQ-I21）：只读一个 mtime，
+    **不阻断**。语义上 `None` 与 `0.0` 完全不同——前者是"这台机器上没有过备份或我读不到"，
+    后者是"刚备份过"；调用方不得把 `None` 当 0（原则 13 层 3 同族）。
+
+    mtime 取目录本身：`data/backup_<tag>` 是备份动作创建的那一刻，够用且最便宜
+    （递归 stat 一个 3G 的目录树只为一个近似时间，不划算）。
+    """
+    from pathlib import Path as _Path
+    try:
+        hub_path = _Path(str(getattr(hub, "_path", "") or ""))
+        if not hub_path.name:
+            return None
+        newest = max((d.stat().st_mtime for d in hub_path.parent.glob(_BACKUP_DIR_GLOB)
+                      if d.is_dir()), default=None)
+        if newest is None:
+            return None
+        return round(max(0.0, (time.time() - newest) / 86400.0), 2)
+    except OSError as e:
+        logger.warning("backup_age_probe_failed", error=str(e))
+        return None
 
 
 def _open_writable_index(cfg: ProxyConfig) -> MemoryIndex | None:
@@ -125,6 +159,61 @@ def _hub_unavailable() -> JSONResponse:
         status_code=503,
         content={"error": {"message": "Memory Hub unavailable", "type": "storage_error"}},
     )
+
+
+def _strict_query(*allowed: str) -> Callable[[Request], None]:
+    """🔴 未知 query 参数 ⇒ **400 并点名**，而不是 FastAPI 默认的静默忽略（MQ-I24 根因，批 T0b）。
+
+    2026-09-22 的事故：新 CLI 发 `?with_memory=true&dry_run=true` 给一个还不认识
+    `dry_run` 的 `delete_ledger`。FastAPI 把它当不存在 ⇒ 请求退化成
+    `?with_memory=true` **真删**执行，并回 200。CLI 于是照 dry-run 渲染，
+    打出 "nothing written" —— 而两本账本连记忆已经没了。
+
+    **与 MQ-A22「静默截断」同族：静默丢弃比丢弃更糟。** 丢弃至少还可能被读数抓到；
+    静默丢弃把"我要的那件事没发生"这个事实一起销毁了。
+
+    只挂在**写端点**上：只读端点多一个参数不会造成不可逆后果，而给它们加严格校验
+    会把 dashboard 的 cache-buster 之类无害参数也拒掉。
+
+    :param allowed: 该端点声明的全部 query 参数名（路径参数与 body 不在内）。
+    """
+    allowed_set = frozenset(allowed)
+
+    def _check(request: Request) -> None:
+        unknown = sorted({k for k in request.query_params if k not in allowed_set})
+        if unknown:
+            raise HTTPException(status_code=400, detail=(
+                f"unknown query parameter(s): {', '.join(unknown)}. "
+                f"This endpoint accepts {', '.join(sorted(allowed_set)) or '(none)'}. "
+                f"Refusing rather than silently ignoring them -- a parameter this server "
+                f"does not know is how a --dry-run once became a real, irreversible delete "
+                f"(MQ-I24). If you expected it to be known, the running proxy is probably "
+                f"older than your CLI: restart it."))
+
+    return _check
+
+
+def _origin_payload(body: Any) -> dict[str, str]:
+    """Z4：回流来源进管理事件 payload；dashboard / CLI 调用（origin 为空）载荷逐字不变。"""
+    if not getattr(body, "origin", ""):
+        return {}
+    return {"origin": body.origin, "submitter": getattr(body, "submitter", "")}
+
+
+#: 进程内 admin job 登记保留条数（只留最近的；完成的 job 结果供 CLI 轮询一次即可）。
+_ADMIN_JOBS_KEEP = 50
+
+
+def _admin_jobs(app: FastAPI) -> dict[str, dict[str, Any]]:
+    """进程内后台 admin job 登记（MQ-I30）。只留最近 `_ADMIN_JOBS_KEEP` 条已结束的。"""
+    jobs: dict[str, dict[str, Any]] | None = getattr(app.state, "admin_jobs", None)
+    if jobs is None:
+        jobs = {}
+        app.state.admin_jobs = jobs
+    finished = [k for k, j in jobs.items() if j.get("state") != "running"]
+    for k in finished[:max(0, len(finished) - _ADMIN_JOBS_KEEP)]:
+        jobs.pop(k, None)
+    return jobs
 
 
 def _admin_response(status_code: int, status_text: str, **extra: Any) -> JSONResponse:
@@ -295,10 +384,19 @@ def register_admin_routes(app: FastAPI) -> None:
     async def delete_fact(
         request: Request,
         fact_id: str,
+        origin: str = "",
         cfg: ProxyConfig = _admin_key_dep,
+        _strict: None = Depends(_strict_query("origin")),
     ) -> JSONResponse:
         """删除单条 Fact（Beta T11 `bladex memory forget`）：先写 Memory Hub FACT 墓碑，
-        再 Memory Index 级联（meta + 向量 + 归属边）。rebuild 侧按墓碑过滤不复活。"""
+        再 Memory Index 级联（meta + 向量 + 归属边）。rebuild 侧按墓碑过滤不复活。
+
+        `?origin=obsidian|postgres`（Z4 回流）：写进墓碑的 `origin` 字段，删除从哪来可指认。
+        """
+        if origin and origin not in BACKFLOW_ORIGINS:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": f"origin {origin!r} not in {sorted(BACKFLOW_ORIGINS)}",
+                "type": "validation_error"}})
         hub: MemoryHub | None = request.app.state.hub
         if hub is None:
             return _hub_unavailable()
@@ -320,16 +418,122 @@ def register_admin_routes(app: FastAPI) -> None:
             target_type=TombstoneTargetType.FACT,
             target_key=fact_id,
             source=TombstoneSource.USER,
+            origin=origin,
         )
         applied, existed = _apply_to_index(cfg, lambda p2w: p2w.delete_fact(fact_id))
         logger.info("admin_fact_deleted", fact_id=fact_id,
                     tombstone_key=tombstone_key, index_applied=applied,
-                    existed=bool(existed))
+                    existed=bool(existed), origin=origin or None)
         return _admin_response(
             200 if applied else 202,
             "deleted" if applied else "deferred",
             fact_id=fact_id, tombstone_key=tombstone_key,
         )
+
+    # ── Z4（MQ-P33）：外部工具回流 —— 正门在这里，Hub 唯一写者仍是 proxy ──
+
+    @app.post("/admin/facts/{fact_id}/correct")
+    async def correct_fact(
+        body: CorrectFactBody,
+        fact_id: str,
+        request: Request,
+        cfg: ProxyConfig = _admin_key_dep,
+    ) -> JSONResponse:
+        """外部工具更正一条 fact 的文字：先落 FACT_CORRECT 管理事件，再应用到 Index。
+
+        - 状态式完整载荷（更正后的 Fact dump），重放 = 覆盖；full rebuild 后仍在。
+        - 与现存文字一致 ⇒ 200 `unchanged`、**不落事件**（回声不算编辑）。
+        - Index 写锁被 consolidator 占着 ⇒ 202 deferred，consolidator 下一 pass 增量重放。
+        """
+        content = (body.content or "").replace("\n", " ").strip()
+        if not content:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": "content: field required", "type": "validation_error"}})
+        if body.origin not in BACKFLOW_ORIGINS:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": f"origin {body.origin!r} not in {sorted(BACKFLOW_ORIGINS)}",
+                "type": "validation_error"}})
+        hub: MemoryHub | None = request.app.state.hub
+        if hub is None:
+            return _hub_unavailable()
+        p2r: MemoryIndex | None = request.app.state.index
+        current = None
+        if p2r is not None:
+            try:
+                current = p2r.get_fact(fact_id)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("admin_fact_correct_lookup_failed", error=str(e))
+        if current is None:
+            return JSONResponse(status_code=404, content={"error": {
+                "message": "Fact not found", "type": "not_found"}})
+        if current.content == content:
+            return _admin_response(200, "unchanged", fact_id=fact_id)
+
+        from datetime import UTC, datetime
+
+        from bladex_core.consolidation_proxy import embed_passage_compat
+        corrected = current.model_copy(update={
+            "content": content, "updated_at": datetime.now(UTC), "embedding": None})
+        event_key = hub.append_admin_event(
+            AdminEventType.FACT_CORRECT, "", fact_id,
+            fact_id=fact_id,
+            entity=corrected.model_dump(mode="json", exclude={"embedding"}),
+            previous_content=current.content,
+            origin=body.origin, submitter=body.submitter)
+        embedder = getattr(request.app.state, "embedder", None)
+        if embedder is not None:
+            try:
+                corrected.embedding = embed_passage_compat(embedder, [content])[0]
+            except Exception as e:  # noqa: BLE001 —— 无向量仍入 meta；重放会重嵌
+                logger.debug("admin_fact_correct_embed_skip", error=str(e))
+        # 事件已在 Hub：即时应用失败（写锁 / 向量表维度等）一律降为 202 deferred，
+        # 交给 consolidator 的增量重放——绝不回 5xx 让调用方重试而重复落账。
+        try:
+            applied, _ = _apply_to_index(cfg, lambda p2w: p2w.correct_fact(corrected) or True)
+        except Exception as e:  # noqa: BLE001
+            applied = False
+            logger.warning("admin_fact_correct_index_apply_failed", fact_id=fact_id,
+                           error=str(e), hint="Hub event recorded; Index catches up on "
+                                              "the consolidator's next pass")
+        logger.info("admin_fact_corrected", fact_id=fact_id, origin=body.origin,
+                    event_key=event_key, index_applied=applied)
+        return _admin_response(200 if applied else 202,
+                               "corrected" if applied else "deferred",
+                               fact_id=fact_id, event_key=event_key)
+
+    @app.post("/admin/hard-rules/set")
+    async def set_hard_rules(
+        body: HardRulesSetBody,
+        request: Request,
+        cfg: ProxyConfig = _admin_key_dep,
+    ) -> JSONResponse:
+        """Obsidian `Hard Rules.md` 回流：落 HARD_RULES_SET 管理事件（状态式整表）。
+
+        🔴 只收 Obsidian：Postgres 收件拒绝硬规则（硬规则每轮注入每个请求，能写那张库
+        的人就能往所有 agent 塞指令）——收件侧先拒，这里再拒一次（纵深）。
+        🔴 空表拒收：硬规则是每轮必注的，清成零条是最坏的失败方式（Z1.2 判据③同族）。
+        生效 = Z1.2 热加载读 Hub 最近一条本事件作覆盖层（结算稿写明依赖）。
+        """
+        if body.origin != "obsidian":
+            return JSONResponse(status_code=403, content={"error": {
+                "message": f"hard rules can only be changed from obsidian, got {body.origin!r}",
+                "type": "forbidden"}})
+        rules = [r.strip() for r in body.rules if r and r.strip()]
+        if not rules:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": "refusing an empty hard-rule list (would drop every MUST/NEVER)",
+                "type": "validation_error"}})
+        hub: MemoryHub | None = request.app.state.hub
+        if hub is None:
+            return _hub_unavailable()
+        event_key = hub.append_admin_event(
+            AdminEventType.HARD_RULES_SET, "", "",
+            rules=rules, previous=list(body.previous),
+            origin=body.origin, submitter=body.submitter)
+        logger.info("admin_hard_rules_set", count=len(rules),
+                    previous=len(body.previous), origin=body.origin,
+                    event_key=event_key)
+        return _admin_response(200, "recorded", event_key=event_key, count=len(rules))
 
     # ── ADR-0012 §3.5: Matter 手动映射操作 ──
 
@@ -378,9 +582,13 @@ def register_admin_routes(app: FastAPI) -> None:
         if hub is None:
             return _hub_unavailable()
 
+        if body.origin and body.origin not in BACKFLOW_ORIGINS:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": f"origin {body.origin!r} not in {sorted(BACKFLOW_ORIGINS)}",
+                "type": "validation_error"}})
         hub.append_admin_event(
             AdminEventType.MATTER_ASSIGN, matter_id, body.target_key,
-            target_type=body.target_type,
+            target_type=body.target_type, **_origin_payload(body),
         )
 
         et = EdgeTargetType.SESSION if body.target_type == "session" else EdgeTargetType.FACT
@@ -929,10 +1137,14 @@ def register_admin_routes(app: FastAPI) -> None:
         if hub is None:
             return _hub_unavailable()
 
+        if body.origin and body.origin not in BACKFLOW_ORIGINS:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": f"origin {body.origin!r} not in {sorted(BACKFLOW_ORIGINS)}",
+                "type": "validation_error"}})
         hub.append_admin_event(
             AdminEventType.MATTER_DETACH, matter_id,
             edge_id=body.edge_id, target_key=body.target_key,
-            target_type=body.target_type,
+            target_type=body.target_type, **_origin_payload(body),
         )
 
         if body.edge_id:
@@ -1376,12 +1588,26 @@ def register_admin_routes(app: FastAPI) -> None:
                 "status": "not_found", "detail": f"unknown ledger {ledger_id}"})
         active = [dict(zip(("agent", "project"), split_scope(s), strict=True))
                   for s, lid in agency.activation.snapshot().items() if lid == ledger_id]
+        # 批 Z · Z3：取代链（README「`supersede` primitives」的读侧）。只存 `superseded_by`
+        # 一个方向（core 纪律），向前沿链走、反向由池派生；环 / 断链到池外就停，不猜。
+        chain: list[dict[str, str]] = []
+        seen = {ledger_id}
+        nxt = led.superseded_by
+        while nxt and nxt not in seen:
+            seen.add(nxt)
+            succ = agency.pool.get(nxt)
+            chain.append({"ledger_id": nxt, "title": getattr(succ, "title", "") or "",
+                          "status": getattr(succ, "status", "") or "(not in pool)"})
+            nxt = succ.superseded_by if succ is not None else ""
         return JSONResponse(content={
             "ledger": led.model_dump(mode="json"),
             "markdown": render_ledger_md(led),
             "children": [{"ledger_id": c.ledger_id, "title": c.title}
                          for c in children_of(agency.pool, ledger_id)],
             "active_in": sorted(active, key=lambda s: (s["agent"], s["project"])),
+            "superseded_chain": chain,
+            "supersedes": sorted(lid for lid, lg in agency.pool.items()
+                                 if lg.superseded_by == ledger_id),
         })
 
     @app.post("/admin/ledgers/bind-legacy-matters")
@@ -1428,24 +1654,125 @@ def register_admin_routes(app: FastAPI) -> None:
             "status": "dry_run" if dry_run else "bound",
             "checked": len(agency.pool), "unbound": len(todo), "ledgers": bound})
 
+    # ── 批 Z · Z3：账本生命周期（README 承诺的 close / supersede）──
+    # 执行点只有 `AgencyRuntime.lifecycle_close / lifecycle_reopen`（工具面同一对方法）；
+    # 这里只做 origin 校验与 HTTP 语义。三个动作都**追加式、可逆**（reopen），不同于墓碑。
+
+    def _lifecycle_guard(request: Request, ledger_id: str,
+                         body: LedgerLifecycleBody) -> tuple[Any, JSONResponse | None]:
+        if body.origin not in LEDGER_LIFECYCLE_ADMIN_ORIGINS:
+            return None, JSONResponse(status_code=400, content={"error": {
+                "message": f"origin {body.origin!r} not in "
+                           f"{sorted(LEDGER_LIFECYCLE_ADMIN_ORIGINS)}",
+                "type": "validation_error"}})
+        agency = getattr(request.app.state, "agency", None)
+        if agency is None:
+            return None, JSONResponse(status_code=503, content={"error": {
+                "message": "agency runtime unavailable", "type": "storage_error"}})
+        if ledger_id not in agency.pool:
+            return None, JSONResponse(status_code=404, content={
+                "status": "not_found",
+                "detail": f"unknown ledger {ledger_id} (not in the live pool)"})
+        return agency, None
+
+    async def _close_or_supersede(request: Request, ledger_id: str,
+                                  body: LedgerLifecycleBody, *, supersede: bool) -> JSONResponse:
+        agency, err = _lifecycle_guard(request, ledger_id, body)
+        if err is not None:
+            return err
+        successor = (body.superseded_by or "").strip()
+        if supersede and not successor:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": "superseded_by: field required", "type": "validation_error"}})
+        result, detail = agency.lifecycle_close(
+            ledger_id, origin=body.origin, reason=body.reason,
+            superseded_by=successor if supersede else "")
+        if result in ("unknown_successor", "self_successor"):
+            return JSONResponse(status_code=400, content={"error": {
+                "message": ("a ledger cannot supersede itself" if result == "self_successor"
+                            else f"unknown ledger {successor} (superseded_by)"),
+                "type": "validation_error"}})
+        led = agency.pool[ledger_id]
+        return _admin_response(200, result, ledger_id=ledger_id,
+                               ledger_status=led.status,
+                               superseded_by=led.superseded_by,
+                               freed_scopes=detail.get("freed_scopes", []))
+
+    @app.post("/admin/ledgers/{ledger_id}/close")
+    async def close_ledger_endpoint(
+        body: LedgerLifecycleBody,
+        ledger_id: str,
+        request: Request,
+        cfg: ProxyConfig = _admin_key_dep,
+    ) -> JSONResponse:
+        """关本：`status=closed`；它是某些 scope 的激活账本 ⇒ 这些 scope 的激活随之解除
+        （之后的轮次不锚到它）。已关 ⇒ 200 `noop`、不落事件。Goal 一字不动。"""
+        return await _close_or_supersede(request, ledger_id, body, supersede=False)
+
+    @app.post("/admin/ledgers/{ledger_id}/supersede")
+    async def supersede_ledger_endpoint(
+        body: LedgerLifecycleBody,
+        ledger_id: str,
+        request: Request,
+        cfg: ProxyConfig = _admin_key_dep,
+    ) -> JSONResponse:
+        """取代：关本 + 记下 `superseded_by`（`bladex ledger show` 沿链读）。"""
+        return await _close_or_supersede(request, ledger_id, body, supersede=True)
+
+    @app.post("/admin/ledgers/{ledger_id}/reopen")
+    async def reopen_ledger_endpoint(
+        body: LedgerLifecycleBody,
+        ledger_id: str,
+        request: Request,
+        cfg: ProxyConfig = _admin_key_dep,
+    ) -> JSONResponse:
+        """重开：只恢复状态（清取代指针），**不激活**——激活只有 switch 一条路。"""
+        agency, err = _lifecycle_guard(request, ledger_id, body)
+        if err is not None:
+            return err
+        result = agency.lifecycle_reopen(ledger_id, origin=body.origin, reason=body.reason)
+        return _admin_response(200, result, ledger_id=ledger_id,
+                               ledger_status=agency.pool[ledger_id].status)
+
     @app.delete("/admin/ledgers/{ledger_id}")
     async def delete_ledger(
         ledger_id: str,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        with_memory: bool = False,
+        dry_run: bool = False,
+        _strict: None = Depends(_strict_query("with_memory", "dry_run")),
     ) -> JSONResponse:
         """给账本打墓碑（`task-ledger-tombstone-cleanup-20260901.md`）。
 
         墓碑 = 「重建不得复活」（ADR-0012 §3.6）。账本层打一次，
-        三个消费方（agency 池 / 重建锚层 / flash 物化）全部跟随，
-        且锚定 Matter **自然不会被创建**——`_la_ledger_at` 查不到它。
+        三个消费方（agency 池 / 重建锚层 / flash 物化）全部跟随。
 
         🔴 **不可逆**：Hub 追加式，墓碑本身也是追加记录，没有"取消墓碑"。
         调用前请确认已备份 `data/bladex_hub` 与 `data/bladex_index`。
 
-        🔴 **不做级联**：账本的锚定 Matter 不在这里删。下一次全量重建时它不会被
-        重新创建，其成员 fact 落回 D1/五层兜底——那才是我们要的（让归属机制
-        自己判，不替它做决定）。存量库里那张卡要等重建才消失。
+        **派生记忆（拍板 0.3.0-(2)，批 S · S3，2026-09-18）**：
+        - 默认 **不动记忆**（墓碑账本 ≠ 清派生记忆），响应里如实给
+          `derived_facts_retained`（该账本激活窗口内源轮次蒸出的 current fact 数，
+          批 Q 仪器 `window_facts` 同口径）与 `hint`。
+          🔴 MQ-I19 之后锚卡**不再随全量重建消失**（墓碑不倒填，墓碑前窗口的轮次
+          仍锚到它）——记忆保留就是整张保留，不再"落回 DPL 兜底"。
+        - `?with_memory=true`：对窗口内每条源轮次追加 **TURN 墓碑**（Hub 层，
+          `ledger_memory.tombstone_ledger_memory`），重建自然不再蒸出；Index 级联尽力而为
+          （proxy 内 Index 只读 ⇒ deferred，MQ-I14 形态）。仍走墓碑、不物理删。
+
+        **`?dry_run=true`（MQ-I21，批 T0 2026-09-22）**：只算不写——一条墓碑都不追加、
+        池与激活表一字不动，返回与真跑同形的 `window_turns` / `derived_facts_retained`。
+        🔴 **尺子与扳机同源**：预览走的是**同两个只读函数**（`ledger_window_turn_keys` /
+        `count_window_facts`），不另写一条估算路径；两次调用的 `window_turns` 必须相等，
+        不等就说明有第二把尺子。
+        与 MQ-I22 同批上线的理由：窗口口径修好之后 `--with-memory` 才**开始真的**墓碑
+        大量 turn（修之前对有 project 身份的账本恒 0），没有 dry-run 就等于把一个
+        刚长出牙齿的不可逆操作直接对准存量。
+
+        **备份软闸**：响应带 `backup_age_days`（`data/backup_*` 最近一次的天数，
+        没有备份 ⇒ `None`）。**只告警不阻断**——拦住用户是产品决定，不是这条端点的事；
+        但"不可逆操作前没人知道上次备份是什么时候"是可发现性缺口（MQ-L17 教训）。
         """
         hub: MemoryHub | None = request.app.state.hub
         if hub is None:
@@ -1460,21 +1787,277 @@ def register_admin_routes(app: FastAPI) -> None:
                 "detail": f"unknown ledger {ledger_id} (not in the live pool; "
                           f"it may already be tombstoned)"})
 
+        from bladex_proxy.ledger_memory import (
+            count_window_facts,
+            ledger_window_turn_keys,
+            tombstone_ledger_memory,
+        )
+
+        index: MemoryIndex | None = getattr(request.app.state, "index", None)
+        title = getattr(agency.pool.get(ledger_id), "title", "")
+        backup_age = _newest_backup_age_days(hub)
+
+        if dry_run:
+            # 只算不写。窗口此时**尚无**账本墓碑，末端按 `now` 截止；真跑时末端 =
+            # 墓碑时刻（≈ now），故两者读数相等——判据 ③ 就是钉这一点。
+            window = ledger_window_turn_keys(hub, ledger_id)
+            retained = count_window_facts(index, window["turn_keys"])
+            n_txt = "NO-DATA (Memory Index unavailable)" if retained is None else str(retained)
+            logger.info("admin_ledger_tombstone_dry_run", ledger_id=ledger_id, title=title,
+                        with_memory=with_memory, window_turns=len(window["turn_keys"]),
+                        window_scopes=window["scopes"], derived_facts_retained=retained,
+                        backup_age_days=backup_age)
+            return _admin_response(
+                200, "dry_run", ledger_id=ledger_id, with_memory=with_memory, dry_run=True,
+                window_turns=len(window["turn_keys"]), window_scopes=window["scopes"],
+                derived_facts_retained=retained, backup_age_days=backup_age,
+                hint=("DRY RUN -- nothing written. Would tombstone the ledger"
+                      + (f" AND {len(window['turn_keys'])} source turns "
+                         f"(derived facts affected: {n_txt})" if with_memory
+                         else f"; {n_txt} derived facts would be kept")))
+
         tombstone_key = hub.append_tombstone(
             target_type=TombstoneTargetType.LEDGER,
             target_key=ledger_id,
             source=TombstoneSource.USER,
         )
-        title = getattr(agency.pool.get(ledger_id), "title", "")
         # 立刻从活着的池与激活表里摘掉，不必等重启（投影即时收敛）。
         agency.pool.pop(ledger_id, None)
         freed = agency.activation.forget_ledger(ledger_id)
+        # 窗口在账本墓碑**之后**算：墓碑时刻已合成"切到空"，窗口在这里自然闭合。
+        window = ledger_window_turn_keys(hub, ledger_id)
+        extra: dict[str, Any] = {"window_turns": len(window["turn_keys"]),
+                                 "window_scopes": window["scopes"]}
+        if with_memory:
+            extra["memory"] = tombstone_ledger_memory(hub, index, window["turn_keys"])
+            extra["derived_facts_retained"] = 0
+        else:
+            retained = count_window_facts(index, window["turn_keys"])
+            extra["derived_facts_retained"] = retained
+            n_txt = "N=NO-DATA (Memory Index unavailable)" if retained is None else str(retained)
+            extra["hint"] = (f"derived memory kept: {n_txt} facts from {len(window['turn_keys'])} "
+                             f"turns; re-run with --with-memory to tombstone them too")
         logger.info("admin_ledger_tombstoned", ledger_id=ledger_id, title=title,
                     tombstone_key=tombstone_key, freed_scopes=freed,
-                    hint="anchored Matter disappears on the next full rebuild; "
-                         "its facts fall back to D1/DPL attribution")
+                    with_memory=with_memory, backup_age_days=backup_age,
+                    **{k: v for k, v in extra.items() if k != "hint"})
         return _admin_response(200, "tombstoned", ledger_id=ledger_id,
-                               tombstone_key=tombstone_key)
+                               tombstone_key=tombstone_key, with_memory=with_memory,
+                               backup_age_days=backup_age, **extra)
+
+    @app.delete("/admin/ledgers/{ledger_id}/memory")
+    async def delete_ledger_memory(
+        ledger_id: str,
+        request: Request,
+        cfg: ProxyConfig = _admin_key_dep,
+        dry_run: bool = False,
+        _strict: None = Depends(_strict_query("dry_run")),
+    ) -> JSONResponse:
+        """只清**派生记忆**那一半：对该账本激活窗口内的源轮次打 TURN 墓碑（批 T0b 路径①，MQ-I23）。
+
+        # 为什么是一条独立的动作，而不是让 DELETE 对已墓碑账本放行
+
+        `DELETE /admin/ledgers/{id}` 的 404 说的是「这本不在活池」——**那个语义是对的**，
+        账本墓碑本来就是对活账本的动作。让它对已墓碑账本"放行一半"会把 404 稀释成
+        "有时表示不存在、有时表示只做另一半"，下一棒读不出它到底判的是什么。
+        拆成两件事之后两边都只说一句话：
+        - `DELETE /admin/ledgers/{id}`：给账本打墓碑（`?with_memory=true` 顺手连记忆）。**活池限定。**
+        - `DELETE /admin/ledgers/{id}/memory`：只清窗口记忆。**与活池无关**，
+          已墓碑的账本照样算得出窗口（窗口从事件流来，`ledger_window_turn_keys` 的 `known` 口径）。
+
+        挡路的现场（MQ-I23）：乙四本已在 09-22 被墓碑，且当时因 MQ-I22 各打 **0** 条
+        TURN 墓碑 ⇒ 41 条待补的轮次**没有任何 CLI 路径够得着**。
+
+        # 幂等
+
+        `scan_meta_snapshot()` 已滤掉被墓碑的 turn ⇒ 补跑一次，第二次窗口里不含上次
+        已墓碑的轮次，`turn_tombstones` 自然收敛到 0。**不靠调用方记得"只能跑一次"。**
+
+        # 404
+
+        只在账本**在事件流里也不存在**时报 404（真的没有这本）；已墓碑 ⇒ 正常执行。
+        """
+        hub: MemoryHub | None = request.app.state.hub
+        if hub is None:
+            return _hub_unavailable()
+
+        from bladex_proxy.ledger_memory import (
+            count_window_facts,
+            ledger_window_turn_keys,
+            tombstone_ledger_memory,
+        )
+
+        index: MemoryIndex | None = getattr(request.app.state, "index", None)
+        backup_age = _newest_backup_age_days(hub)
+        window = ledger_window_turn_keys(hub, ledger_id)
+        if not window["known"]:
+            return JSONResponse(status_code=404, content={
+                "status": "not_found",
+                "detail": f"unknown ledger {ledger_id} (no LEDGER_CREATE event in Memory Hub)"})
+
+        agency = getattr(request.app.state, "agency", None)
+        in_pool = agency is not None and ledger_id in agency.pool
+        n_turns = len(window["turn_keys"])
+        if dry_run:
+            retained = count_window_facts(index, window["turn_keys"])
+            n_txt = "NO-DATA (Memory Index unavailable)" if retained is None else str(retained)
+            logger.info("admin_ledger_memory_tombstone_dry_run", ledger_id=ledger_id,
+                        title=window["title"], window_turns=n_turns,
+                        window_scopes=window["scopes"], derived_facts_retained=retained,
+                        ledger_in_pool=in_pool, backup_age_days=backup_age)
+            return _admin_response(
+                200, "dry_run", ledger_id=ledger_id, title=window["title"], dry_run=True,
+                ledger_in_pool=in_pool, window_turns=n_turns, window_scopes=window["scopes"],
+                derived_facts_retained=retained, backup_age_days=backup_age,
+                hint=(f"DRY RUN -- nothing written. Would tombstone {n_turns} source turns "
+                      f"(derived facts affected: {n_txt}). The ledger object itself is NOT "
+                      f"touched by this endpoint."))
+
+        memory = tombstone_ledger_memory(hub, index, window["turn_keys"])
+        logger.info("admin_ledger_memory_tombstoned", ledger_id=ledger_id,
+                    title=window["title"], window_turns=n_turns,
+                    window_scopes=window["scopes"], ledger_in_pool=in_pool,
+                    backup_age_days=backup_age, **memory)
+        return _admin_response(200, "memory_tombstoned", ledger_id=ledger_id,
+                               title=window["title"], ledger_in_pool=in_pool,
+                               window_turns=n_turns, window_scopes=window["scopes"],
+                               memory=memory, backup_age_days=backup_age)
+
+    @app.post("/admin/turns/tombstone-by-project")
+    async def tombstone_turns_by_project(
+        body: dict[str, Any],
+        request: Request,
+        cfg: ProxyConfig = _admin_key_dep,
+        _strict: None = Depends(_strict_query()),
+    ) -> JSONResponse:
+        """按 **project 作用域**给轮次打墓碑（批 T0b 路径②，拍板 (3) 的"整体清"那条线）。
+
+        body: `{"project_ids": ["p-…", …], "dry_run": true}`。**`dry_run` 缺省 = `True`**
+        ——这条端点一次的口径是几千轮，默认必须是只读的（与 `bind-legacy-matters` 同款）。
+
+        # 只墓碑 turn
+
+        一条 LEDGER 墓碑都不打（拍板 (3) 的两条线不合并）。响应里的 `ledgers` 只是
+        影响面读数：该 project 作用域上出现过多少本账本，供调用方另行处置。
+
+        # 硬拒绝空 project
+
+        `project_id=""`（Global）是 project 识别恒空那段时期的全部流量（live ≈17,047 轮），
+        拍板 (3) 明写那一半**只能按账本清** ⇒ 400。计算层
+        （`project_purge.project_scope_preview`）也拒一次，两道不互相顶替。
+
+        # 每个 project 单独出读数
+
+        响应的 `projects` 是一个**逐 project 的列表**，不是一个总数：批量操作最容易
+        出的错是"总数看着对、其中一个 project 选错了"，只给总数就看不出来。
+
+        # 真跑 = 后台 job（MQ-I30，2026-09-29）
+
+        写墓碑逐轮 `append_tombstone` + 级联，live 实测 ≈3 轮/s（539 轮 ≈3 分钟）。此前在
+        请求处理里同步跑 ⇒ 事件循环被占满、`/ready` 无响应、代理的正常流量一起卡住。
+        现在：影响面预览照旧在请求里算（线程里跑，不占事件循环；空 project 仍当场 400），
+        **写墓碑交给后台线程**，端点立即回 `status="submitted"` + `job_id` + 预览读数
+        （与 `/admin/agents/reattribute` 的委托同形），完成后的结果——逐字是修前同步
+        响应的那一份——挂在 `GET /admin/jobs/{job_id}` 的 `result` 上，CLI 轮询到
+        `done` 再打印。job 登记在进程内（`app.state.admin_jobs`）：proxy 重启 ⇒ 登记丢失，
+        但墓碑是追加写、本端点幂等 ⇒ 重跑一次 dry-run 就知道还剩多少。
+        dry-run 分支不变（同步返回 `status="dry_run"`，闸 A 照读）。
+        """
+        hub: MemoryHub | None = request.app.state.hub
+        if hub is None:
+            return _hub_unavailable()
+
+        from bladex_proxy.ledger_memory import tombstone_ledger_memory
+        from bladex_proxy.project_purge import EmptyProjectRefused, project_scope_preview
+
+        raw = (body or {}).get("project_ids") or []
+        if not isinstance(raw, list):
+            raise HTTPException(status_code=400, detail="project_ids must be a list of strings")
+        dry_run = bool((body or {}).get("dry_run", True))
+        try:
+            preview = await asyncio.to_thread(project_scope_preview, hub, [str(x) for x in raw])
+        except EmptyProjectRefused as e:
+            logger.warning("admin_project_tombstone_refused", reason=str(e), count=len(raw))
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        index: MemoryIndex | None = getattr(request.app.state, "index", None)
+        backup_age = _newest_backup_age_days(hub)
+        rows: list[dict[str, Any]] = []
+        total = 0
+        for pid, row in preview.items():
+            rows.append({
+                "project_id": pid, "project_names": row["project_names"],
+                "turn_count": row["turn_count"], "agents": row["agents"],
+                "first_ts": row["first_ts"], "last_ts": row["last_ts"],
+                "ledgers": row["ledgers"],
+            })
+            total += row["turn_count"]
+
+        def _finish() -> dict[str, Any]:
+            logger.info("admin_project_tombstone" + ("_dry_run" if dry_run else ""),
+                        projects=len(rows), total_turns=total, dry_run=dry_run,
+                        backup_age_days=backup_age,
+                        project_ids=[r["project_id"] for r in rows])
+            return {"status": "dry_run" if dry_run else "tombstoned", "dry_run": dry_run,
+                    "projects": rows, "total_turns": total, "backup_age_days": backup_age,
+                    "hint": ("DRY RUN -- nothing written. " if dry_run else "")
+                    + f"{total} source turns across {len(rows)} project(s); "
+                      f"ledger objects are NOT touched by this endpoint."}
+
+        if dry_run:
+            return JSONResponse(status_code=200, content=_finish())
+
+        job_id = f"tbp-{uuid.uuid4().hex[:12]}"
+        job: dict[str, Any] = {
+            "job_id": job_id, "kind": "tombstone_by_project", "state": "running",
+            "done": 0, "total": total, "started_at": time.time(), "finished_at": None,
+            "result": None, "error": None,
+        }
+
+        def _run() -> None:
+            try:
+                for entry, (_pid, row) in zip(rows, preview.items(), strict=True):
+                    entry["memory"] = tombstone_ledger_memory(hub, index, row["turn_keys"])
+                    job["done"] += row["turn_count"]
+                job["result"] = _finish()
+                job["state"] = "done"
+            except Exception as e:  # noqa: BLE001 —— 失败要落到 job 上让 CLI 读到，不许静默
+                job["error"] = f"{type(e).__name__}: {e}"
+                job["state"] = "failed"
+                logger.warning("admin_project_tombstone_failed", job_id=job_id,
+                               done=job["done"], total=total, error=job["error"])
+            finally:
+                job["finished_at"] = time.time()
+
+        jobs = _admin_jobs(request.app)
+        jobs[job_id] = job
+        job["_task"] = asyncio.get_running_loop().create_task(asyncio.to_thread(_run))
+        logger.info("admin_project_tombstone_submitted", job_id=job_id, projects=len(rows),
+                    total_turns=total, project_ids=[r["project_id"] for r in rows])
+        return _admin_response(
+            200, "submitted", dry_run=False, job_id=job_id, poll=f"/admin/jobs/{job_id}",
+            projects=[dict(r) for r in rows], total_turns=total, backup_age_days=backup_age,
+            hint=f"{total} source turns across {len(rows)} project(s) are being tombstoned "
+                 f"in the background; poll /admin/jobs/{job_id} for the result.")
+
+    @app.get("/admin/jobs/{job_id}")
+    async def admin_job_status(
+        job_id: str,
+        request: Request,
+        cfg: ProxyConfig = _admin_key_dep,
+    ) -> JSONResponse:
+        """后台 admin job 的状态（MQ-I30）：`state` ∈ running | done | failed。
+
+        `done`/`total` 是轮次进度；`state=done` 时 `result` 是该操作修前同步响应的那一份。
+        登记只在进程内——proxy 重启后查旧 job ⇒ 404（见 tombstone-by-project 的说明）。
+        """
+        job = _admin_jobs(request.app).get(job_id)
+        if job is None:
+            return _admin_response(404, "not_found", detail=(
+                f"unknown job {job_id} (jobs live in the proxy process; a restart forgets "
+                f"them -- re-run the matching --dry-run to see what is left)"))
+        return _admin_response(200, "ok", job={k: v for k, v in job.items()
+                                               if not k.startswith("_")})
 
     # ── V-A3（F0.2）：只读 admin API + dashboard 归 `admin_read` 模块，默认开 = 现状；
     #    关 ⇒ 这两组路由**不登记**（404），上面的写端点照常。登记时机 = create_app，

@@ -130,6 +130,116 @@ class CaptureResult:
     # **整段 TTFB 落在测量窗口之外**。实证：全 agent p50 1.1–1.4ms，
     # 而同任务的裸跑真 TTFB p50 **1,958ms**（tap 录音），差三个数量级。
     t_upstream: float = 0.0
+    # ── 批 R · R1（2026-09-18）：本轮归属与请求侧体量，由端点经 `bind_round()` 写入，
+    #    三条路径的 `*_capture_done` 经 `round_fields()` 一并打出 ──
+    # 🔴 归属（MQ-P29 卡登记的仪器缺口）：此前**三条**路径的 capture 行都不带
+    # agent / model / session_id / path（批 M 结算稿写的"另两条路径带"是读错了——
+    # 09-17 日志逐行看过，`anthropic_capture_done` 也没有），探针只能按行序就近挂到上一条
+    # `route_decision`，并发两个 agent 时会错位。落进行里就不需要 join。
+    agent_id: str = ""
+    model: str = ""
+    session_id: str = ""
+    path: str = ""
+    # MQ-CA13 ②：本轮请求里**工具结果**的体量（字符数 / 条数）。`probe_cache_gap.residual`
+    # 只减了上一轮 output、没减工具结果，而工具结果各跑之间差 4× ⇒ 分母未受控。
+    tool_result_chars: int = 0
+    tool_result_n: int = 0
+    # 发起上游调用的墙钟（epoch 秒）。与 `t_upstream`（perf_counter，只算差值）不同：
+    # 这个要和上一轮 `t_done_epoch` 相减算 **gap_a（真空闲）**，必须是可跨行比较的绝对时钟。
+    t_call_wall: float = 0.0
+    # 批 U · U1.2（ADR-0033 §2.3）：本轮上游回报的 cache 命中读数（None = 没报）。
+    # 由 `note_cache_reading()` 写入并登记进 `cache_state`，下一轮装配触发门读它。
+    cache_read_tokens: int | None = None
+
+
+def tool_result_volume(messages: list[dict]) -> tuple[int, int]:
+    """请求里工具结果的 (字符数, 条数)。纯函数（MQ-CA13 ②）。
+
+    两种载体都认：协议归一化后的 `role == "tool"` 消息（三条入站路径进 `do_inject`
+    前都已归一化）；以及 Anthropic 风格残留在 user content 里的 `tool_result` block
+    （`task_unit._has_tool_result_block` 同款，T0 实测 2/4251 轮）。
+    content 为 list 时只数其 text 块。
+
+    🔴 口径纪律（MQ-CA13）：报本条任何数字必须**同时给 `gap_a`（真空闲）**——本函数
+    给的是分母的一部分，不是成因；成因判决表在 `task-ca12-cause-separation-20260915.md`。
+    """
+    chars = 0
+    n = 0
+
+    def _text(c: object) -> str:
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            return "".join(str(b.get("text") or b.get("content") or "")
+                           for b in c if isinstance(b, dict))
+        return ""
+
+    for m in messages or ():
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        c = m.get("content")
+        if role == "tool":
+            chars += len(_text(c))
+            n += 1
+        elif role == "user" and isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    chars += len(_text(b.get("content")))
+                    n += 1
+    return chars, n
+
+
+def bind_round(result: CaptureResult, *, agent_id: str, model: str, session_id: str,
+               path: str, messages: list[dict]) -> None:
+    """端点在**发起上游调用之前**调一次：把本轮归属 + 工具结果体量 + 起跑墙钟写进 result。
+
+    三条入站路径各调一次（与 `t_upstream` 同款接线；守卫 `test_r1_capture_round_fields.py`
+    钉三处调用点都在）。`messages` 是**真正发给上游的那份**（含本轮注入与内循环拼接的
+    工具结果）——量的是上游看到的分母。
+    """
+    result.agent_id = agent_id or ""
+    result.model = model or ""
+    result.session_id = session_id or ""
+    result.path = path
+    result.tool_result_chars, result.tool_result_n = tool_result_volume(messages)
+    result.t_call_wall = time.time()
+
+
+def round_fields(result: CaptureResult) -> dict[str, Any]:
+    """`*_capture_done` 三条路径共用的归属/体量/时钟字段（MQ-CA5 / CA13 / P29 卡）。
+
+    `t_call_epoch` / `t_done_epoch` 都是 `time.time()`：`probe_cache_ttl.py` 用
+    本轮 `t_call_epoch − 上轮 t_done_epoch` 算 gap_a，与 `probe_cache_gap.py` 的
+    "`route_calling` 行时刻 − 上轮 capture 行时刻"**同一定义**（起跑点都在 `call_model`
+    之前几行内），只是时钟从日志行的秒级换成本行自带的浮点秒——不是第二把尺子。
+    `t_call_wall=0` = 端点没绑（旧调用方 / 测试），两个 epoch 都报 None 而不是 0。
+    """
+    bound = result.t_call_wall > 0
+    return {
+        "agent": result.agent_id, "model": result.model,
+        "session_id": result.session_id, "path": result.path,
+        "tool_result_chars": result.tool_result_chars,
+        "tool_result_n": result.tool_result_n,
+        "t_call_epoch": round(result.t_call_wall, 3) if bound else None,
+        "t_done_epoch": round(time.time(), 3) if bound else None,
+    }
+
+
+def note_cache_reading(result: CaptureResult, cache_read: int | None) -> None:
+    """本轮 cache 命中读数的**唯一登记点**（批 U · U1.2，ADR-0033 §2.3 / MQ-CA17）。
+
+    三条流式 capture 路径在 `*_capture_done` 之后各调一次：写进 `result`，并按
+    `result.session_id`（`bind_round` 绑的）登记到 `cache_state`——下一轮的装配触发门
+    （`inject._assembly_trigger`）据此判冷：上一轮 `cache_read_tokens == 0` ⇒ 冷。
+    None（上游没报）也照登记：它让下一轮按"无读数"判冷，而不是沿用更早的旧值。
+    守卫 `test_u12_trigger_gate.py` 钉三处调用点都在。
+    """
+    result.cache_read_tokens = cache_read
+    if result.session_id:
+        from bladex_proxy.cache_state import registry
+
+        registry().note_cache_read(result.session_id, cache_read)
 
 
 def record_first_chunk(result: CaptureResult, t0: float) -> None:
@@ -170,6 +280,8 @@ async def capture_stream(
     tool_calls_acc: dict[int, dict[str, Any]] = {}
     t0 = time.perf_counter()
     saw_done = False
+    # MQ-CA5：上游 prompt cache 命中读数。None = 上游没报；0 = 报了没命中（两者不可混）。
+    cache_read: int | None = None
 
     try:
         async for chunk in stream:
@@ -219,6 +331,9 @@ async def capture_stream(
             usage = getattr(chunk, "usage", None)
             if usage is not None:
                 result.usage = extract_usage(usage)
+                _cr = cache_read_tokens(usage)
+                if _cr is not None:
+                    cache_read = _cr
 
         result.done = True
 
@@ -253,9 +368,21 @@ async def capture_stream(
         ms_first_chunk=round(result.ms_first_chunk, 2),
         finish_reason=result.finish_reason,
         usage=result.usage,
+        # 🔴 MQ-CA5（批 R · R1，2026-09-18）：此前三条路径里**只有这条**不记
+        # `cache_read_tokens`——而它是 hermes / dsh / opencode 等全部 OpenAI 兼容 agent
+        # 走的路，占 capture 总数的大头（09-15：110/267）。字段名与另两条路径逐字相同，
+        # `probe_cache_gap` / `probe_cache_ttl` 按键名取、三协议同一把尺子。
+        # None ≠ 0：上游不报就是 None（NO-DATA），不写成 0。
+        cache_read_tokens=cache_read,
+        # 与 `responses_capture_done` 同名同义（P31 那里是 `input_tokens_reported` /
+        # `output_tokens`）；`usage` 为空 ⇒ None，不报 0。
+        input_tokens_reported=(result.usage.get("prompt") if result.usage else None),
+        output_tokens=(result.usage.get("completion") if result.usage else None),
         done=result.done,
         error=result.error,
+        **round_fields(result),
     )
+    note_cache_reading(result, cache_read)
     warn_inline_think(result.full_text, "chat_completions")
     warn_bare_reasoning(result.full_text, len(result.reasoning_text), "chat_completions")
 

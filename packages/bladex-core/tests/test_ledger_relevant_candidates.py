@@ -121,10 +121,62 @@ def test_latin_token_counts_double():
     assert relevant_ledgers(pool, "别的事") == []
 
 
-def test_closed_ledgers_are_still_candidates():
-    pool = _pool()
-    pool["ldg-c9ab"] = pool["ldg-c9ab"].model_copy(update={"status": "closed"})
-    assert "ldg-c9ab" in _ids(relevant_ledgers(pool, "小黑，梳理泰山啤酒破产重整最新进展"))
+#: 判据时刻（批 HO 的窗口用例都按它算 `now_ms`，不读墙钟）。
+_NOW = "2026-10-15T08:15:30+00:00"
+
+
+def _closed(pool, lid: str, *, hours_ago: float | None = 0.5, superseded_by: str = ""):
+    import datetime as dt
+    at = ("" if hours_ago is None else
+          (dt.datetime.fromisoformat(_NOW) - dt.timedelta(hours=hours_ago)).isoformat())
+    pool[lid] = pool[lid].model_copy(update={"status": "closed", "closed_at": at,
+                                             "closed_by_agent": "codex",
+                                             "superseded_by": superseded_by})
+    return pool
+
+
+def _now_ms() -> float:
+    from bladex_core.ledger import iso_ms
+    return iso_ms(_NOW)
+
+
+def test_closed_ledger_matched_by_content_is_listed_and_open_ones_unchanged():
+    """批 HO（MQ-L99，推翻批 Z · Z3 判据 ②「closed 不列」）。
+
+    同一条用例的两半：关掉的那本按内容命中时**照列、带 `closed=True`**；没关的那本照进、
+    **分数一字不变**（idf / 稀有锚仍按全池算——关本不许顺手改别人的得分，Z3 阴性对照保留）。"""
+    q = "小黑，梳理泰山啤酒破产重整最新进展"
+    before = {m.ledger_id: m for m in relevant_ledgers(_pool(), q, now_ms=_now_ms())}
+    assert {"ldg-c9ab", "ldg-d50e"} <= set(before), "夹具前提：两本都该命中"
+    after = {m.ledger_id: m for m in relevant_ledgers(_closed(_pool(), "ldg-c9ab"), q,
+                                                       now_ms=_now_ms())}
+    assert after["ldg-c9ab"].closed is True and after["ldg-c9ab"].score == before["ldg-c9ab"].score
+    assert after["ldg-d50e"].closed is False and after["ldg-d50e"].score == before["ldg-d50e"].score
+    # 对照臂（Z3 口径）：排除 closed 时它不在
+    z3 = relevant_ledgers(_closed(_pool(), "ldg-c9ab"), q, include_closed=False, now_ms=_now_ms())
+    assert "ldg-c9ab" not in _ids(z3) and "ldg-d50e" in _ids(z3)
+
+
+@pytest.mark.parametrize("hours_ago, listed", [(0.0, True), (23.9, True), (24.1, False),
+                                               (None, False)])
+def test_closed_window_is_24h_and_missing_closed_at_is_not_listed(hours_ago, listed):
+    """收紧 ②（回放读数定）：关闭超 24 h 不列；`closed_at` 缺失（老事件）不列。"""
+    q = "小黑，梳理泰山啤酒破产重整最新进展"
+    got = _ids(relevant_ledgers(_closed(_pool(), "ldg-c9ab", hours_ago=hours_ago), q,
+                                now_ms=_now_ms()))
+    assert ("ldg-c9ab" in got) is listed
+    loose = _ids(relevant_ledgers(_closed(_pool(), "ldg-c9ab", hours_ago=hours_ago), q,
+                                  closed_window_s=None, now_ms=_now_ms()))
+    assert "ldg-c9ab" in loose, "对照臂：不设窗时它在"
+
+
+def test_superseded_ledger_is_not_listed():
+    """收紧 ①（回放读数定）：被取代的本有明确继任，不列；继任本若对得上会作为 open 本自己出现。"""
+    q = "小黑，梳理泰山啤酒破产重整最新进展"
+    pool = _closed(_pool(), "ldg-c9ab", superseded_by="ldg-d50e")
+    assert "ldg-c9ab" not in _ids(relevant_ledgers(pool, q, now_ms=_now_ms()))
+    assert "ldg-c9ab" in _ids(relevant_ledgers(pool, q, include_superseded=True,
+                                               now_ms=_now_ms()))
 
 
 def test_units_shape():

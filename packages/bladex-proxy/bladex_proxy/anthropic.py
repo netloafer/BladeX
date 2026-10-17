@@ -25,7 +25,9 @@ from bladex_proxy.capture import (
     CaptureResult,
     cache_read_tokens,
     extract_usage,
+    note_cache_reading,
     record_first_chunk,
+    round_fields,
     warn_bare_reasoning,
     warn_inline_think,
 )
@@ -742,7 +744,10 @@ async def anthropic_stream_generator(
         # 两种情况**屏幕上和日志里此前长得一模一样**，而修法方向相反。
         # 判读：`text_len` 大 + `thinking_len` 为 0 ⇒ ①；两者都非零 ⇒ ②。
         reasoning_len=len(result.reasoning_text),
+        # 批 R · R1：归属 / 工具结果体量 / 起止墙钟（三条路径同一实现点 `capture.round_fields`）。
+        **round_fields(result),
     )
+    note_cache_reading(result, cache_read_tokens)
     warn_inline_think(result.full_text, "messages")
     # MQ-P29 第二步（批 L）：标记守卫对裸散文推理失明，判据换成行为（正文长 ∧ 同轮 reasoning 为 0）。
     warn_bare_reasoning(result.full_text, len(result.reasoning_text), "messages")

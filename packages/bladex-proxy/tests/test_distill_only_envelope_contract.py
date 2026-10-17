@@ -84,6 +84,11 @@ _SAMPLES: dict[str, str] = {
     "session_resume_recap":
         "The user stepped away and is coming back. Recap in a few sentences what "
         "was being worked on.",
+    # Hub 原文（hermes:default，路径脱敏）
+    "hermes_background_process":
+        "[IMPORTANT: Background process proc_8a79cd4b9df1 completed normally (exit code 0).\n"
+        "Command: cd ~/work/demo && nohup .venv/bin/python train.py > train_log.txt 2>&1 &\n"
+        "Output:\n]",
 }
 
 
@@ -326,7 +331,8 @@ def test_hermes_markers_match_identity_verbatim() -> None:
     env_markers = {k: m for k, m in _WHOLE_MESSAGE_MARKERS}
     ident = {r: p.lower() for r, p in _AUX_USER_PATTERNS}
     for rule in ("hermes_memory_save", "hermes_empty_response_retry",
-                 "hermes_skill_library_update", "truncated_response_continue"):
+                 "hermes_skill_library_update", "truncated_response_continue",
+                 "hermes_background_process"):
         assert env_markers[rule] == ident[rule], (
             f"{rule} 两处 marker 不一致：\n"
             f"  identity: {ident[rule]!r}\n  envelope: {env_markers[rule]!r}\n"

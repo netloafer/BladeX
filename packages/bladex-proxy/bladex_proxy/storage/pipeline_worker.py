@@ -143,17 +143,16 @@ def enrich_tool_results(turn: Turn) -> None:
         if te.direction == "result" and te.tool_call_id
     }
 
-    matched = 0
-    unmatched = 0
-    skipped_old = 0
+    # 🔴 MQ-R10（批 Q3A，2026-09-29 退役）：此处原有 matched / unmatched / skipped_old 三个计数
+    # 与一行 `tool_results_enriched` 日志。`call_map` 取自**本轮响应**的 call，请求里的
+    # tool_result 必然对应**上一轮**的 call ⇒ matched 结构性恒 0（两跑 44/44、18/18），
+    # 08-28 还被读成"拼接台账一次没匹配上"误导排查。恒为常数的读数比没有更坏；全仓无消费方
+    # ⇒ 整组删除，回填行为不变。守卫 `test_mq_r10_enriched_readout_retired.py`。
     for msg in turn.request_messages[scan_start:]:
         if msg.get("role") != "tool":
             # T4(ADR-0018 §4.4 C7): Anthropic tool_result block 在 user 消息里
             if msg.get("role") == "user":
-                m, u, sk = _enrich_anthropic_tool_results(msg, turn, call_map, existing_result_ids)
-                matched += m
-                unmatched += u
-                skipped_old += sk
+                _enrich_anthropic_tool_results(msg, turn, call_map, existing_result_ids)
             continue
         tc_id = msg.get("tool_call_id", "")
         content = msg.get("content", "")
@@ -171,10 +170,9 @@ def enrich_tool_results(turn: Turn) -> None:
         if tc_id and tc_id in call_map:
             idx = call_map[tc_id]
             turn.tool_events[idx].result = content_text
-            matched += 1
         elif tc_id and tc_id in existing_result_ids:
             # 同轮已记录过此 result → 跳过
-            skipped_old += 1
+            pass
         else:
             # 属于上一轮的工具返回——记录为独立 result 事件
             name = _extract_tool_name(msg, turn, request_call_names)
@@ -184,15 +182,6 @@ def enrich_tool_results(turn: Turn) -> None:
                 direction="result", tool_call_id=tc_id,
             ))
             existing_result_ids.add(tc_id)
-            unmatched += 1
-
-    if matched or unmatched:
-        logger.info(
-            "tool_results_enriched",
-            matched=matched, unmatched=unmatched,
-            skipped_old=skipped_old,
-            total_events=len(turn.tool_events),
-        )
 
 # 每 N 轮主循环回收一次 PEL
 _RECLAIM_INTERVAL = 10
@@ -522,20 +511,17 @@ def _enrich_anthropic_tool_results(
     turn: Turn,
     call_map: dict[str, int],
     existing_result_ids: set,
-) -> tuple[int, int, int]:
+) -> None:
     """T4(C7): Anthropic 格式 tool_result block 回填 tool_events.result。
 
     Anthropic 工具返回是 user 消息里 type=tool_result 的 content block，
     按 tool_use_id 匹配回 call（与 OpenAI 的 role=tool + tool_call_id 对称）。
-    返回 (matched, unmatched, skipped_old)。
+    计数返回值随 MQ-R10 退役（2026-09-29，见 `enrich_tool_results`）。
     """
     content = msg.get("content", "")
     if not isinstance(content, list):
-        return (0, 0, 0)
+        return
 
-    matched = 0
-    unmatched = 0
-    skipped_old = 0
     for block in content:
         if not isinstance(block, dict) or block.get("type") != "tool_result":
             continue
@@ -553,9 +539,8 @@ def _enrich_anthropic_tool_results(
         if tc_id and tc_id in call_map:
             idx = call_map[tc_id]
             turn.tool_events[idx].result = content_text
-            matched += 1
         elif tc_id and tc_id in existing_result_ids:
-            skipped_old += 1
+            pass
         else:
             from bladex_proxy.models import ToolEvent
             turn.tool_events.append(ToolEvent(
@@ -563,5 +548,3 @@ def _enrich_anthropic_tool_results(
                 direction="result", tool_call_id=tc_id,
             ))
             existing_result_ids.add(tc_id)
-            unmatched += 1
-    return (matched, unmatched, skipped_old)

@@ -104,9 +104,11 @@ from bladex_proxy.server.orchestration import (  # noqa: F401
     _resolve_sensitivity,
     _resolve_task_units,
     _resolve_with_memory,
+    _route_error_response,
     _shim_processed_response,
     _store_raw_request,
     _try_recover_redis,
+    _unknown_req_model_error_response,
     _validate_sensitivity_judge,
     _warn_if_output_truncated,
 )

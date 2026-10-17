@@ -87,6 +87,12 @@ _CLI = [
 ]
 
 
+#: 拆后**有意删除**的名字（具名登记，不改上面的快照——快照是拆前事实，删除是后来的决定）。
+_RETIRED: dict[str, str] = {
+    "load_agents_roster": "批 F4（2026-09-23）名册退出稳定层，读取函数随之删除（拍板 (16)）",
+}
+
+
 @pytest.mark.parametrize("modname, names, expected", [
     ("bladex_proxy.agency", _AGENCY, 49),
     ("bladex_proxy.server", _SERVER, 65),
@@ -95,7 +101,7 @@ _CLI = [
 def test_facade_keeps_every_pre_split_name(modname: str, names: list[str], expected: int) -> None:
     assert len(names) == expected, "名单被动过——它是拆前 ast 顶层名的快照，不该增删"
     mod = importlib.import_module(modname)
-    missing = [n for n in names if not hasattr(mod, n)]
+    missing = [n for n in names if not hasattr(mod, n) and n not in _RETIRED]
     assert not missing, f"{modname} 门面丢了拆前的名字：{missing}"
 
 
@@ -114,8 +120,9 @@ def test_agency_runtime_keeps_handlers_via_mixin() -> None:
     """handlers 以 mixin 挂回：`AgencyRuntime._h_*` 经 MRO 仍可取（既有 `inspect.getsource` 断言依赖）。"""
     from bladex_proxy.agency import AgencyRuntime
 
+    # `_maybe_migrate_binding` 批 Y · Y1d（2026-09-28）已删（MQ-L93），从名单移除。
     for name in ("_h_memory_search", "_h_ledger_read", "_h_ledger_update", "_h_ledger_switch",
-                 "_maybe_migrate_binding", "_coauthor_note", "_mark_subtask_on_parent",
+                 "_coauthor_note", "_mark_subtask_on_parent",
                  "session_owns_active_ledger"):
         assert callable(getattr(AgencyRuntime, name)), f"AgencyRuntime.{name} 丢了"
 

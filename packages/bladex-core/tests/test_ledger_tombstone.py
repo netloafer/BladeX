@@ -130,7 +130,7 @@ def test_pool_drops_the_tombstoned_ledger() -> None:
 
 
 def test_forget_ledger_clears_every_scope_holding_it() -> None:
-    t = ActivationTable(debounce_turns=0)
+    t = ActivationTable()
     t.restore({activation_scope("a", ""): "ldg-X",
                activation_scope("b", ""): "ldg-X",
                activation_scope("c", ""): "ldg-Y"})
@@ -141,7 +141,7 @@ def test_forget_ledger_clears_every_scope_holding_it() -> None:
 
 
 def test_forget_ledger_is_a_noop_for_unknown_id() -> None:
-    t = ActivationTable(debounce_turns=0)
+    t = ActivationTable()
     t.restore({SCOPE: "ldg-X"})
     assert t.forget_ledger("ldg-nope") == []
     assert t.active(SCOPE) == "ldg-X"

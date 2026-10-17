@@ -7,11 +7,14 @@ claude-code `Working directory:` 行；软链收敛 = "路径不做项目身份"
 
 from __future__ import annotations
 
+import json
 import os
 
+import pytest
 from bladex_proxy.project_identity import (
     ProjectIdentity,
     _cache,
+    codex_workspace_root,
     extract_cwd,
     resolve_from_request,
     resolve_project,
@@ -377,10 +380,38 @@ class TestResolveProject:
         assert len(_cache) == before
 
     def test_absolute_but_missing_dir_is_global(self, tmp_path):
-        """绝对但不存在 ⇒ Global（这一档进缓存：绝对路径取值空间是有界的）。"""
+        """绝对但不存在 ⇒ Global，且**不进缓存**（批 Y · Y1a，MQ-L65）。
+
+        此前这里断言 `missing in _cache`——把缺陷写成了规格（刚性原则 12）：
+        目录稍后被建出来（worktree 晚于第一条请求），这个 cwd 在重启前恒判 Global。"""
         missing = str(tmp_path / "gone")
         assert resolve_project(missing) == ProjectIdentity()
-        assert missing in _cache
+        assert missing not in _cache
+
+    def test_dir_created_after_first_request_is_recognised(self, tmp_path):
+        """MQ-L65 复现剧本（隔离 proxy 上同一形状）：第一轮目录不存在 ⇒ Global；
+        建目录 + `.git` 后同一 cwd 第二轮必须认出项目。"""
+        wt = tmp_path / "wt-late"
+        assert resolve_project(str(wt)) == ProjectIdentity()
+        (wt / ".git").mkdir(parents=True)
+        r = resolve_project(str(wt))
+        assert r.source == "git-root" and r.project_id, "第二轮仍 Global ⇒ 缓存污染（MQ-L65）"
+
+    def test_plain_dir_that_becomes_repo_is_recognised(self, tmp_path):
+        """同族形状：目录先存在但还不是仓库（mkdir 后才 `git init` / clone）。"""
+        d = tmp_path / "plain-then-repo"
+        d.mkdir()
+        assert resolve_project(str(d)) == ProjectIdentity()
+        (d / ".git").mkdir()
+        assert resolve_project(str(d)).project_id
+
+    def test_non_project_dir_stays_global(self, tmp_path):
+        """阴性对照：确实不是项目的目录（无 .git、无项目标志）每轮都判 Global。"""
+        d = tmp_path / "just-a-dir"
+        d.mkdir()
+        for _ in range(3):
+            assert resolve_project(str(d)) == ProjectIdentity()
+        assert str(d) not in _cache
 
     def test_file_path_is_not_a_project(self, tmp_path):
         """指向文件而非目录也不算——`isdir` 不是 `exists`。"""
@@ -467,3 +498,260 @@ class TestCarrierPushedOutOfWindow:
             {"role": "system", "content": " - Primary working directory: /Users/you/dev/second"},
         ]
         assert extract_cwd(msgs) == "/Users/you/dev/first"
+
+
+class TestCodexWorkspaceHeader:
+    """批 E · MQ-A83：codex 远端压缩后载体被推出窗口，改读 header 自报的 `workspaces`。"""
+
+    @staticmethod
+    def _meta(workspaces: dict | None) -> str:
+        import json
+        meta = {"session_id": "s", "thread_source": "user", "request_kind": "turn"}
+        if workspaces is not None:
+            meta["workspaces"] = workspaces
+        return json.dumps(meta)
+
+    @staticmethod
+    def _compacted_messages(root: str) -> list[dict]:
+        """19:58:58 的真实形状：5 条回放的 user 在前，env 块在 `messages[7]`。"""
+        env = ("<environment_context>\n  <cwd>" + root + "</cwd>\n  <shell>zsh</shell>\n"
+               "</environment_context>")
+        return ([{"role": "system", "content": "You are Codex, a coding agent."}]
+                + [{"role": "user", "content": f"回放的用户消息 {i}"} for i in range(5)]
+                + [{"role": "developer", "content": "<permissions instructions>…"},
+                   {"role": "user", "content": env},
+                   {"role": "user", "content": "任务1已经完成，继续下一个任务。"}])
+
+    def test_single_root_is_taken(self):
+        hdr = {"x-codex-turn-metadata": self._meta({"/Users/j/dev/BladeX": {"has_changes": True}})}
+        assert codex_workspace_root(hdr) == "/Users/j/dev/BladeX"
+
+    def test_multi_root_is_not_guessed(self):
+        hdr = {"x-codex-turn-metadata": self._meta({"/a": {}, "/b": {}})}
+        assert codex_workspace_root(hdr) == ""
+
+    @pytest.mark.parametrize("hdr", [{}, {"x-codex-turn-metadata": "nope"},
+                                     {"x-codex-turn-metadata": '{"workspaces": []}'},
+                                     {"x-codex-turn-metadata": '{"workspaces": {"rel/path": {}}}'}])
+    def test_missing_or_malformed_is_empty(self, hdr):
+        assert codex_workspace_root(hdr) == ""
+
+    def test_compacted_shape_is_out_of_message_window(self):
+        """钉住病例：压缩后 env 块在 `messages[7]`，user 侧窗口 4 条够不着（不放大窗口）。"""
+        assert extract_cwd(self._compacted_messages("/Users/j/dev/BladeX")) == ""
+
+    def test_header_rescues_compacted_turn_and_id_matches_message_path(self, tmp_path):
+        root = tmp_path / "proj"
+        root.mkdir()
+        (root / "AGENTS.md").write_text("# x")
+        hdr = {"x-codex-turn-metadata": self._meta({str(root): {"has_changes": False}})}
+        via_header = resolve_from_request(hdr, self._compacted_messages(str(root)))
+        assert via_header.project_id, "header 自报的根必须救回压缩后的轮次"
+        # 同一路径从消息里抽到时（未压缩形态）算出的 id 必须相同 —— 身份不分叉
+        plain = [{"role": "system", "content": "You are Codex, a coding agent."},
+                 {"role": "user", "content": f"<environment_context>\n  <cwd>{root}</cwd>\n</environment_context>"}]
+        via_messages = resolve_from_request({}, plain)
+        assert via_messages.project_id == via_header.project_id
+        assert via_header.source == via_messages.source == "path"
+
+    def test_message_cwd_wins_over_header_root(self, tmp_path):
+        """① 调度复核（09-28）：header 根与消息 cwd 不同 ⇒ 以消息 cwd 为准。
+
+        工作区开在 `~/dev`（非 git ⇒ Global）、cwd 在 `~/dev/BladeX`：header 优先会把
+        原本认得出的项目解析成 Global。改前能认出项目的路径必须逐字不变。
+        """
+        ws = tmp_path / "dev"
+        ws.mkdir()
+        proj = ws / "BladeX"
+        proj.mkdir()
+        (proj / "AGENTS.md").write_text("# x")
+        hdr = {"x-codex-turn-metadata": self._meta({str(ws): {"has_changes": False}})}
+        msgs = [{"role": "user", "content": f"<environment_context>\n  <cwd>{proj}</cwd>\n</environment_context>"}]
+        with_header = resolve_from_request(hdr, msgs)
+        without_header = resolve_from_request({}, msgs)
+        assert with_header.project_id and with_header.project_id == without_header.project_id
+        assert with_header.root == without_header.root == os.path.realpath(str(proj))
+
+    def test_header_only_rescues_when_messages_have_no_cwd(self, tmp_path):
+        """② 消息取不到 ⇒ header 救回（压缩后形状，沿用 `_compacted_messages`）。"""
+        root = tmp_path / "proj"
+        root.mkdir()
+        (root / "AGENTS.md").write_text("# x")
+        hdr = {"x-codex-turn-metadata": self._meta({str(root): {}})}
+        assert extract_cwd(self._compacted_messages(str(root))) == ""
+        assert resolve_from_request(hdr, self._compacted_messages(str(root))).project_id
+
+    def test_no_header_still_uses_messages(self, tmp_path):
+        root = tmp_path / "proj"
+        root.mkdir()
+        (root / "AGENTS.md").write_text("# x")
+        plain = [{"role": "user", "content": f"<environment_context>\n  <cwd>{root}</cwd>\n</environment_context>"}]
+        assert resolve_from_request({"user-agent": "x"}, plain).project_id
+
+
+class TestCodexCompactedTurnFixture:
+    """MQ-A83 判据 ①：Hub 原文形状的压缩后请求（`01a0e6eb…` 19:58:58，id 脱敏、正文截短）。"""
+
+    _ROOT = os.path.expanduser("~/dev/BladeX")   # 权威路径（刚性原则 11）；源码不写家目录字面量
+    _META = ('{"installation_id":"00000000-0000-4000-8000-000000000001",'
+             '"session_id":"01a0e6eb-0000-4000-8000-000000000004","thread_id":"01a0e6eb-0000-4000-8000-000000000004",'
+             '"agent_name":"/root","turn_id":"t","window_id":"w:3","window_number":3,'
+             '"context_window_id":"c","request_kind":"turn","root_turn_id":"t","thread_source":"user",'
+             '"sandbox":"seatbelt","sandbox_mode":"workspace-write","auto_review_enabled":false,'
+             '"node_repl_auto_review_required":false,"node_repl_disabled":false,'
+             '"workspaces":{' + json.dumps(_ROOT) + ':{"latest_git_commit_hash":"2caaf2df","has_changes":true}},'
+             '"turn_started_at_unix_ms":1790595538000}')
+
+    @classmethod
+    def _messages(cls) -> list[dict]:
+        env = ("<environment_context>\n  <cwd>" + cls._ROOT + "</cwd>\n  <shell>zsh</shell>\n"
+               "  <current_date>2026-09-28</current_date>\n  <timezone>Asia/Shanghai</timezone>\n"
+               "</environment_context>")
+        agents = "# AGENTS.md instructions for " + cls._ROOT + "\n\n<INSTRUCTIONS>\n…"
+        return [
+            {"role": "system", "content": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals."},
+            {"role": "user", "content": "## 任务 1 · MQ-I33：全量重建被守卫中止时，不许报\"完成\"…"},
+            {"role": "user", "content": "任务 1 复核退回，补四处后再提交：…"},
+            {"role": "user", "content": "### 测试怎么写、怎么跑、怎么算过…"},
+            {"role": "user", "content": "继续"},
+            {"role": "user", "content": "commit由你来提交吧。"},
+            {"role": "developer", "content": "<permissions instructions>…</permissions instructions>"},
+            {"role": "user", "content": agents + "\n\n" + env},
+            {"role": "user", "content": "任务1已经完成，继续下一个任务。 ## 任务 2 · MQ-A78…"},
+            {"role": "user", "content": "Another language model started to solve this problem and produced a summary…"},
+        ]
+
+    def test_message_scan_misses_the_carrier(self):
+        """压缩回放把载体推到 `messages[7]`（第 6 条 user）⇒ 窗口够不着。钉住病例，不放大窗口。"""
+        assert extract_cwd(self._messages()) == ""
+
+    def test_header_yields_the_root(self):
+        assert codex_workspace_root({"x-codex-turn-metadata": self._META}) == self._ROOT
+
+    def test_resolves_to_the_live_project_id(self):
+        """在 Jason 机（仓库在权威路径）上必须解析为 `p-10ad1f61d0c2`；别处跳过（路径不存在）。"""
+        if not os.path.isdir(os.path.join(self._ROOT, ".git")):
+            pytest.skip("权威路径不在本机")
+        ident = resolve_from_request({"x-codex-turn-metadata": self._META}, self._messages())
+        assert ident.project_id == "p-10ad1f61d0c2" and ident.source == "git-root"
+
+    def test_no_header_still_resolves_via_context_bundle(self):
+        """批 E · E6（MQ-A88）改判：原名 `test_no_header_keeps_global`（A83 时「无头 ⇒ Global」）。
+
+        这个压缩后形状的 cwd 载体就在首个 developer 紧后那条里——请求里有信号，只是出了窗口；
+        E6 按那处读，所以无头也能解析出项目。「真没有信号仍为 Global」由
+        `TestCodexContextBundleAfterDeveloper.test_no_developer_or_tool_next_or_no_cwd_stays_global` 钉住。
+        """
+        if not os.path.isdir(os.path.join(self._ROOT, ".git")):
+            pytest.skip("权威路径不在本机")
+        assert resolve_from_request({}, self._messages()).project_id == "p-10ad1f61d0c2"
+
+
+class TestCodexContextBundleAfterDeveloper:
+    """批 E · E6（MQ-A88）：压缩后 ∧ 新一轮首个请求 ∧ header 缺 `workspaces` ⇒ 读 codex 上下文包。
+
+    夹具 = Hub `local/codex/01a0e6eb…/1790646351557-0`（09-29 09:45:34）的真实形状，正文截短：
+    7 条回放 user 在前 → `developer`（skills 说明）→ 上下文包 user（AGENTS.md 头 +
+    `<environment_context>`，**块在 offset 11,866**，超出 `_SCAN_CHARS`）→ 新一轮用户原话。
+    header `x-codex-turn-metadata` 在、字段齐，**唯独没有 `workspaces`**。
+    """
+
+    _ROOT = os.path.expanduser("~/dev/BladeX")   # 权威路径（刚性原则 11）；源码不写家目录字面量
+    _META_NO_WS = ('{"installation_id":"00000000-0000-4000-8000-000000000001",'
+                   '"session_id":"01a0e6eb-0000-4000-8000-000000000004","thread_id":"01a0e6eb-0000-4000-8000-000000000004",'
+                   '"agent_name":"/root","turn_id":"t","window_id":"w:6","window_number":6,"context_window_id":"c",'
+                   '"request_kind":"turn","root_turn_id":"t","thread_source":"user","sandbox":"seatbelt",'
+                   '"sandbox_mode":"workspace-write","auto_review_enabled":false,'
+                   '"node_repl_auto_review_required":false,"node_repl_disabled":false,'
+                   '"turn_started_at_unix_ms":1790646334665}')
+
+    @classmethod
+    def _bundle(cls, root: str) -> str:
+        agents = "# AGENTS.md instructions for " + root + "\n\n<INSTRUCTIONS>\n" + "规范正文。\n" * 1980
+        env = ("<environment_context>\n  <cwd>" + root + "</cwd>\n  <shell>zsh</shell>\n"
+               "  <current_date>2026-09-29</current_date>\n  <timezone>Asia/Shanghai</timezone>\n"
+               "  <filesystem><workspace_roots><root>" + root + "</root></workspace_roots>"
+               "</filesystem>\n</environment_context>")
+        return agents + "\n</INSTRUCTIONS>\n\n" + env
+
+    @classmethod
+    def _messages(cls, root: str | None = None) -> list[dict]:
+        root = root or cls._ROOT
+        replay = ["## 任务 1 · MQ-I33：全量重建被守卫中止时，不许报\"完成\"…", "任务 1 复核退回，补四处后再提交：…",
+                  "### 测试怎么写、怎么跑、怎么算过…", "继续", "commit由你来提交吧。",
+                  "任务1已经完成，继续下一个任务。\n## 任务 2 · MQ-A78…", "任务 2 复核退回，已提交的 21bb68a 上补一个修正提交：…"]
+        return ([{"role": "system", "content": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals."}]
+                + [{"role": "user", "content": r} for r in replay]
+                + [{"role": "developer", "content": "<skills_instructions>\n## Skills\n…</skills_instructions>"},
+                   {"role": "user", "content": cls._bundle(root)},
+                   {"role": "user", "content": "继续"},
+                   {"role": "user", "content": "Another language model started to solve this problem…"},
+                   {"role": "user", "content": "任务 3 复核：tombstone-project 部分通过。退回补一处：…"}])
+
+    def test_case_shape_is_empty_on_both_existing_paths(self):
+        msgs = self._messages()
+        hdr = {"x-codex-turn-metadata": self._META_NO_WS}
+        assert extract_cwd(msgs) == ""
+        assert codex_workspace_root(hdr) == ""
+        assert msgs[8]["role"] == "developer" and msgs[9]["role"] == "user"
+        assert msgs[9]["content"].find("<environment_context>") > 8192   # 块在头部字符窗口之外
+
+    def test_case_resolves_via_context_bundle(self, tmp_path):
+        from bladex_proxy.project_identity import extract_cwd_after_developer
+        root = tmp_path / "proj"
+        root.mkdir()
+        (root / "AGENTS.md").write_text("# x")
+        msgs = self._messages(str(root))
+        assert extract_cwd_after_developer(msgs) == str(root)
+        ident = resolve_from_request({"x-codex-turn-metadata": self._META_NO_WS}, msgs)
+        plain = [{"role": "user", "content": f"<environment_context>\n  <cwd>{root}</cwd>\n</environment_context>"}]
+        assert ident.project_id and ident.project_id == resolve_from_request({}, plain).project_id
+
+    def test_case_resolves_to_live_project_id(self):
+        if not os.path.isdir(os.path.join(self._ROOT, ".git")):
+            pytest.skip("权威路径不在本机")
+        ident = resolve_from_request({"x-codex-turn-metadata": self._META_NO_WS}, self._messages())
+        assert ident.project_id == "p-10ad1f61d0c2" and ident.source == "git-root"
+
+    def test_existing_signals_win_and_bundle_is_not_consulted(self, tmp_path, monkeypatch):
+        """有信号时逐字不变：消息窗口或 header 任一取到 ⇒ 新规则不被调用。"""
+        import bladex_proxy.project_identity as pi
+
+        def _boom(_m):
+            raise AssertionError("after_developer must not run when a signal exists")
+        monkeypatch.setattr(pi, "extract_cwd_after_developer", _boom)
+        root = tmp_path / "proj"
+        root.mkdir()
+        (root / "AGENTS.md").write_text("# x")
+        uncompacted = [{"role": "system", "content": "You are Codex"},
+                       {"role": "developer", "content": "<permissions>…"},
+                       {"role": "user", "content": self._bundle(str(root))},
+                       {"role": "user", "content": "做任务"}]
+        assert resolve_from_request({}, uncompacted).project_id
+        with_ws = ('{"thread_source":"user","workspaces":{"' + str(root) + '":{}}}')
+        assert resolve_from_request({"x-codex-turn-metadata": with_ws}, self._messages(str(root))).project_id
+
+    def test_no_developer_or_tool_next_or_no_cwd_stays_global(self):
+        from bladex_proxy.project_identity import extract_cwd_after_developer
+        no_dev = [m for m in self._messages() if m["role"] != "developer"]
+        assert extract_cwd_after_developer(no_dev) == ""
+        tool_next = [{"role": "developer", "content": "x"},
+                     {"role": "tool", "content": "<environment_context><cwd>/etc</cwd></environment_context>"}]
+        assert extract_cwd_after_developer(tool_next) == ""
+        # codex-tui 标题子调用（aux）的真实形状：developer 之后的 env 只有日期/时区，没有 cwd
+        title_sub = [{"role": "system", "content": "You are Codex, a coding agent."},
+                     {"role": "developer", "content": "<permissions instructions>…</permissions instructions>"},
+                     {"role": "user", "content": "<environment_context>\n  <current_date>2026-09-28</current_date>\n"
+                                                 "  <timezone>Asia/Shanghai</timezone>\n</environment_context>"},
+                     {"role": "user", "content": "Generate a concise, single-line task title…"}]
+        assert extract_cwd_after_developer(title_sub) == ""
+        assert resolve_from_request({}, title_sub).project_id == ""
+
+    def test_only_the_first_developer_is_the_anchor(self):
+        """中途插进来的 developer（权限变更等）之后的消息不当上下文包读。"""
+        from bladex_proxy.project_identity import extract_cwd_after_developer
+        msgs = [{"role": "developer", "content": "<skills>"},
+                {"role": "user", "content": "做任务，没有环境块"},
+                {"role": "developer", "content": "<permissions changed>"},
+                {"role": "user", "content": "<environment_context><cwd>/tmp/elsewhere</cwd></environment_context>"}]
+        assert extract_cwd_after_developer(msgs) == ""

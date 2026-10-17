@@ -33,7 +33,9 @@
 
 ## 报一次，不是每轮报
 
-按 **agent_id / 进程** 去重：高流量 agent 每轮报一行就是噪声，噪声等于没有告警。
+按 **(agent_id, project_id) / 进程** 去重（MQ-A74，2026-09-22 起；此前只按 agent）：
+高流量 agent 每轮报一行就是噪声，噪声等于没有告警；但同一 agent 换到新 project
+要**再报一次**，否则新 project 的 `project_source` 来源档在日志里没有落点。
 进程重启会重报 —— 这是**特意的**：重启后配置可能变了，那正是该重新体检的时刻。
 
 **aux 轮整轮跳过**：子调用（标题生成 / 压缩）本来就不给工具面，
@@ -79,25 +81,28 @@ def onboarding_gaps(*, agent_source: str, agent_id: str, cwd_found: bool,
     return gaps
 
 
-def _dedup_key(agent_id: str) -> str:
-    """去重键的**唯一定义点**。
+def _dedup_key(agent_id: str, project_id: str = "") -> str:
+    """去重键的**唯一定义点** = `(agent_id, project_id)`。
 
-    G17.22 要把它改成 `(agent_id, project_id)`；届时只改这一处——调用方
-    （`server/orchestration.py`）不许再复述这个判据（批 H 复核指出的形态：
-    外面复制了一份 `agent_id not in _seen`，里面改了键、外面那句会静默挡住新行为）。
+    🔴 MQ-A74（2026-09-22，批 F2 修）：此前只含 agent ⇒ 同一进程里 agent 换了 project
+    **再也不报**，`project_source` 这一跳在日志里零读数（原则 13 层 4：值有、值对、
+    但来源不可指认——G19 重跑的 `p-1ae6f8fc40dc` 就是这样对不上的）。改成按
+    (agent, project) 去重：**换项目重报一次**，代价 = 每个新 project 一行日志；
+    同 agent 同 project 仍只报一次（阴性对照 `test_same_agent_same_project_reports_once`）。
+    调用方（`server/orchestration.py`）不许复述这个判据（批 H 复核指出的形态）。
     """
-    return agent_id
+    return f"{agent_id}\x00{project_id}"
 
 
-def pending(*, agent_id: str, auxiliary: bool) -> bool:
-    """这个 agent 本进程是否**还需要**体检（不改状态，纯查询）。
+def pending(*, agent_id: str, auxiliary: bool, project_id: str = "") -> bool:
+    """这个 (agent, project) 本进程是否**还需要**体检（不改状态，纯查询）。
 
     调用方用它决定要不要为体检付出 `extract_cwd` 那次重算——
     它与 `note_onboarding` 内部用的是同一个键、同一条 aux 规则、同一个上限。
     """
     if auxiliary or not agent_id:
         return False
-    return _dedup_key(agent_id) not in _seen and len(_seen) < _MAX_SEEN
+    return _dedup_key(agent_id, project_id) not in _seen and len(_seen) < _MAX_SEEN
 
 
 def note_onboarding(*, agent_id: str, agent_source: str, auxiliary: bool,
@@ -107,10 +112,10 @@ def note_onboarding(*, agent_id: str, agent_source: str, auxiliary: bool,
 
     :returns: 这次是否真的报了（供测试与调用方判断，生产侧不依赖）。
     """
-    if not pending(agent_id=agent_id, auxiliary=auxiliary):
+    if not pending(agent_id=agent_id, auxiliary=auxiliary, project_id=project_id):
         # aux 轮不体检、也不记 seen（见模块 docstring）；已报过 / 上限满同样跳过。
         return False
-    _seen.add(_dedup_key(agent_id))
+    _seen.add(_dedup_key(agent_id, project_id))
     agent_source = str(getattr(agent_source, "value", agent_source))  # 与 identity_resolved 同形（短名）
     gaps = onboarding_gaps(agent_source=agent_source, agent_id=agent_id,
                            cwd_found=cwd_found, toolface_injected=toolface_injected)

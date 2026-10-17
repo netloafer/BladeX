@@ -79,7 +79,8 @@ def _dump(index: MemoryIndex) -> dict:
         edges.extend(e.model_dump(mode="json", exclude={"created_at"})
                      for e in index.get_edges(m.matter_id))
     edges.sort(key=lambda d: d["edge_id"])
-    profiles = index.get_profile_cards("u1", "claude-code")
+    # 画像卡渲染 2026-09-18 批 S 删除（ADR-0034 §3.2）；等价性改看投影本体（USER.md / AGENT.md）+ 工具统计
+    profiles = [index.get_profile_md("u1", "claude-code"), index.get_tool_stats("claude-code", top=50)]
     return {"facts": facts, "matters": matters, "edges": edges, "profiles": profiles}
 
 

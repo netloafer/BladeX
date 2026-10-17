@@ -10,10 +10,17 @@ import json
 
 import typer
 
-from bladex_proxy.cli import _admin_call, _print_op_result  # noqa: E402
+from bladex_proxy.cli import (  # noqa: E402
+    _admin_call,
+    _admin_long_timeout_s,
+    _print_op_result,
+    _require_dry_run_ack,
+    _require_server_contract,
+)
 
 ledger_app = typer.Typer(help="Task ledgers (five-section working state; read-only except "
-                              "`doctor --bind-legacy-matters --yes`)",
+                              "`close` / `reopen` / `supersede`, "
+                              "`doctor --bind-legacy-matters --yes` and `tombstone`)",
                          no_args_is_help=True)
 
 
@@ -151,16 +158,20 @@ def _doctor_age_days(iso: str) -> float | None:
 
 
 def _doctor_scope_key(row: dict) -> str:
-    """账本所属 scope。`active_in` 为空 = 当前没有 agent 激活它。
-
-    重复检测**只在同一 scope 内比**：不同 agent 各有一本同名账本是
-    合理形态（跨 agent 交接正是北极星要的），不该报成重复。
-    """
+    """账本所属 scope。`active_in` 为空 = 当前没有 agent 激活它。"""
     scopes = row.get("active_in") or []
     if not scopes:
         return ""
     s = scopes[0]
     return f"{s.get('agent','')}\x1f{s.get('project','')}"
+
+
+def _doctor_agent(row: dict) -> str:
+    """账本激活 scope 的 agent。空 scope 返回空串，不猜 agent。"""
+    scopes = row.get("active_in") or []
+    if not scopes:
+        return ""
+    return str(scopes[0].get("agent", ""))
 
 
 def _doctor_findings(rows: list[dict], details: dict[str, dict]) -> list[dict]:
@@ -169,23 +180,46 @@ def _doctor_findings(rows: list[dict], details: dict[str, dict]) -> list[dict]:
 
     out: list[dict] = []
 
-    # ① 疑似重复：同 scope 下标题归一化后相等，或 Goal 前缀相同
+    # 已关的账本不是待处理问题，不参与任何重复比较（MQ-L94）。
+    open_rows = [r for r in rows if (r.get("status") or "active") != "closed"]
+
+    # ① 疑似重复：
+    # - 同 scope 标题相等：duplicate_title（原语义不变）
+    # - 同 agent 跨 scope 标题相等：duplicate_title_cross_scope（MQ-L94）
+    # - 不同 agent 同名：交接的正常形态，不报（08-27 的既有判断）
+    # Goal 前缀仍只在同 scope 内比较，保持原语义。
     by_title: dict[tuple[str, str], list[str]] = defaultdict(list)
+    by_agent_title: dict[tuple[str, str], list[str]] = defaultdict(list)
     by_goal: dict[tuple[str, str], list[str]] = defaultdict(list)
-    for r in rows:
+    for r in open_rows:
         scope = _doctor_scope_key(r)
         t = _doctor_norm_title(r.get("title", ""))
+        agent = _doctor_agent(r)
         if t:
             by_title[(scope, t)].append(r["ledger_id"])
+            if agent:
+                by_agent_title[(agent, t)].append(r["ledger_id"])
         g = (r.get("goal") or "").strip()[:_DOCTOR_GOAL_PREFIX]
         if g:
             by_goal[(scope, g)].append(r["ledger_id"])
+    same_scope_pairs: set[tuple[str, ...]] = set()
     for (_scope, key), ids in sorted(by_title.items()):
         if len(ids) > 1:
+            same_scope_pairs.add(tuple(sorted(ids)))
             out.append({"kind": "duplicate_title", "ledger_ids": sorted(ids),
                         "detail": f"same title after normalisation: {key!r}",
                         "action": f"bladex ledger show {sorted(ids)[0]}"})
-    seen = {tuple(sorted(f["ledger_ids"])) for f in out}
+    for (_agent, key), ids in sorted(by_agent_title.items()):
+        if len(ids) < 2:
+            continue
+        pair = tuple(sorted(ids))
+        if pair in same_scope_pairs:
+            continue
+        out.append({"kind": "duplicate_title_cross_scope", "ledger_ids": sorted(ids),
+                    "detail": (f"same title after normalisation for the same agent "
+                               f"across scopes: {key!r}"),
+                    "action": f"bladex ledger show {sorted(ids)[0]}"})
+    seen = same_scope_pairs
     for (_scope, _key), ids in sorted(by_goal.items()):
         if len(ids) > 1 and tuple(sorted(ids)) not in seen:
             out.append({"kind": "duplicate_goal", "ledger_ids": sorted(ids),
@@ -265,6 +299,7 @@ def ledger_doctor(
 ) -> int:
     """Report suspicious ledgers. Read-only -- never edits or merges.
 
+    \f
     唯一的写动作是显式的 `--bind-legacy-matters --yes`（2026-09-04，
     `task-ledger-switch-candidates-20260904.md` §2）：只给 `matter_id` 空的旧账本补上
     确定性派生的锚 id（与 Index 已有的同一个），不合并、不改绑、不碰 Goal。
@@ -374,4 +409,232 @@ def ledger_show(
         print("Sub-ledgers:")
         for c in children:
             print(f"  {c.get('ledger_id', '')}  {c.get('title', '')}")
+    # 批 Z · Z3：取代链——被取代的本指向接手的本，沿链读到当前在办的那本。
+    chain = data.get("superseded_chain") or []
+    if chain:
+        print()
+        print("Superseded by (follow the chain):")
+        for c in chain:
+            print(f"  -> {c.get('ledger_id', '')}  {c.get('title', '')}  [{c.get('status', '')}]")
+    supersedes = data.get("supersedes") or []
+    if supersedes:
+        print()
+        print(f"Supersedes: {', '.join(supersedes)}")
+    return 0
+
+
+# ── 生命周期：close / reopen / supersede（批 Z · Z3，README 承诺）────────────
+# 三个动作都是**追加式、可逆**的管理事件（reopen 撤销 close），不同于墓碑——故不走
+# 墓碑那两道闸（`_require_server_contract` / 备份软闸），也不问确认。
+# origin 固定 "cli"（原则 13 层 4：事件要能指认它从哪条路来）。
+
+
+def _lifecycle(action: str, ledger_id: str, body: dict) -> tuple[int, dict]:
+    return _admin_call("POST", f"/admin/ledgers/{ledger_id}/{action}",
+                       body={"origin": "cli", **body})
+
+
+@ledger_app.command("close")
+def ledger_close(
+    ledger_id: str = typer.Argument(..., help="Ledger ID (ldg-...)"),
+    reason: str = typer.Option("", "--reason", help="Why (recorded in the Hub event)"),
+) -> int:
+    """Close a finished ledger (no longer a switch candidate; active scopes are released).
+
+    The Goal and entries are not touched. Undo with `bladex ledger reopen`."""
+    code, data = _lifecycle("close", ledger_id, {"reason": reason})
+    if code != 200:
+        return _print_op_result(code, data)
+    if data.get("status") == "noop":
+        print(f"{ledger_id} is already closed.")
+        return 0
+    freed = data.get("freed_scopes") or []
+    print(f"✓ closed {ledger_id}" + (f" (released {len(freed)} active scope(s))" if freed else ""))
+    return 0
+
+
+@ledger_app.command("reopen")
+def ledger_reopen(
+    ledger_id: str = typer.Argument(..., help="Ledger ID (ldg-...)"),
+    reason: str = typer.Option("", "--reason", help="Why (recorded in the Hub event)"),
+) -> int:
+    """Reopen a closed ledger. It is NOT re-activated -- an agent switches to it when needed."""
+    code, data = _lifecycle("reopen", ledger_id, {"reason": reason})
+    if code != 200:
+        return _print_op_result(code, data)
+    if data.get("status") == "noop":
+        print(f"{ledger_id} is not closed; nothing to do.")
+        return 0
+    print(f"✓ reopened {ledger_id} (not activated)")
+    return 0
+
+
+@ledger_app.command("supersede")
+def ledger_supersede(
+    ledger_id: str = typer.Argument(..., help="Ledger being replaced (ldg-...)"),
+    by: str = typer.Option(..., "--by", help="Ledger that continues this work (ldg-...)"),
+    reason: str = typer.Option("", "--reason", help="Why (recorded in the Hub event)"),
+) -> int:
+    """Close a ledger and record which ledger continues it (`ledger show` follows the chain)."""
+    code, data = _lifecycle("supersede", ledger_id, {"superseded_by": by, "reason": reason})
+    if code != 200:
+        return _print_op_result(code, data)
+    if data.get("status") == "noop":
+        print(f"{ledger_id} is already superseded by {by}.")
+        return 0
+    print(f"✓ {ledger_id} superseded by {by}")
+    return 0
+
+
+#: 备份软闸的告警阈值（天）。软闸 = **只告警不阻断**（MQ-I21）——拦不拦是用户的事，
+#: "上次备份是什么时候"不可见才是缺陷。
+_BACKUP_STALE_DAYS = 3.0
+
+
+def _print_backup_notice(data: dict) -> None:
+    """备份软闸的一行提示。`None` = 没有备份或读不到（NO-DATA），不是"刚备份过"。"""
+    age = data.get("backup_age_days", "__absent__")
+    if age == "__absent__":
+        return
+    if age is None:
+        print("  ⚠ backup: NO-DATA -- no data/backup_* found (or unreadable). "
+              "This operation is irreversible.")
+    elif float(age) > _BACKUP_STALE_DAYS:
+        print(f"  ⚠ backup: newest data/backup_* is {age} days old "
+              f"(> {_BACKUP_STALE_DAYS:g}d). This operation is irreversible.")
+    else:
+        print(f"  backup: newest data/backup_* is {age} days old.")
+
+
+@ledger_app.command("tombstone")
+def ledger_tombstone(
+    ledger_id: str = typer.Argument(...),
+    with_memory: bool = typer.Option(
+        False, "--with-memory",
+        help="Also tombstone the source turns in this ledger's activation window "
+             "(derived memory stops being rebuilt; tombstone semantics, nothing is physically erased)"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Preview only: print the window size and the derived facts, write nothing"),
+    yes: bool = typer.Option(False, "--yes", help="Skip confirmation"),
+) -> int:
+    """Tombstone a ledger (DELETE /admin/ledgers/{id}). Memory is kept unless --with-memory.
+
+    \f
+    拍板 0.3.0-(2)：墓碑账本 ≠ 清派生记忆。默认只墓碑账本并提示"派生记忆保留 N 条"；
+    `--with-memory` 是显式的第二动作（Hub 层 TURN 墓碑，MQ-I17）。两条路都不可逆、都不物理删。
+
+    `--dry-run`（MQ-I21，批 T0）：只算不写，**不问确认**（没有东西可确认）。它与真跑
+    共用同两个只读函数，同一本账本两次调用 `window_turns` 必须相等——**尺子与扳机同源**。
+    """
+    # 🔴 闸 B（MQ-I24）：不可逆操作 —— 先确认跑着的进程就是这份代码，再发请求。
+    #    dry-run 也过这道闸：09-22 的事故正是"以为在预览、其实在真删"。
+    _require_server_contract(f"tombstone {ledger_id}")
+    if dry_run:
+        code, data = _admin_call("DELETE", f"/admin/ledgers/{ledger_id}",
+                                 params={"with_memory": "true" if with_memory else None,
+                                         "dry_run": "true"})
+        if code != 200:
+            return _print_op_result(code, data)
+        scope = "ledger AND its derived memory" if with_memory else "ledger only (memory kept)"
+        # 🔴 闸 A（MQ-I24）：服务端没自认走了 dry-run 分支 ⇒ 不许渲染成预览。
+        _require_dry_run_ack(data, f"tombstone {ledger_id} ({scope})")
+        print(f"DRY RUN -- nothing written. Would tombstone {ledger_id} ({scope}).")
+        # scope 的分隔符是 `\x1f`（不可见）——直接 join 会打出 "claude-codep-xxxx"。
+        # 拆分只走 core 的 `split_scope`，不在这里复制第二份分隔符真相。
+        from bladex_core.ledger_runtime import split_scope
+        scopes = [f"{a} @ {pj}" for a, pj in (split_scope(x) for x in (data.get("window_scopes") or []))]
+        print(f"  turns in window: {data.get('window_turns', '?')}  "
+              f"scopes: {', '.join(scopes) or '(none)'}")
+        n = data.get("derived_facts_retained")
+        print(f"  derived facts in window: {'NO-DATA' if n is None else n}")
+        _print_backup_notice(data)
+        return 0
+    what = "ledger AND its derived memory" if with_memory else "ledger only (memory kept)"
+    if not yes and not typer.confirm(f"Tombstone {ledger_id} -- {what}? (append-only; no undo)"):
+        print("Cancelled.")
+        return 130
+    code, data = _admin_call(
+        "DELETE", f"/admin/ledgers/{ledger_id}",
+        params={"with_memory": "true"} if with_memory else None,
+        timeout=_admin_long_timeout_s() if with_memory else 15.0,
+    )
+    if code != 200:
+        return _print_op_result(code, data)
+    print(f"✓ tombstoned {ledger_id} (turns in window: {data.get('window_turns', '?')})")
+    _print_backup_notice(data)
+    if with_memory:
+        mem = data.get("memory") or {}
+        print(f"  derived memory tombstoned: {mem.get('turn_tombstones', '?')} turn tombstones "
+              f"(index cascaded {mem.get('index_cascaded', '?')}, deferred {mem.get('index_deferred', '?')} "
+              f"-- deferred ones converge on the next rebuild)")
+    else:
+        n = data.get("derived_facts_retained")
+        n_txt = "NO-DATA" if n is None else str(n)
+        print(f"  derived memory kept: {n_txt} facts; `bladex ledger tombstone {ledger_id} --with-memory` "
+              f"would tombstone them too")
+    return 0
+
+
+@ledger_app.command("tombstone-memory")
+def ledger_tombstone_memory(
+    ledger_id: str = typer.Argument(...),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Preview only: print the window size and the derived facts, write nothing"),
+    yes: bool = typer.Option(False, "--yes", help="Skip confirmation"),
+) -> int:
+    """Tombstone only this ledger's derived memory window (DELETE /admin/ledgers/{id}/memory).
+
+    \f
+    **与 `tombstone --with-memory` 的分工（批 T0b 路径①，MQ-I23）**：
+
+    | 命令 | 动作 | 对已墓碑的账本 |
+    |---|---|---|
+    | `ledger tombstone [--with-memory]` | 给**账本**打墓碑（顺手连记忆） | 404（不在活池） |
+    | `ledger tombstone-memory` | 只清**窗口记忆**，不碰账本对象 | ✅ 正常执行 |
+
+    为什么拆成两条而不是让上面那条对已墓碑账本放行一半：404 应当继续只说一句话
+    ——"这本不在活池"。让它有时表示"不存在"、有时表示"只做了另一半"，
+    下一棒读不出它判的是什么。
+
+    现场（MQ-I23）：乙四本 09-22 已被墓碑，且当时因 MQ-I22 各打 **0** 条 TURN 墓碑
+    ⇒ 41 条待补的轮次没有任何 CLI 路径够得着。本命令就是那条路径。
+
+    **幂等**：窗口来自 `scan_meta_snapshot()`，它已滤掉被墓碑的 turn ⇒ 补跑一次，
+    第二次 `turn_tombstones` 自然是 0。
+    """
+    _require_server_contract(f"tombstone-memory {ledger_id}")
+    if dry_run:
+        code, data = _admin_call("DELETE", f"/admin/ledgers/{ledger_id}/memory",
+                                 params={"dry_run": "true"})
+        if code != 200:
+            return _print_op_result(code, data)
+        _require_dry_run_ack(data, f"tombstone the derived memory window of {ledger_id}")
+        print(f"DRY RUN -- nothing written. Would tombstone the derived memory window of "
+              f"{ledger_id} ({data.get('title', '')}).")
+        from bladex_core.ledger_runtime import split_scope
+        scopes = [f"{a} @ {pj}" for a, pj in (split_scope(x) for x in (data.get("window_scopes") or []))]
+        print(f"  turns in window: {data.get('window_turns', '?')}  "
+              f"scopes: {', '.join(scopes) or '(none)'}")
+        n = data.get("derived_facts_retained")
+        print(f"  derived facts in window: {'NO-DATA' if n is None else n}")
+        print(f"  ledger object: NOT touched (in live pool: {data.get('ledger_in_pool')})")
+        _print_backup_notice(data)
+        return 0
+    if not yes and not typer.confirm(
+            f"Tombstone the derived memory window of {ledger_id}? "
+            f"(append-only; no undo; the ledger object itself is not touched)"):
+        print("Cancelled.")
+        return 130
+    code, data = _admin_call("DELETE", f"/admin/ledgers/{ledger_id}/memory")
+    if code != 200:
+        return _print_op_result(code, data)
+    mem = data.get("memory") or {}
+    print(f"✓ memory tombstoned for {ledger_id} ({data.get('title', '')}); "
+          f"turns in window: {data.get('window_turns', '?')}")
+    print(f"  derived memory tombstoned: {mem.get('turn_tombstones', '?')} turn tombstones "
+          f"(index cascaded {mem.get('index_cascaded', '?')}, deferred {mem.get('index_deferred', '?')} "
+          f"-- deferred ones converge on the next rebuild)")
+    _print_backup_notice(data)
     return 0

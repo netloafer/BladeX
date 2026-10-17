@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from bladex_proxy import router_sdk
 from bladex_proxy.agency import intercept_chat_stream
-from bladex_proxy.capture import CaptureResult, capture_stream
+from bladex_proxy.capture import CaptureResult, bind_round, capture_stream
 from bladex_proxy.config import ModelRoute, ProxyConfig
 from bladex_proxy.models import (
     AgentSource,
@@ -233,6 +233,9 @@ async def _handle_stream(
         # 生成器的 `t0` 在函数体第一行，而 async generator 创建时不执行函数体
         # ⇒ 等它跑起来，`await call_model` 早已返回，整段 TTFB 在窗口之外
         # （量出 0.32ms，而 tap 录的真值是 1,958ms）。
+        bind_round(result, agent_id=identity.agent_id, model=model,
+                   session_id=identity.session_id, path="/v1/chat/completions",
+                   messages=messages)
         result.t_upstream = time.perf_counter()
         stream = await call_model(model, messages, stream=True, route=route, failover=failover,
                                   health=health, on_success=on_used, **kwargs)

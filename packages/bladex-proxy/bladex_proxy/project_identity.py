@@ -147,6 +147,17 @@ _ENV_BLOCK = re.compile(
     r"<(environment_context|env)>(.*?)</\1>", re.S)
 
 #: 解析缓存（cwd -> ProjectIdentity）。进程生命期内 cwd 集合极小，不设逐出。
+#: 🔴 **只缓存识别出项目的结果**（批 Y · Y1a，MQ-L65）：Global（空 id）一律不进缓存。
+#: 此前"cwd 此刻不是目录"与"是目录但还没有 .git / 项目标志"都缓存 Global 且永不逐出
+#: ⇒ 请求先于 worktree 创建到达（或同名 worktree 删了重建、目录建好后才 `git init`），
+#: 这个 cwd 在 proxy 重启前恒判 Global（隔离 proxy 复现：建目录 + `git init` 之后第二轮
+#: 仍 `source=global`）。会话因此落 `agent@Global`，账本也建在 Global 上
+#: （`ldg-547ab412a42a`，handoff-bench #1；绕法"新 worktree 名字要新"进了手册）。
+#: 取舍：Global 结果每轮重算——家目录这类"确实不是项目"的 cwd 实测 16.5 µs/次
+#: （realpath + 向上 12 层 `.git` 探测 + 6 个标志文件），不存在的路径 1.2 µs/次，
+#: 对 200 ms 热路径预算可忽略；换来的是"项目一出现就被认出来"，且不存在的绝对路径
+#: 垃圾串不再进缓存（与 isabs 那道门同一条"缓存无逐出 ⇒ 不许无界增长"的理由）。
+#: 正结果照旧缓存：项目身份一旦识别出来，同一 cwd 在进程内不会自己变回"不是项目"。
 _cache: dict[str, ProjectIdentity] = {}
 
 
@@ -250,6 +261,79 @@ def extract_cwd(messages: list[dict]) -> str:
     return ""
 
 
+#: ── codex 自报的工作区根（批 E · MQ-A83，2026-09-28）──
+#:
+#: 病例：codex-tui 会话 `01a0e6eb`（explicit `session-id`，没断）19:58:50 起
+#: `project_resolved cwd= cwd_found=False source=global`——`remote_compaction_v2`
+#: 重置上下文后，codex 把此前的 user 消息**回放在前面**（5 条），`<environment_context>`
+#: / `# AGENTS.md instructions for …` 载体从 `messages[5]` 被推到 `messages[7]`，
+#: 出了 `_SCAN_MESSAGES=4` 的 user 侧窗口；每压缩一次再推一截。cwd **codex 发了、
+#: BladeX 没读到** ⇒ 同一会话从 `codex@p-10ad…` 落到 `codex@Global`、账本在两个 scope
+#: 各绑一次（`agency_ledger_closed freed_scopes=2`）。
+#:
+#: 修法不放大窗口（MQ-A25/A67：往中毒源上扫），改读 codex **在 header 里自报的**
+#: `x-codex-turn-metadata.workspaces`（键 = 工作区根路径；09-28 全天 Desktop / tui
+#: 主会话每轮都带，压缩后照带；标题 / 建议子调用不带——它们已是 aux）。
+#: 只在消息里抽不到 cwd 时用（消息的 `<cwd>` 是精确目录、header 是工作区根，前者更准）。
+#: 取到的路径**仍走 `resolve_project`**（realpath + git 根）⇒ 与从消息
+#: 抽到 cwd 算出的 `project_id` 相同，身份不分叉。
+#: 🔴 只在**恰好一个**工作区根时采用；多根 ⇒ 不猜、退回消息扫描并打
+#: `project_codex_workspaces_ambiguous`（项目键只取包含 cwd 的仓库，多根时只有消息里的
+#: cwd 能定）。
+def codex_workspace_root(headers: dict[str, str] | None) -> str:
+    """codex `x-codex-turn-metadata.workspaces` 的唯一根路径；缺 / 多根 / 非法 ⇒ ""。"""
+    from bladex_proxy.identity import codex_turn_metadata  # noqa: PLC0415 —— 单一解析点
+
+    ws = codex_turn_metadata(headers).get("workspaces")
+    if not isinstance(ws, dict) or not ws:
+        return ""
+    roots = [str(k) for k in ws if str(k).startswith("/")]
+    if len(roots) != 1:
+        logger.info("project_codex_workspaces_ambiguous", n=len(roots))
+        return ""
+    return roots[0]
+
+
+#: ── codex 的「上下文包」：首个 developer 消息紧跟的那一条（批 E · E6，MQ-A88，2026-09-29）──
+#:
+#: 病例：会话 `01a0e6eb` 09-29 09:45:34 任务 3 打回，用户新一轮首个请求 `project_resolved
+#: cwd_source= source=global` ⇒ 在 `codex@Global` 重开任务 3 的本，14 s 后又在项目 scope
+#: 切一次（同一本绑两个 scope）。回扫 09-28 起 640 条 codex 主对话：
+#:   - header 路：工具往返 612/612 都带 `workspaces`；**新一轮首个请求 26 条里 7 条不带**
+#:     （字段缺失，不是换了形状）——A83 的前提「header 每轮都在」对这类请求不成立。
+#:   - 消息路：这 7 条的 cwd 载体**都在**——在 codex 首个 `developer` 消息紧后的那条 user
+#:     （`<environment_context>` + AGENTS.md 头）；未压缩时它在 `[2]`，压缩回放把此前的
+#:     user 消息排到 developer 前面，它就被推到 `[5]`–`[9]`，出了 `_SCAN_MESSAGES` 窗口。
+#:   ⇒ 两路皆空的主对话 3 次（09-28 21:32 建出 Global 本 `ldg-1d06…` 那次、23:41、09-29
+#:     09:45）全是「压缩后 ∧ 新一轮首个请求 ∧ header 缺 workspaces」。
+#: 信号在请求里、只是换了位置 ⇒ 按那处读，**不做会话级项目粘滞**（粘滞是沿用旧值的推断，
+#: 用户中途换仓库时会留下上一个项目的键；这里当轮就有 agent 自己声明的 cwd）。
+#: 规则：取**第一个** `developer` 消息之后紧跟的那一条（`tool` 不扫），按与窗口内同一套
+#: 抽取（`<environment_context>` 标签块 ∪ 头部 `_SCAN_CHARS`）。**不放大窗口**：只多看
+#: 一条、且是 agent 注入位上的那一条，中毒源（tool 结果转引文档）不在这个位置。
+#: 只在消息窗口与 header 两路都取不到时才用 ⇒ 有信号的请求逐字不变。
+def extract_cwd_after_developer(messages: list[dict]) -> str:
+    """首个 `developer` 消息紧后那一条里的 cwd；没有 developer / 下一条是 tool / 取不到 ⇒ ""。"""
+    msgs = messages or []
+    for i, m in enumerate(msgs):
+        if m.get("role") != "developer":
+            continue
+        for nxt in msgs[i + 1:]:
+            content = _text_of(nxt.get("content"))
+            if not content:
+                continue
+            if nxt.get("role") == "tool":
+                return ""
+            block = _ENV_BLOCK.search(content)
+            if block:
+                found = _first_match(block.group(2))
+                if found:
+                    return found
+            return _first_match(content[:_SCAN_CHARS])
+        return ""
+    return ""
+
+
 def explicit_project_id(headers: dict[str, str]) -> str:
     """显式层占位（键分层第一档）。
 
@@ -303,7 +387,8 @@ _PROJECT_MARKERS = ("AGENTS.md", "CLAUDE.md", "pyproject.toml",
 
 
 def resolve_project(cwd: str) -> ProjectIdentity:
-    """cwd → 项目身份。结果按 cwd 缓存（FS 访问每 cwd 一次）。
+    """cwd → 项目身份。**识别出项目的**结果按 cwd 缓存（FS 访问每 cwd 一次）；
+    Global 结果不缓存、每轮重算（MQ-L65，见 `_cache` 注释）。
 
     准入（2026-08-29 护栏 C）：cwd 必须绝对且是真实目录，否则直接 Global。
 
@@ -332,9 +417,7 @@ def resolve_project(cwd: str) -> ProjectIdentity:
         return hit
     try:
         if not os.path.isdir(cwd):
-            ident = ProjectIdentity()
-            _cache[cwd] = ident
-            return ident
+            return ProjectIdentity()          # 不缓存：目录可能稍后才建出来（MQ-L65）
         real = os.path.realpath(cwd)
         root = _git_repo_root(real)
         if not root:
@@ -356,7 +439,8 @@ def resolve_project(cwd: str) -> ProjectIdentity:
                 source="git-remote" if url else "git-root", root=root)
     except OSError:
         ident = ProjectIdentity()
-    _cache[cwd] = ident
+    if ident.project_id:                      # 只缓存正结果（MQ-L65，见 `_cache` 注释）
+        _cache[cwd] = ident
     return ident
 
 
@@ -376,9 +460,22 @@ def resolve_from_request(headers: dict[str, str],
     explicit = explicit_project_id(headers)
     if explicit:
         return ProjectIdentity(project_id=explicit, source="explicit")
+    # 批 E（MQ-A83，调度复核改序）：**消息扫描优先，取不到 cwd 才读 codex 自报的工作区根**。
+    # header 的 `workspaces` 是工作区根，消息里的 `<cwd>` 是精确当前目录——两者不同时
+    # （工作区开在 ~/dev、cwd 在 ~/dev/BladeX）header 优先会把原本认得出的项目解析成
+    # ~/dev（非 git ⇒ Global），把要修的病反过来带到正常会话上。改前能认出项目的路径
+    # 逐字不变，header 只救压缩后载体出窗口那一类。
     cwd = extract_cwd(messages)
+    cwd_source = "messages" if cwd else ""
+    if not cwd:
+        cwd = codex_workspace_root(headers)
+        cwd_source = "codex_workspaces" if cwd else ""
+    if not cwd:
+        # 批 E · E6（MQ-A88）：前两路都空 ⇒ 读 codex 上下文包（见 `extract_cwd_after_developer`）。
+        cwd = extract_cwd_after_developer(messages)
+        cwd_source = "after_developer" if cwd else ""
     ident = resolve_project(cwd)
-    logger.info("project_resolved", cwd_found=bool(cwd), cwd=cwd[:120],
+    logger.info("project_resolved", cwd_found=bool(cwd), cwd=cwd[:120], cwd_source=cwd_source,
                 project_id=ident.project_id, source=ident.source or "global",
                 name=ident.name)
     return ident

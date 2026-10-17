@@ -209,7 +209,7 @@ def test_unconsume_requires_filter():
         try:
             index.unconsume_matching(ledger)
         except ValueError as e:
-            assert "过滤条件" in str(e)
+            assert "needs at least one filter" in str(e)
         else:
             raise AssertionError("unconsume_matching 无过滤条件时应抛 ValueError")
         finally:

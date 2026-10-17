@@ -5,7 +5,13 @@
 `migrate_legacy_layout` / `prune_orphan_machine_files` / `prune_empty_dirs` 及 `matters/`
 路径族）连同 `BLADEX_FLASH_RENDER` / `BLADEX_FLASH_MATTERS` 一起删除——ADR-0031 已废、
 两开关默认关且 live 未设、`memory_index._render_flash` 是唯一调用点。素材在 git 历史。
-本模块只剩 **被 `flash_daemon` / `ledger` / `flash_tree` 共用的路径与落盘助手**。
+本模块只剩 **被 `flash_daemon` / `ledger` 共用的路径与落盘助手**
+（`flash_tree` 四级目录树已于 2026-09-23 批 F4 删除，ADR-0034 §3.1）。
+
+Flash 今天的职责（ADR-0034 §3）：① 账本的人可编辑面（`ledgers/**/<id>.md`，直编经 daemon
+捕获为 `LEDGER_USER_EDIT` 回 Hub）；② 行为画像 `behavior.json`（F2 写；读者 = dashboard / `/admin/behavior`——
+模型工具 `bladex_flash_read` 10-17 F5 判决退出注册）。
+账本的真相在 Hub 事件流，`.md` 只是它的投影。
 
 # 🔴 仍然有效的红线
 
@@ -18,6 +24,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -199,12 +206,12 @@ class FlashTreeSummary:
     本仓库的高发病）。真正的渲染心跳要另立，且**不能放进 flash-root**：
     一个内容是时间戳的文件会让"删掉重渲染逐字一致"当场失效。
 
-    2026-09-03 S5 起按 ADR-0032 布局计数：`ledgers`（`ledgers/<桶>/<id>.md` 账本真身）
-    取代旧的 `cards`/`archived`（`matters/` 目录族已随老渲染器删除）。
+    2026-09-03 S5 起按 ADR-0032 布局计数：`ledgers`（`ledgers/<桶>/<id>.md` 账本投影；
+    真相在 Hub 事件流，ADR-0034 §3.2）取代旧的 `cards`/`archived`（`matters/` 目录族已随老渲染器删除）。
     """
 
     principals: int = 0
-    ledgers: int = 0      # ledgers/<桶>/<id>.md（账本池真身）
+    ledgers: int = 0      # ledgers/<桶>/<id>.md（账本投影文件数，不是 Hub 账本数）
     user_files: int = 0   # *.local.md —— 用户手写的那些
     newest_mtime: float = 0.0
 
@@ -235,3 +242,31 @@ def summarize_tree(root: str) -> FlashTreeSummary:
         logger.warning("flash_summary_failed root=%s error=%s", root, e)
     return FlashTreeSummary(principals=principals, ledgers=ledgers,
                             user_files=user_files, newest_mtime=newest)
+
+
+# ── F2 · 行为画像产物与新鲜度读数（daemon 写、status / admin 读；都从文件系统读，不经进程）──
+
+#: `behavior.json` 落点（方案 §1）：`<flash-root>/<principal>/<scope>/behavior.json`
+BEHAVIOR_FILE = "behavior.json"
+#: daemon 的持久小状态（增量 fold + 新鲜度读数）——与账本直编 baseline 同一个文件
+STATE_FILE = ".flash_state.json"
+
+
+def behavior_path(root: str, principal: str, *, scope: str = SCOPE_PERSONAL) -> str:
+    return f"{scope_dir(root, principal, scope)}/{BEHAVIOR_FILE}"
+
+
+def read_behavior_status(root: str) -> dict:
+    """`.flash_state.json` 里的 `behavior_status` 段（`flash_lag_s` 等；MQ-F4）。
+
+    读不到 / 没有 ⇒ 空 dict：调用方要把"没有读数"与"lag=0"分开显示（原则 13 层 4：
+    恒 0 要能证明是"真没新轮"，而不是分子断线——所以这里**不补 0**）。
+    """
+    path = f"{_norm_root(root)}/{STATE_FILE}"
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    st = data.get("behavior_status") if isinstance(data, dict) else None
+    return dict(st) if isinstance(st, dict) else {}

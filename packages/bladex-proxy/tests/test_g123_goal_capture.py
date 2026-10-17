@@ -59,24 +59,28 @@ def test_disposition_rejudges_and_ignores_frozen_flag():
     import inspect
 
     params = inspect.signature(classify_turn_disposition).parameters
-    assert list(params) == ["messages"]
+    # 批 E（MQ-A82，2026-09-28）：多出两个 keyword-only 的**原始输入**（agent 名 + header
+    # 快照），codex 自报的 `thread_source` 只在 header 里、消息里没有，重判照样是从
+    # 存下来的原料**重算**。守的那条线不变：签名里不许出现冻结的判定字段。
+    assert list(params) == ["messages", "agent_id", "headers"]
+    assert params["agent_id"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["headers"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert not {"auxiliary", "aux_source", "identity", "turn"} & set(params)
 
 
 # ── 🔴 已知缺口：钉当前行为，修好后反过来 ───────────────────────────────
 
-def test_mq_s44_background_process_notice_currently_reads_as_real():
-    """MQ-S44：`[IMPORTANT: Background process …]` 没有 aux 指纹。
+def test_mq_s44_background_process_notice_is_refused():
+    """MQ-S44 **已修**（批 Q3A，2026-09-29）：`[IMPORTANT: Background process …]` 判 scaffold。
 
-    live 20 轮全判 REAL，其中 1 条**已确凿开卡**（`judgment_taskstate` 仅有的三条
-    `verdict=new` 之一）。⇒ 现在 goal 会从一条后台进程完成通知里取。
-
-    🔴 MQ-S44 修好后：expected 改成 `TURN_SCAFFOLD`（user 侧是通知、assistant 侧
-    可能在做实事），并把 `test_..._currently_reads_as_real` 改名为 `_is_refused`。
+    原缺口：live 20 轮全判 REAL，其中 1 条**已确凿开卡**（`judgment_taskstate` 仅有的三条
+    `verdict=new` 之一）⇒ goal 会从一条后台进程完成通知里取。按本条原 docstring 的交代反转：
+    expected = `TURN_SCAFFOLD`（user 侧是通知、assistant 侧在做实事），goal 不从它取。
     """
     text = ("[IMPORTANT: Background process proc_2f436f1cb432 completed normally "
             "(exit code 0).\nCommand: bash scripts/gate_check.sh")
     cls, rule = classify_turn_disposition(_u(text))
-    assert (cls, rule) == (TURN_REAL, ""), "指纹表补上了？那就按 docstring 反转本条"
+    assert (cls, rule) == (TURN_SCAFFOLD, "hermes_background_process")
 
 
 def test_mq_s45_codex_history_all_live_clauses_hit():

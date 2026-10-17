@@ -28,13 +28,11 @@ from bladex_core.project import (
     matter_belongs_to_project,
     name_from_root,
     project_id_for,
-    render_project_card,
 )
 from bladex_core.rulefile import (
     extract_rule_files,
     norm_rulefile_name,
     render_agent_md,
-    render_profile_card,
     render_user_md,
 )
 
@@ -167,14 +165,11 @@ def test_compose_fields_are_deterministic_concatenation():
     assert compose_progress(["进展一", " ", "进展二"]) == "进展一 | 进展二"
 
 
-def test_project_card_max_four_lines():
-    p = Project(project_id="pipeline", name="BladeX", root_path="/dev/BladeX",
-                description="记忆检索重构", progress_note="E6 完成",
-                languages=["Python"])
-    lines = render_project_card(p, active_matters=3)
-    assert len(lines) <= 4
-    assert lines[0].startswith("[Project: BladeX]")
-    assert any("活跃 Matter: 3" in ln for ln in lines)
+def test_project_card_renderer_removed():
+    """E7.2 Project 卡注入 2026-09-18 批 S 删设计（拍板 0.3.0-(5)，ADR-0034 §3.2）。"""
+    import bladex_core.project as _proj
+    assert not hasattr(_proj, "render_project_card")
+    assert Project(project_id="pipeline", name="BladeX", root_path="/dev/BladeX").name == "BladeX"
 
 
 # ── E7.3 规则文件 + 画像渲染 ───────────────────────────────────────────
@@ -251,8 +246,11 @@ def test_agent_md_no_warning_when_sample_too_small():
     assert "常见失败" not in md
 
 
-def test_profile_card_v2_picks_complete_sentences():
-    """render v2：只选完整句子，≤5 行——取代"路径串联乱码"那两行。"""
+def test_profile_card_renderer_removed_user_md_kept():
+    """E7.3 画像卡注入 2026-09-18 批 S 删设计（ADR-0034 §3.2）：USER.md 渲染保留（投影/dashboard），
+    `render_profile_card` 不许再出现。"""
+    import bladex_core.rulefile as _rf
+    assert not hasattr(_rf, "render_profile_card")
     user_md = render_user_md(
         user_id="u1", key_count=1,
         agents=[{"agent_id": "hermes", "turns": 10}],
@@ -260,12 +258,4 @@ def test_profile_card_v2_picks_complete_sentences():
         preferences=["用户希望回复简洁", "用户不喜欢 emoji"],
         coding_preferences=[],
     )
-    lines = render_profile_card(user_md)
-    assert len(lines) <= 5
-    assert any("用户希望回复简洁" in ln for ln in lines)
-    # 统计行不进卡（"hermes: 3 turns" 这类）
-    assert not any(ln.endswith(" turns") for ln in lines)
-
-
-def test_profile_card_empty_when_no_profile():
-    assert render_profile_card("", "") == []
+    assert "用户希望回复简洁" in user_md

@@ -600,10 +600,18 @@ def test_recommended_profiles_present_and_described():
 
 
 def test_recommended_models_supported_by_fastembed():
-    """推荐档必须都在 fastembed 白名单内（防再次写出不存在的 e5-small）。"""
+    """**本地**推荐档必须都在 fastembed 白名单内（防再次写出不存在的 e5-small）。
+
+    G18.3 起 MODEL_PROFILES 含 api 条目（openai/... 等），它们本就不在 fastembed
+    白名单——断言范围从全表收窄到 local_profile_names()，且 api 条目必须都带
+    `api: True` 标记（否则会漏进 `_local_model_for` 的可喂 fastembed 判据）。
+    """
+    from bladex_proxy.embedding import local_profile_names
     from fastembed import TextEmbedding
     supported = {m["model"] for m in TextEmbedding.list_supported_models()}
-    assert set(MODEL_PROFILES) <= supported
+    assert set(local_profile_names()) <= supported
+    for name in set(MODEL_PROFILES) - set(local_profile_names()):
+        assert MODEL_PROFILES[name].get("api") is True, name
 
 
 def test_cache_detect_uses_real_hf_repo(tmp_path):
@@ -614,8 +622,10 @@ def test_cache_detect_uses_real_hf_repo(tmp_path):
     """
     from bladex_proxy.embedding import _hf_repos_for, _model_cached
     repos = _hf_repos_for("intfloat/multilingual-e5-large")
-    assert repos[0] == "qdrant/multilingual-e5-large-onnx"
-    d = tmp_path / "models--qdrant--multilingual-e5-large-onnx"
+    # 仓库名大小写随 fastembed 版本变（0.8 `qdrant/…`，0.9 `Qdrant/…`）；断言只比到大小写，
+    # 缓存目录按当前版本给的真实仓库名拼（HF 缓存目录大小写敏感，写死小写会在 Linux 上红）。
+    assert repos[0].lower() == "qdrant/multilingual-e5-large-onnx"
+    d = tmp_path / ("models--" + repos[0].replace("/", "--"))
     d.mkdir(parents=True)
     (d / "model.onnx").write_text("x")
     assert _model_cached("intfloat/multilingual-e5-large", str(tmp_path)) is True
@@ -624,7 +634,7 @@ def test_cache_detect_uses_real_hf_repo(tmp_path):
 def test_ensure_local_model_skips_when_cached(monkeypatch, tmp_path):
     """已缓存 -> 不探网、不下载（正常启动路径零网络开销）。"""
     from bladex_proxy import embedding as em
-    d = tmp_path / "models--qdrant--bge-small-en-v1.5-onnx-q"
+    d = tmp_path / ("models--" + em._hf_repos_for("BAAI/bge-small-en-v1.5")[0].replace("/", "--"))
     d.mkdir(parents=True)
     (d / "model.onnx").write_text("x")
     monkeypatch.setattr(em, "_endpoint_reachable",
@@ -892,3 +902,51 @@ def test_embeddings_endpoint_attributes_caller(monkeypatch):
         assert got2["caller"] != "consolidator"
     finally:
         client.__exit__(None, None, None)
+
+
+# ── G18.3：api 模型元数据进 MODEL_PROFILES（MQ-W9 断点③，批 P）──
+
+_API_PROFILE_NAMES = ("openai/text-embedding-3-small", "openai/text-embedding-3-large",
+                      "doubao-embedding", "dashscope/text-embedding-v3")
+
+
+def test_api_model_profiles_present_with_metadata():
+    """四条 api 模型有元数据、带 api 标记、恒未标定（标定是另一张跨模型的卡）。"""
+    for name in _API_PROFILE_NAMES:
+        prof = MODEL_PROFILES[name]
+        assert prof.get("api") is True, name
+        assert prof["calibrated"] is False, name
+        assert prof.get("languages") and prof.get("note"), name
+    assert MODEL_PROFILES["openai/text-embedding-3-small"]["dim"] == 1536
+    assert MODEL_PROFILES["openai/text-embedding-3-large"]["dim"] == 3072
+    assert MODEL_PROFILES["dashscope/text-embedding-v3"]["dim"] == 1024
+
+
+def test_thresholds_known_api_model_no_longer_unknown(monkeypatch):
+    """判据原文：resolve_embed_settings 对上述 model 名不再走 unknown 分支。"""
+    for k in ("BLADEX_NOVELTY_THRESHOLD", "BLADEX_SEMANTIC_THRESHOLD",
+              "BLADEX_DIGESTION_THRESHOLD"):
+        monkeypatch.delenv(k, raising=False)
+    from bladex_proxy.embedding import resolve_embed_settings
+    for name in _API_PROFILE_NAMES:
+        cfg = _fake_cfg(embed_backend="api", embed_model=name)
+        assert name in resolve_embed_settings(cfg).profiles
+        out = effective_thresholds(cfg)
+        assert out == {"novelty": _FLAG_NOVELTY, "semantic": 0.85, "digestion": 0.85}
+
+
+def test_forced_local_never_feeds_api_profile_name_to_fastembed():
+    """阴性对照：api 模型进表后，`_local_model_for` 的"在表内=可喂 fastembed"旧判据
+    会把 openai/... 当本地模型名——必须仍回默认本地模型。"""
+    from bladex_proxy.embedding import _local_model_for, resolve_embed_settings
+    for name in _API_PROFILE_NAMES:
+        cfg = _fake_cfg(embed_backend="api", embed_model=name, sens_enabled=True)
+        s = resolve_embed_settings(cfg)
+        assert _local_model_for(s, True) == DEFAULT_LOCAL_MODEL, name
+
+
+def test_local_profile_names_excludes_api_entries():
+    from bladex_proxy.embedding import local_profile_names
+    names = local_profile_names()
+    assert DEFAULT_LOCAL_MODEL in names and _E5_MODEL in names
+    assert not set(names) & set(_API_PROFILE_NAMES)

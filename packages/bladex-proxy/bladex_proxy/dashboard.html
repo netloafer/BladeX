@@ -429,11 +429,13 @@ const IC={
   profiles:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5"/></svg>',
   agents:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 2v6M15 2v6"/><path d="M6 8h12v3a6 6 0 0 1-12 0z"/><path d="M12 17v5"/></svg>',
   config:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6z"/></svg>',
-  ledgers:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 4h11a2 2 0 0 1 2 2v14H7a2 2 0 0 1-2-2z"/><path d="M9 8h6M9 12h6M9 16h3"/></svg>'
+  ledgers:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 4h11a2 2 0 0 1 2 2v14H7a2 2 0 0 1-2-2z"/><path d="M9 8h6M9 12h6M9 16h3"/></svg>',
+  activity:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>'
 };
 const TABS=[["overview","Overview"],["ledgers","Ledgers"],["facts","Memory"],
             ["matters","Matters"],
             ["files","Files"],["projects","Projects"],["profiles","Profiles"],
+            ["activity","Activity"],
             ["graph","Graph"],["sessions","Sessions"],["agents","Agents"],
             ["config","Rules & Config"]];
 const SUBS={overview:"Pipeline, storage tiers, routing and degradation",
@@ -443,6 +445,7 @@ const SUBS={overview:"Pipeline, storage tiers, routing and degradation",
   files:"File index: names, types, summaries and keywords from traffic",
   projects:"Project library: roots, languages and progress",
   profiles:"USER.md, per-agent habit docs, rule file copies and tool usage",
+  activity:"Behaviour profile: per-agent turns, sessions and ledgers (behavior.json)",
   graph:"Force-directed view of Matters and member facts",
   agents:"Connected agents, unrecognised clients and claim history",
   sessions:"Hub sessions and turn-level replay",
@@ -1626,11 +1629,60 @@ async function _agentNameDialog(from,drift,mode){
   }
   viewAgents();
 }
+/* ═══════════════ Activity（F3 最小形态：一张表 + flash_lag_s 一行）═══════════════
+   数据源 = /admin/behavior，经 behavior.json 的唯一读取点
+   （behavior_read.read_behavior_card；模型面 bladex_flash_read 10-17 F5 退出注册）。这里不算任何派生值——
+   dashboard 另算一遍就是给同一个读数造第二个口径。
+   可视化（活跃时段热力图等）不在 0.3.0，见交接稿 §1。 */
+async function viewActivity(){
+  const m=$("#main");
+  m.innerHTML=`<div class="card">${skel(4)}</div>`;
+  let d;try{d=await api("GET","/admin/behavior");}
+  catch(e){if(e.auth)return authGate();m.innerHTML=errorCard(e.message,"viewActivity()");return;}
+  const st=d.status||{};
+  /* 「没有读数」与「lag=0」必须分得开（原则 13 层 4）——键不在就显示 n/a。 */
+  const lag=("flash_lag_s" in st)
+    ? `${st.flash_lag_s}s${st.lag_exceeded?' <span class="tag err">over bound</span>':""}`
+    : '<span class="dim2">n/a (this proxy has not seen a behavior pass)</span>';
+  const meta=(d.behavior||{}).meta||{};
+  if(!d.available){
+    m.innerHTML=`<div class="card"><div class="fields">
+        <div class="f"><div class="fk">flash_lag_s</div><div class="fv">${lag}</div></div>
+        ${field("reason",d.reason)}${field("path",d.path,1)}
+        ${field("age",d.age_s==null?"":d.age_s+"s")}</div></div>
+      <div class="card">${emptyState("No behaviour profile available",
+        "behavior.json is written by the flash maintenance process; reason: "+esc(d.reason||"unknown"))}</div>`;
+    return;
+  }
+  const agents=(d.behavior.agents||[]);
+  m.innerHTML=`<div class="card"><div class="fields">
+      <div class="f"><div class="fk">flash_lag_s</div><div class="fv">${lag}</div></div>
+      ${field("hub watermark",meta.hub_watermark)}
+      ${field("generated at",meta.generated_at)}
+      ${field("turns eligible",`${meta.turns_eligible??"-"} / seen ${meta.turns_seen??"-"} / bench ${meta.turns_bench??"-"}`)}
+    </div></div>
+    <div class="card"><div class="tbl-wrap"><table id="acttab"><thead><tr>
+      <th style="width:16%">Agent</th><th>Last seen</th><th class="num">Turns</th>
+      <th class="num">7d</th><th class="num">30d</th><th class="num">Sessions</th>
+      <th class="num">Ledgers</th><th>Top tool</th>
+    </tr></thead><tbody>${agents.map(a=>{
+      const t=(a.tools_top||[])[0];
+      return `<tr><td>${esc(a.base)}</td>
+        <td class="dim num">${tsCell(a.last_seen,"min")}</td>
+        <td class="num">${a.turns?.all??0}</td><td class="num">${a.turns?.d7??0}</td>
+        <td class="num">${a.turns?.d30??0}</td>
+        <td class="num">${a.sessions?.count_all??0}</td>
+        <td class="num">${a.ledger?.created??0} / ${a.ledger?.active??0} active</td>
+        <td class="dim">${t?esc(t.name)+" ("+t.calls+")":"-"}</td></tr>`;}).join("")
+      ||`<tr><td colspan="8">${emptyState("No agents in the profile",
+          "Only agents with real turns appear here")}</td></tr>`}
+    </tbody></table></div></div>`;
+}
 const VIEWS={overview:viewOverview,ledgers:viewLedgers,facts:viewFacts,
              matters:viewMatters,
              files:viewFiles,projects:viewProjects,profiles:viewProfiles,
              graph:viewGraph,sessions:viewSessions,agents:viewAgents,
-             config:viewConfig};
+             config:viewConfig,activity:viewActivity};
 window.addEventListener("hashchange",route);
 (function initTz(){
   const t=tzLabel(),el=$("#tz");

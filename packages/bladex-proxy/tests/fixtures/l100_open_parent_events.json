@@ -1,0 +1,293 @@
+{
+ "source": "批 L100：修前代码（HEAD ac230d7 的 agency/handlers.py）跑 open_parent_events() 的归一化事件序列",
+ "events": [
+  [
+   "ledger_create",
+   {
+    "agent_id": "dsh",
+    "ledger": {
+     "closed_at": "",
+     "closed_by_agent": "",
+     "closed_by_session": "",
+     "created_at": "<ts>",
+     "goal": "修 MQ-A92",
+     "goal_origin": "",
+     "goal_revisions": 0,
+     "goal_source": "model",
+     "goal_verbatim": "修 MQ-A92",
+     "last_writer": "",
+     "ledger_id": "<L0>",
+     "matter_id": "<M0>",
+     "parent_ledger_id": "",
+     "rev": 0,
+     "section_order": [
+      "goal",
+      "core",
+      "verified",
+      "open",
+      "next"
+     ],
+     "sections": {
+      "core": [
+       {
+        "ref": "",
+        "source": "model",
+        "text": "A92 的根因在压缩引擎",
+        "writer": "dsh"
+       }
+      ],
+      "next": [],
+      "open": [],
+      "verified": []
+     },
+     "status": "active",
+     "superseded_by": "",
+     "title": "MQ-A92 修复",
+     "updated_at": "<ts>"
+    },
+    "project_id": "p-l100test0001",
+    "session_id": "s1",
+    "turn_index": 1
+   }
+  ],
+  [
+   "ledger_switch",
+   {
+    "agent_id": "dsh",
+    "evidence": "修 MQ-A92",
+    "evidence_ok": true,
+    "evidence_source": "new_ledger",
+    "from_ledger_id": "",
+    "ledger_id": "<L0>",
+    "project_id": "p-l100test0001",
+    "session_id": "s1",
+    "to_ledger_id": "<L0>",
+    "turn_index": 1
+   }
+  ],
+  [
+   "ledger_update",
+   {
+    "ledger": {
+     "closed_at": "",
+     "closed_by_agent": "",
+     "closed_by_session": "",
+     "created_at": "<ts>",
+     "goal": "修 MQ-A92",
+     "goal_origin": "",
+     "goal_revisions": 0,
+     "goal_source": "model",
+     "goal_verbatim": "修 MQ-A92",
+     "last_writer": "dsh",
+     "ledger_id": "<L0>",
+     "matter_id": "<M0>",
+     "parent_ledger_id": "",
+     "rev": 1,
+     "section_order": [
+      "goal",
+      "core",
+      "verified",
+      "open",
+      "next"
+     ],
+     "sections": {
+      "core": [
+       {
+        "ref": "",
+        "source": "model",
+        "text": "A92 的根因在压缩引擎",
+        "writer": "dsh"
+       }
+      ],
+      "next": [
+       {
+        "ref": "<L1>",
+        "source": "model",
+        "text": "[sub-task] awaiting sub-task <L1>: MQ-A93 修复",
+        "writer": "dsh"
+       }
+      ],
+      "open": [],
+      "verified": []
+     },
+     "status": "active",
+     "superseded_by": "",
+     "title": "MQ-A92 修复",
+     "updated_at": "<ts>"
+    }
+   }
+  ],
+  [
+   "ledger_create",
+   {
+    "agent_id": "dsh",
+    "ledger": {
+     "closed_at": "",
+     "closed_by_agent": "",
+     "closed_by_session": "",
+     "created_at": "<ts>",
+     "goal": "修 MQ-A93",
+     "goal_origin": "",
+     "goal_revisions": 0,
+     "goal_source": "model",
+     "goal_verbatim": "顺手把 A93 修了",
+     "last_writer": "",
+     "ledger_id": "<L1>",
+     "matter_id": "<M1>",
+     "parent_ledger_id": "<L0>",
+     "rev": 0,
+     "section_order": [
+      "goal",
+      "core",
+      "verified",
+      "open",
+      "next"
+     ],
+     "sections": {
+      "core": [],
+      "next": [
+       {
+        "ref": "<L0>",
+        "source": "model",
+        "text": "[sub-task] on completion: report status and results back to parent ledger <L0> (bladex_ledger_switch to it, then bladex_ledger_update).",
+        "writer": "dsh"
+       }
+      ],
+      "open": [],
+      "verified": []
+     },
+     "status": "active",
+     "superseded_by": "",
+     "title": "MQ-A93 修复",
+     "updated_at": "<ts>"
+    },
+    "project_id": "p-l100test0001",
+    "session_id": "s2",
+    "turn_index": 1
+   }
+  ],
+  [
+   "ledger_switch",
+   {
+    "agent_id": "dsh",
+    "evidence": "修 MQ-A93",
+    "evidence_ok": true,
+    "evidence_source": "new_ledger",
+    "from_ledger_id": "<L0>",
+    "ledger_id": "<L1>",
+    "project_id": "p-l100test0001",
+    "session_id": "s2",
+    "to_ledger_id": "<L1>",
+    "turn_index": 1
+   }
+  ],
+  [
+   "ledger_switch",
+   {
+    "agent_id": "dsh",
+    "evidence": "[sub-task] on completion: report status and results back to parent ledger <L0> (bladex_ledger_switch to it, then bladex_ledger_update).",
+    "evidence_ok": true,
+    "evidence_source": "child_writeback",
+    "from_ledger_id": "<L1>",
+    "ledger_id": "<L0>",
+    "project_id": "p-l100test0001",
+    "session_id": "s2",
+    "to_ledger_id": "<L0>",
+    "turn_index": 2
+   }
+  ],
+  [
+   "ledger_update",
+   {
+    "agent_id": "dsh",
+    "ledger": {
+     "closed_at": "",
+     "closed_by_agent": "",
+     "closed_by_session": "",
+     "created_at": "<ts>",
+     "goal": "修 MQ-A92",
+     "goal_origin": "",
+     "goal_revisions": 0,
+     "goal_source": "model",
+     "goal_verbatim": "修 MQ-A92",
+     "last_writer": "dsh",
+     "ledger_id": "<L0>",
+     "matter_id": "<M0>",
+     "parent_ledger_id": "",
+     "rev": 2,
+     "section_order": [
+      "goal",
+      "core",
+      "verified",
+      "open",
+      "next"
+     ],
+     "sections": {
+      "core": [
+       {
+        "ref": "",
+        "source": "model",
+        "text": "A92 的根因在压缩引擎",
+        "writer": "dsh"
+       }
+      ],
+      "next": [
+       {
+        "ref": "<L1>",
+        "source": "model",
+        "text": "[sub-task] awaiting sub-task <L1>: MQ-A93 修复",
+        "writer": "dsh"
+       }
+      ],
+      "open": [],
+      "verified": [
+       {
+        "ref": "",
+        "source": "model",
+        "text": "[sub-task] <L1> done: A93 规则已落",
+        "writer": "dsh"
+       }
+      ]
+     },
+     "status": "active",
+     "superseded_by": "",
+     "title": "MQ-A92 修复",
+     "updated_at": "<ts>"
+    },
+    "project_id": "p-l100test0001",
+    "session_id": "s2",
+    "turn_index": 2
+   }
+  ],
+  [
+   "ledger_switch",
+   {
+    "agent_id": "dsh",
+    "evidence": "[sub-task] awaiting sub-task <L1>: MQ-A93 修复",
+    "evidence_ok": true,
+    "evidence_source": "child_writeback",
+    "from_ledger_id": "<L0>",
+    "ledger_id": "<L1>",
+    "project_id": "p-l100test0001",
+    "session_id": "s2",
+    "to_ledger_id": "<L1>",
+    "turn_index": 2
+   }
+  ],
+  [
+   "ledger_close",
+   {
+    "agent_id": "dsh",
+    "evidence": "",
+    "evidence_ok": null,
+    "evidence_source": "",
+    "ledger_id": "<L1>",
+    "origin": "model",
+    "project_id": "p-l100test0001",
+    "reason": "",
+    "session_id": "s2",
+    "turn_index": 2
+   }
+  ]
+ ]
+}

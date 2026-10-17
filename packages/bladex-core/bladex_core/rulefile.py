@@ -143,29 +143,5 @@ def render_agent_md(
 
 # ── ①平面画像卡 render v2（节选，≤5 行完整句子）────────────────────────
 
-PROFILE_CARD_MAX_LINES = 5
-
-
-def render_profile_card(user_md: str, agent_md: str = "", *,
-                        max_lines: int = PROFILE_CARD_MAX_LINES) -> list[str]:
-    """从 USER.md / agent 文件节选出 ①平面画像卡（ADR-0028 E7.3 render v2）。
-
-    取代旧渲染（"[User 画像] 使用规则文件 CLAUDE.md：<一段路径乱码>"）：
-    只选**完整句子**的条目行（`- ` 开头、去掉标题与统计行），≤5 行。
-    """
-    picked: list[str] = []
-    for blob, tag in ((user_md, "User 画像"), (agent_md, "Agent 习惯")):
-        if not blob:
-            continue
-        for raw in blob.splitlines():
-            line = raw.strip()
-            if not line.startswith("- ") or len(line) < 6:
-                continue
-            body = line[2:].strip()
-            # 跳过纯统计/清单行（"agents:"、"key: 3"、"xxx: 12 turns"）
-            if body.endswith(":") or re.fullmatch(r"[\w.:\-]+\s*[:：]\s*\d+.*", body):
-                continue
-            picked.append(f"[{tag}] {body}")
-            if len(picked) >= max_lines:
-                return picked
-    return picked
+# （`render_profile_card`——①平面画像卡节选——已于 2026-09-18 批 S 删除：注入面 09-03 起
+#  不消费画像卡，零生产调用点；拍板 0.3.0-(5)，ADR-0034 §3.2。USER.md / AGENT.md 渲染保留。）

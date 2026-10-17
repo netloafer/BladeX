@@ -5,6 +5,10 @@
   </picture>
 </p>
 
+<p align="center">
+  <a href="https://github.com/netloafer/BladeX/actions/workflows/ci.yml"><img src="https://github.com/netloafer/BladeX/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+</p>
+
 > **Build your private data assets.**
 > **Connect all your agents and LLMs like a blade.**
 
@@ -88,7 +92,7 @@ the Hub can be rebuilt from it.
 | **Pipeline** | Redis (AOF) | Incoming buffer. Acked only after the turn is stored; disk spill if Redis is down, so turns are never lost. |
 | **Memory Hub** | RocksDB | Full journal, **single source of truth**, long-term. Everything else can be rebuilt from it. |
 | **Memory Index** | LanceDB + FTS | Derived: distilled facts, embeddings, the Matter graph. Rebuildable from the Hub. |
-| **Memory Flash** | Files | File projection of the current state, `User → Agent → Project → Session`. Readable by you, not just by the proxy. |
+| **Memory Flash** | Files | Your ledgers as editable Markdown (edit one in your own editor and BladeX adopts the change), plus a behavior profile (`behavior.json`) you can view on the dashboard. Projections of the Hub, never a second source of truth. |
 
 ### 3. Agency — BladeX is visible to the model
 
@@ -122,9 +126,8 @@ and spliced back. You can see every one of them in `bladex status --traffic`.
 | **Works across different agents** | ✅ one memory behind all of them | ❌ per-agent silo | depends on integration |
 | **Task state, not just facts** | ✅ five-section ledger | ❌ | ❌ |
 | **You own all data** | ✅ 100% on your infrastructure | depends on the agent | cloud by default |
-| **Memory-aware model routing** | ✅ optional | ❌ | ❌ |
 
-## Quick Start (v0.2.0)
+## Quick Start (v0.3.0)
 
 ### Prerequisites
 
@@ -160,13 +163,15 @@ bladex doctor --e2e    # end-to-end: is memory actually being produced and recal
 `bladex start` prints the dashboard URL and, if anything in the memory pipeline is missing, a
 `degraded` line naming the consequence (for example *"Redis unreachable -> turns are NOT stored, no
 memory will be produced"*). A green `ready` line means the loop is live; `bladex doctor --e2e`
-proves it by sending a probe turn and recalling it.
+proves it by sending a probe turn and recalling it. For scripts: `bladex start` exits `0` when ready,
+`1` when it failed, and `3` when it started degraded.
 
 > **First start downloads the embedding model** (~70 MB, from Hugging Face) before the proxy answers
-> `/ready`. On a slow link this can exceed the 30 s readiness window and `bladex start` may report
-> `failed -- /ready did not answer within 30s` even though the process is fine. Check
-> `logs/proxy-*.log` for `embed_model_download_start … server_ready`, then run `bladex doctor`;
-> the second start is instant. (Tracked as MQ-A42; the window will become download-aware in 0.3.0.)
+> `/ready`. `bladex start` recognises the download and waits for it, printing
+> `downloading embedding model … first start only` plus progress, instead of giving up at the 30 s
+> readiness window; the window only restarts once the download finishes. If the download fails, or
+> makes no progress for 2 minutes, `start` reports `failed -- the embedding model download failed`
+> with the reason (and stops the proxy it just started). The second start is instant.
 
 ### Configure your agent
 
@@ -206,6 +211,7 @@ bladex status --traffic     # one line per recent turn: agent / injected / route
 bladex doctor --e2e         # full loop: forward -> store -> distil -> recall
 bladex ledger list          # the task ledgers, newest first
 bladex ledger show <id>     # one ledger's five sections
+bladex ledger close <id>    # mark a finished ledger closed (undo: bladex ledger reopen <id>)
 bladex memory search "..."  # what BladeX has actually learned
 ```
 
@@ -246,10 +252,17 @@ baselined, and BladeX will not quote an end-to-end saving until that number exis
 
 ### Small context windows
 
-If you run a local model with a small context window (32K and below), watch the injected surface:
-the ledger block and system notes are real tokens, and on a small window they can squeeze the output
-budget. `bladex status --traffic` and the `upstream_output_truncated` warning in the log tell you
-when that is happening. Window-aware routing and budget-aware trimming are on the 0.3.0 list.
+If you run a local model with a small context window (32K and below), tell BladeX the window:
+add `context_window = <tokens>` (the `num_ctx` from `ollama show <model>`) to that model's
+`[[models]]` entry in `config/routing.toml`. With it set, dynamic routing skips a model that cannot
+hold the request plus an output reserve (`BLADEX_CONTEXT_OUTPUT_FLOOR_TOKENS`, default 2048), and
+BladeX trims **its own** injected surface to the remaining budget — switch candidates first, then
+the ledger block, then the ledger tool family, then the system notes; hard rules are never trimmed,
+and your agent's messages, tools and `max_tokens` are never touched. A model pinned by a static
+strategy is never swapped: you get a `route_static_context_window_exceeded` warning pointing at
+`routing.toml` instead. Without `context_window` nothing changes. `bladex doctor` lists local
+models that have no window configured; `bladex status --traffic` and the `upstream_output_truncated`
+warning still tell you when output is being cut.
 
 ### Non-English users
 
@@ -296,9 +309,12 @@ All data is stored locally on your machine, under `data/`:
 - **Pipeline**: Redis AOF persistence
 - **Memory Hub**: RocksDB — full conversation journal, single source of truth
 - **Memory Index**: LanceDB — embeddings, distilled facts, Matter graph (rebuildable from the Hub)
-- **Memory Flash**: plain files in `data/bladex_flash` — the current state projected as
-  `User → Agent → Project → Session`. Point `BLADEX_FLASH_PATH` somewhere handier (a notes vault,
-  say) if you want to read it alongside your own files.
+- **Memory Flash**: plain files in `data/bladex_flash` — one Markdown file per task ledger
+  (`<principal>/personal/ledgers/…/<id>.md`; edit it and BladeX adopts your version) and
+  `behavior.json`, a per-agent / per-project activity profile. Point `BLADEX_FLASH_PATH` somewhere
+  handier if you want to edit ledgers alongside your own files. (Before 0.3.0 Flash also wrote a
+  `User → Agent → Project → Session` directory tree; that tree is no longer written — see the
+  release notes.)
 
 BladeX **never sends your memory to third-party servers**. The only outgoing requests are to the LLM
 API providers you configured, for model inference. Encryption at rest is delegated to your disk
@@ -306,13 +322,18 @@ API providers you configured, for model inference. Encryption at rest is delegat
 
 ## Features
 
-### Core (v0.2.0)
+### Core (v0.3.0)
 
 - 🧾 **Five-section task ledger** — Goal / Core / Verified / Open / Next; survives compaction,
-  restarts, and cross-agent handoffs. Goal is user-owned.
+  restarts, and cross-agent handoffs. Goal is user-owned. Finished ledgers can be **closed or
+  superseded** — by the agent (`bladex_ledger_close`) or by you (`bladex ledger close | reopen |
+  supersede --by <id>`); a closed ledger drops out of the "recently worked on" list and stops
+  absorbing new turns. When what you say matches its content (within a day of closing, and not superseded), it shows
+  up again in the matching-ledgers list marked as closed — from any session or agent — and
+  switching back to it reopens it. `bladex ledger show` follows the supersede chain.
 - 🧠 **Memory quality as the product** — relevance over volume, incremental extraction before any
-  compaction, contradiction checks on write, trust decay and archiving instead of deletion.
-- 🛠️ **Tool face** — `bladex_memory_search` plus three ledger tools, with a strict boundary
+  compaction, trust decay and archiving instead of deletion.
+- 🛠️ **Tool face** — `bladex_memory_search` plus four ledger tools, with a strict boundary
   (memory and ledger objects only) and zero behavioural difference when unused.
 - 🔌 **Zero integration** — any agent speaking OpenAI Chat Completions, Anthropic Messages, or
   OpenAI Responses.
@@ -324,24 +345,77 @@ API providers you configured, for model inference. Encryption at rest is delegat
 - 🖥️ **Web dashboard** at `http://localhost:38080/dashboard` — status, fact search, Matter graph,
   ledgers, session replay, hard rules.
 - 🔌 **MCP server** (`bladex-mcp`) — a second read/write surface for clients that speak MCP.
-- 📤 **Export/import** — versioned JSONL snapshots, plus continuous one-way sync to Obsidian and
-  PostgreSQL.
+- 📤 **Export/import** — versioned JSONL snapshots, plus continuous **two-way** sync with Obsidian
+  and PostgreSQL. Edits made there flow back into the Memory Hub as journaled admin events, so they
+  survive a full rebuild and later automatic distillation never reverts them:
+  - **Obsidian** — edit a fact line (correction), move it to another Matter page (re-assignment;
+    into `Inbox.md` = unassign), or delete it (forget). On by default; `backflow = false` turns it
+    off. Edits to `Hard Rules.md` are journaled too and take effect within seconds (hard rules are
+    hot-reloaded, see below).
+  - **PostgreSQL** — the exported tables stay a read-only mirror; to change something, `INSERT` a
+    request into the append-only `bladex_edit_inbox` table and BladeX writes back `accepted` /
+    `rejected` with a reason. **Off by default** (`inbox = true` in `config/export.toml`), and it
+    **never accepts hard-rule changes** — whoever can write that database would otherwise be able
+    to inject instructions into every agent.
+  - Mass deletions are refused, not applied: a whole page disappearing, or more fact lines vanishing
+    in one scan than `BLADEX_BACKFLOW_MAX_DELETES` (default 5), only logs a warning.
 
-### Coming next (0.3.0)
+### Delivered in 0.3.0
 
-- Context-window-aware routing and budget-aware trimming of the injected surface
-- `close` / `supersede` primitives for finished ledgers
-- Bidirectional sync with external tools
-- Hot-reloadable hard rules (today they live in `config/.env` and need a restart)
+Everything the 0.2.0 README listed under *Coming next*:
 
-## Known Limitations (v0.2.0)
+- Context-window-aware routing and budget-aware trimming of the injected surface (see *Small
+  context windows* above; `[[models]].context_window`, `BLADEX_CHARS_PER_TOKEN`,
+  `BLADEX_CONTEXT_OUTPUT_FLOOR_TOKENS`). The stable part of the injected surface (system notes and
+  tool schemas) is now frozen at the first turn of a session and re-anchored by content afterwards,
+  so its position no longer drifts when the agent appends system reminders.
+- `close` / `supersede` primitives for finished ledgers: the model gets a `bladex_ledger_close`
+  tool (optionally naming the ledger that supersedes it), and you get `bladex ledger close | reopen |
+  supersede`. A closed ledger leaves the "recently worked on" list; when what you say matches
+  its content, it reappears among the matching ledgers marked as closed, and switching back to it
+  reopens it.
+- Bidirectional sync with external tools: edits you make in the Obsidian vault (a fact's line,
+  moving it to another Matter page, deleting it, `Hard Rules.md`) flow back into memory as
+  management events (`backflow = true` by default in `export.toml`; set `false` to keep the old
+  one-way export). PostgreSQL gets an opt-in append-only inbox table (`inbox = true`).
+- Hot-reloadable hard rules: change `BLADEX_HARD_RULES` in `config/.env` (or `Hard Rules.md`) and
+  every process picks it up within `BLADEX_HARD_RULES_RELOAD_S` (default 5 s), no restart.
+- `bladex start` waits for the first-start embedding model download instead of reporting a false
+  `/ready` timeout.
+
+Also in 0.3.0:
+
+- `bladex start` returns exit code 3 when it starts degraded (proxy up, part of the memory
+  pipeline missing) instead of 0; 1 still means it failed.
+- `bladex status` shows a queue trend line, and `/metrics` exposes `bladex_backlog_*` series; a
+  `backlog_rising` warning is logged when the backlog keeps climbing.
+- BladeX refuses to start a second Redis on the same `data/` directory, and `bladex repair-aof`
+  repairs a Redis append-only manifest that points at missing files (dry run by default).
+- Long admin commands such as `bladex memory tombstone-project` run in the background on the
+  proxy and no longer stall it.
+- The idle consolidator round is about 5× cheaper.
+
+### Coming next (0.4.0)
+
+- When your agent compacts a long conversation on its own, BladeX keeps it as the same session:
+  the ledger stays bound and the turn count carries on.
+- Hand a task to another agent with `bladex ledger handoff`, a one-page portable handoff of the
+  ledger; you can also create or edit a ledger yourself with `bladex ledger create | edit`.
+- Contradicting facts are flagged for you to settle; BladeX never deletes on its own judgment.
+- Reasoning parameters pass through `/v1/responses` unchanged; no thinking text leaks into Codex
+  output.
+- Full rebuilds can be interrupted and resumed, survive upstream outages, and never leave a
+  half-written index.
+
+## Known Limitations (v0.3.0)
 
 - Tuned for **individual self-hosting** — enterprise multi-tenant features are still in development.
 - The ledger tool face is enabled by default only for `medium` and `strong` model tiers
   (`BLADEX_LEDGER_TIERS`), or when the session already owns an active ledger. Weak-tier models still
   see the ledger; they just are not asked to maintain it.
-- On small-context local models the injected surface competes with the output budget (see
-  *Small context windows* above); window-aware trimming is 0.3.0.
+- On small-context local models the injected surface competes with the output budget unless you
+  declare the model's `context_window` (see *Small context windows* above); BladeX does not
+  auto-detect windows, and it does not change the agent's `max_tokens`.
 - LanceDB ANN indexing is built once a table passes 256 rows; below that, search is brute-force
   (fast at that size, but tiny stores do skip the index).
 - Only OpenAI Chat Completions, Anthropic Messages, and OpenAI Responses endpoints are supported
@@ -349,11 +423,23 @@ API providers you configured, for model inference. Encryption at rest is delegat
 - **Exported memory can be stale in the target**: continuous sync to Obsidian/PostgreSQL pushes new
   and updated facts, but a Matter card's `summary`/`open_issues` are not filtered by sensitivity
   level the way individual facts are. Review before pointing sync at a shared location.
-- Hard rules are edited in `config/.env` (`||`-separated) and require a proxy restart; the dashboard
-  shows them read-only.
+- The dashboard shows hard rules read-only. Edit them in `config/.env` (`BLADEX_HARD_RULES`,
+  `||`-separated) or in Obsidian's `Hard Rules.md`; **no restart needed** — the proxy, consolidator
+  and Flash daemon each pick the change up within `BLADEX_HARD_RULES_RELOAD_S` (default 5 s) and log
+  `hard_rules_reloaded`. If both places were edited, the later edit wins. Clearing the line does not
+  clear your rules (the previous set is kept and a warning is logged).
 - The CLI reads `config/`, `data/` and `logs/` relative to the current directory (or `BLADEX_HOME`).
   Running `bladex status` from an unrelated directory shows an empty store — your data is not gone,
   you are just pointed somewhere else.
+- **No contradiction detection yet.** Two conflicting facts can coexist in memory without a flag.
+- **Model routing does not use your memory.** Routing is configuration-driven (plus an optional
+  LLM judge); memory-informed routing is not implemented.
+- **When an agent compacts its own history** (e.g. Hermes or DeepSeek Harness on long sessions),
+  BladeX currently treats the next request as a new session: the turn count restarts and the
+  ledger is no longer bound automatically. The ledger itself is kept — the model is offered it as
+  a switch candidate.
+- **Codex with a reasoning model upstream**: reasoning parameters on `/v1/responses` are not
+  forwarded yet, so thinking text can leak into the output and `apply_patch` may fail.
 
 ## License
 

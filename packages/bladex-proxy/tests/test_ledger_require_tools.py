@@ -112,7 +112,11 @@ class TestMachineTextAlarm:
     @pytest.mark.parametrize("text,expect", [
         ("You are a helpful assistant. You will be presented with a user prompt",
          "assistant_persona"),
-        ("# Overview\n\nGenerate 0 to 3 hyperpersonalized suggestions", "md_overview"),
+        # 🔴 形态名变了、判定没变（MQ-L82 / 批 W W2）：这条现在先被**主判据**
+        # 接住——`strip_envelopes` 的 `suggestion_scaffold` 整条即脚手架，
+        # 剥完为空 ⇒ 机器文本，形态名取剥离 mark（比 `md_overview` 更准）。
+        ("# Overview\n\nGenerate 0 to 3 hyperpersonalized suggestions",
+         "suggestion_scaffold"),
         ("You are an agent based on GPT-5.", "agent_persona"),
     ])
     def test_real_cases_are_flagged(self, text, expect):

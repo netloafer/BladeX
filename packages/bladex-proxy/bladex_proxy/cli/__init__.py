@@ -154,6 +154,23 @@ def _read_pidfile(path: str) -> int | None:
 
 
 def _pid_alive(pid: int) -> bool:
+    """进程是否还活着。
+
+    🔴 先 `waitpid(WNOHANG)`（批 Z1 实测，2026-09-23）：`bladex start` 自己 Popen 出来的
+    proxy 若在启动期退出，CLI 作为父进程从不 `wait` ⇒ 它成了**僵尸**，而 `kill(pid, 0)`
+    对僵尸照样成功。后果：MQ-L62 ①"进程死了立刻停等、把日志尾部打到终端"从未对 CLI 自己
+    拉起的子进程生效——实测一个 1 秒内就因 MQ-A38 冲突退出的 proxy，CLI 等满 30 秒后报
+    "the proxy process is alive but /ready did not answer"，真正的报错只在日志里。
+    是自己的子进程 ⇒ 顺手回收并如实返回；不是（ChildProcessError）⇒ 退回 `kill(pid, 0)`。
+    """
+    try:
+        done, _status = os.waitpid(pid, os.WNOHANG)
+        if done == pid:
+            return False
+    except ChildProcessError:
+        pass
+    except OSError:
+        pass
     try:
         os.kill(pid, 0)
     except OSError:
@@ -162,25 +179,13 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _consolidator_pid() -> int | None:
-    """PID 文件优先 + 进程名兜底（手动启动场景，与 run_proxy.sh 同款）。
+    """consolidator PID（与 lifecycle 共用“本部署根 pidfile”判据）。
 
-    进程名要匹配两种形态（ADR-0027 §4.2）：包内入口
-    `python -m bladex_proxy.consolidator` 与老脚本 `run_index_consolidator.py`。
+    MQ-A78：不再按进程名全机兜底——那会把另一个 `BLADEX_HOME` 的 consolidator
+    当成本实例。延迟导入避免 cli 包初始化期间的循环导入。
     """
-    pid = _read_pidfile(_CONS_PIDFILE)
-    if pid is not None:
-        return pid
-    for pattern in ("bladex_proxy.consolidator", "bladex-consolidator",
-                    "run_index_consolidator.py"):
-        try:
-            out = subprocess.run(  # noqa: S603
-                ["pgrep", "-f", pattern],
-                capture_output=True, text=True, check=False).stdout.strip()
-            if out:
-                return int(out.splitlines()[0])
-        except (OSError, ValueError, IndexError):
-            continue
-    return None
+    from bladex_proxy.cli.lifecycle import _owned_sidecar_pid
+    return _owned_sidecar_pid(_CONS_PIDFILE, "Consolidator")
 
 
 def _resolve_distill_concurrency() -> int:
@@ -283,8 +288,27 @@ def _admin_base() -> str:
     return f"http://{cfg.host}:{cfg.port}"
 
 
+def _admin_timeout_check_command(method: str, path: str, body: dict | None,
+                                 params: dict | None = None) -> list[str]:
+    """长耗时写请求超时后，给操作者安全核对命令（MQ-I30）。"""
+    if (method == "POST" and path == "/admin/turns/tombstone-by-project"
+            and body and not body.get("dry_run")):
+        import shlex
+        ids = [str(x) for x in (body.get("project_ids") or [])]
+        return ["bladex memory tombstone-project " + shlex.join(ids) + " --dry-run"]
+    if (method == "DELETE" and path.startswith("/admin/ledgers/")
+            and params and str(params.get("with_memory", "")).lower() == "true"):
+        ledger_id = path.removeprefix("/admin/ledgers/")
+        return [
+            f"bladex ledger tombstone {ledger_id} --with-memory --dry-run",
+            f"bladex ledger show {ledger_id}",
+        ]
+    return []
+
+
 def _http_request(method: str, url: str, key: str = "",
-                  body: dict | None = None, timeout: float = 15.0) -> tuple[int, dict]:
+                  body: dict | None = None, timeout: float = 15.0,
+                  timeout_check_command: list[str] | None = None) -> tuple[int, dict]:
     """admin API 调用（urllib，仅本机管理面）。返回 (status, json)。"""
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)  # noqa: S310
@@ -300,8 +324,23 @@ def _http_request(method: str, url: str, key: str = "",
         except ValueError:
             return e.code, {}
     except (urllib.error.URLError, OSError) as e:
+        reason = getattr(e, "reason", None)
+        if isinstance(e, TimeoutError) or isinstance(reason, TimeoutError):
+            print(f"Warning: request was issued, but this client timed out after "
+                  f"{timeout:g}s; the server may still be executing.")
+            if timeout_check_command:
+                for command in timeout_check_command:
+                    print(f"  Check the result with: {command}")
+                print("  Do not run the write again until you have checked it.")
+            raise typer.Exit(1) from e
         print(f"Error: proxy unreachable ({url}) -- run `bladex start` first. ({e})")
         raise typer.Exit(1) from e
+
+
+def _admin_long_timeout_s() -> float:
+    """长耗时 admin 写命令的客户端等待上限（MQ-I30）。"""
+    from bladex_core.flags import flag_number
+    return flag_number("BLADEX_ADMIN_LONG_TIMEOUT_S")
 
 
 def _admin_call(method: str, path: str, body: dict | None = None,
@@ -310,7 +349,68 @@ def _admin_call(method: str, path: str, body: dict | None = None,
     url = _admin_base() + path
     if params:
         url += "?" + urlencode({k: v for k, v in params.items() if v not in ("", None)})
-    return _http_request(method, url, key=_admin_key(), body=body, timeout=timeout)
+    return _http_request(
+        method, url, key=_admin_key(), body=body, timeout=timeout,
+        timeout_check_command=_admin_timeout_check_command(method, path, body, params))
+
+
+def _require_dry_run_ack(data: dict, what: str) -> None:
+    """🔴 闸 A（MQ-I24，批 T0b）：**服务端必须自己说它走了 dry-run 分支**，否则拒绝渲染预览。
+
+    2026-09-22 的事故：新 CLI 打旧 proxy，`?dry_run=true` 被 FastAPI 静默忽略 ⇒ 服务端
+    **真删**并回 `{"status": "tombstoned", ...}`；CLI 只看了 HTTP 200，照 dry-run 的格式
+    打出 "DRY RUN -- nothing written."。两本账本连记忆一起没了，终端说什么都没写。
+
+    服务端**本来就返回** `status="dry_run"` + `dry_run=True` 这两个标记，CLI 从来没看。
+    ⇒ 这是刚性原则 13 层 4 的最纯形态：`"nothing written"` 这个值**不来自它声称的来源**
+    （服务端的 dry-run 分支），而来自 CLI 的一厢情愿。
+
+    判据反过来问一次："如果服务端换成一个不认识 `dry_run` 的版本而 HTTP 仍是 200，
+    我这把尺子会不会照样绿？"——会 ⇒ 这层没建。现在不会了。
+
+    :raises typer.Exit: 标记缺失 ⇒ 退出码 2（**不是 0、不是 1**：1 是普通失败，
+        2 专指"我不知道服务端做了什么，去查"）。
+    """
+    if data.get("status") == "dry_run" and data.get("dry_run") is True:
+        return
+    print("✗ REFUSING to report a dry run: the server did not acknowledge it.")
+    print(f"  asked for a dry run of: {what}")
+    print(f"  server said: status={data.get('status')!r} dry_run={data.get('dry_run')!r}")
+    print("  🔴 A server that does not know `dry_run` SILENTLY IGNORES it (FastAPI default) "
+          "-- which means THE REAL, IRREVERSIBLE OPERATION MAY HAVE JUST RUN.")
+    print("  Check Memory Hub for new tombstones NOW, then restart the proxy so it runs "
+          "this CLI's code (`bladex stop && bladex start`).")
+    raise typer.Exit(2)
+
+
+def _require_server_contract(what: str) -> int:
+    """🔴 闸 B（MQ-I24，批 T0b）：不可逆操作前，**先问跑着的进程是不是这份代码**。
+
+    读 `/ready` 的 `admin_contract`（协议版本，见 `bladex_proxy/admin_contract.py`
+    为什么是整数而不是 commit）。**不相等一律拒绝执行**——不是告警后照发：
+    2026-09-22 那次，"告警后照发"就是真删两本账本的那条路径。
+
+    缺这个字段（旧 proxy 根本不声明它）同样拒绝 —— 缺席与不等在这里是同一件事。
+
+    :returns: 服务端的 contract 版本（用于日志/回显）。
+    :raises typer.Exit: 不匹配 / 探不到 ⇒ 退出码 2。
+    """
+    from bladex_proxy.admin_contract import ADMIN_CONTRACT_FIELD, ADMIN_CONTRACT_VERSION
+    ready = _probe_ready(_admin_base() + "/ready")
+    if ready is None:
+        print(f"✗ REFUSING {what}: cannot reach {_admin_base()}/ready -- is the proxy running?")
+        raise typer.Exit(2)
+    got = ready.get(ADMIN_CONTRACT_FIELD)
+    if got != ADMIN_CONTRACT_VERSION:
+        print(f"✗ REFUSING {what}: the running proxy is not this code.")
+        print(f"  this CLI speaks admin contract {ADMIN_CONTRACT_VERSION}; "
+              f"the server reports {got!r} (build {ready.get('build', '?')}).")
+        print("  Irreversible admin operations are refused across a version mismatch -- "
+              "an unknown parameter is silently ignored, which is how a --dry-run once "
+              "became a real delete.")
+        print("  Restart the proxy so it runs this code: `bladex stop && bladex start`.")
+        raise typer.Exit(2)
+    return int(ADMIN_CONTRACT_VERSION)
 
 
 def _print_op_result(status_code: int, data: dict) -> int:

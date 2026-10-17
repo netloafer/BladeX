@@ -386,7 +386,7 @@ def test_renaming_a_rule_backed_agent_needs_the_rule_too(tmp_path) -> None:
 
 def test_unknown_field_raises() -> None:
     """打错键名而规则悄悄不生效，是最难查的一类问题。"""
-    with pytest.raises(ValueError, match="未知字段"):
+    with pytest.raises(ValueError, match="unknown fields"):
         parse_rules('[[rules]]\nagent_id = "x"\nsystem_prompt_keyword = ["typo"]\n')
 
 
@@ -396,7 +396,7 @@ def test_missing_agent_id_raises() -> None:
 
 
 def test_bad_regex_raises() -> None:
-    with pytest.raises(ValueError, match="正则非法"):
+    with pytest.raises(ValueError, match="invalid regex"):
         parse_rules(
             '[[rules]]\nagent_id = "x"\n'
             'header_patterns = [{ name = "user-agent", pattern = "([" }]\n'

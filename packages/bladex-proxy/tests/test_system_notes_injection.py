@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import pytest
+import structlog.testing
 from bladex_core.envelope import strip_envelopes
 from bladex_proxy.agency import (
     ABOUT_BLOCK_CLOSE,
@@ -156,8 +157,10 @@ class _Runtime:
 
     def __init__(self, about: str) -> None:
         self.about = about
-        self.agents_roster = ""   # V-F3：生产 __init__ 恒有此属性，桩跟上形态
         self.ledger_on = True     # MQ-L77：`ledger_face=None` 时回落到模块门
+        # Z2.4：按会话定格的记录表（`session_id` 为空的老调用不定格，表保持为空）
+        from collections import OrderedDict
+        self._session_stable = OrderedDict()
 
     insert_system_notes = None  # 由下面 __init_subclass__ 之外的赋值补上
 
@@ -362,3 +365,120 @@ def test_orchestration_passes_ledger_face_to_notes() -> None:
     src = package_source("server")
     i = src.index("agency.insert_system_notes(")
     assert "ledger_face=" in src[i:i + 300]
+
+
+# ── ④ 批 Z · Z2.4（MQ-A58）：会话首轮定格，落点按内容锚点复位 ─────────────────
+
+
+def _cc_shape(turn: int) -> list[dict]:
+    """Claude Code 真实会话形状（Hub 实测 `local/claude-code/fp:69e710a8699c/*`）：
+    数组头两条是 agent 的 system（开场白 + Agent 类型表），之后每轮在**末尾**追加一条
+    `role=system` 的 `<total_tokens>` reminder 与一对 assistant/tool。"""
+    msgs = [{"role": "system", "content": "You are Claude Code, Anthropic's official CLI"},
+            {"role": "system", "content": "Available agent types for the Agent tool: ..."},
+            {"role": "user", "content": "开始干活"}]
+    for k in range(turn):
+        msgs += [{"role": "assistant", "content": None, "tool_calls": [{"id": f"t{k}"}]},
+                 {"role": "tool", "tool_call_id": f"t{k}", "content": f"result {k}"},
+                 {"role": "system", "content": "<total_tokens>15000000 tokens left</total_tokens>"}]
+    return msgs
+
+
+def _pos_and_hash(cap: list[dict]) -> tuple[int, str]:
+    rows = [e for e in cap if e.get("event") == "agency_about_injected"]
+    assert len(rows) == 1, rows
+    return rows[0]["pos"], rows[0]["about_hash"]
+
+
+def test_cc_shaped_session_about_position_never_drifts() -> None:
+    """判据 ⑥：CC 形状回放 15 轮，`pos` 恒定、内容哈希恒定（修前漂 15 次，Z2.0 读数 67 次里 32 次变）。"""
+    rt = _rt()
+    seen: list[tuple[int, str]] = []
+    for turn in range(15):
+        with structlog.testing.capture_logs() as cap:
+            out = rt.insert_system_notes(_cc_shape(turn), toolface_injected=True,
+                                         ledger_face=True, session_id="cc-sess")
+        seen.append(_pos_and_hash(cap))
+        # agent 新追加的 system 一律排在我们之后；agent 开场白仍在第一位
+        assert out[0]["content"].startswith("You are Claude Code")
+        assert ABOUT_BLOCK_OPEN in out[2]["content"]
+        assert all("<total_tokens>" not in str(m.get("content")) for m in out[:3])
+    positions = {p for p, _ in seen}
+    hashes = {h for _, h in seen}
+    assert positions == {2}, f"落点漂了：{[p for p, _ in seen]}"
+    assert len(hashes) == 1
+
+
+def test_without_session_id_the_old_rule_still_drifts_negative_control() -> None:
+    """阴性对照：拿不到会话标识就没有定格，落点按"最后一条 agent system 之后"漂——
+    证明上面那条测到的是定格机制本身，不是形状碰巧。"""
+    rt = _rt()
+    seen = []
+    for turn in range(4):
+        with structlog.testing.capture_logs() as cap:
+            rt.insert_system_notes(_cc_shape(turn), toolface_injected=True, ledger_face=True)
+        seen.append(_pos_and_hash(cap)[0])
+    assert len(set(seen)) == 4, seen
+
+
+def test_anchor_lost_after_compaction_refreezes_and_logs() -> None:
+    rt = _rt()
+    with structlog.testing.capture_logs():
+        rt.insert_system_notes(_cc_shape(3), toolface_injected=True, ledger_face=True,
+                               session_id="cc-2")
+    # agent 压缩了历史：锚点（Agent 类型表那条 system）没了
+    compacted = [{"role": "system", "content": "You are Claude Code, Anthropic's official CLI"},
+                 {"role": "user", "content": "[compacted] 继续"}]
+    with structlog.testing.capture_logs() as cap:
+        out = rt.insert_system_notes(compacted, toolface_injected=True, ledger_face=True,
+                                     session_id="cc-2")
+    assert ABOUT_BLOCK_OPEN in out[1]["content"]
+    assert any(e.get("event") == "agency_about_anchor_lost" for e in cap)
+    row = next(e for e in cap if e.get("event") == "agency_about_injected")
+    assert row["freeze"] == "anchor_lost"
+    # 重新定格后再次稳定
+    with structlog.testing.capture_logs() as cap:
+        rt.insert_system_notes(compacted + [{"role": "system", "content": "<total_tokens>1</total_tokens>"}],
+                               toolface_injected=True, ledger_face=True, session_id="cc-2")
+    assert next(e for e in cap if e.get("event") == "agency_about_injected")["freeze"] == "anchored"
+
+
+def test_legal_content_change_ledger_face_flip_is_logged_not_drift() -> None:
+    about = f"AGENT intro\n{__import__('bladex_proxy.agency.notes', fromlist=['LEDGER_SECTION_OPEN']).LEDGER_SECTION_OPEN}\nledger section\n" \
+            f"{__import__('bladex_proxy.agency.notes', fromlist=['LEDGER_SECTION_CLOSE']).LEDGER_SECTION_CLOSE}\ntail"
+    rt = _rt(about)
+    with structlog.testing.capture_logs() as cap:
+        rt.insert_system_notes(_cc_shape(0), toolface_injected=True, ledger_face=True, session_id="cc-3")
+    h1 = _pos_and_hash(cap)[1]
+    with structlog.testing.capture_logs() as cap:
+        rt.insert_system_notes(_cc_shape(1), toolface_injected=True, ledger_face=False, session_id="cc-3")
+    p2, h2 = _pos_and_hash(cap)
+    assert h2 != h1 and p2 == 2, "账本面翻转：内容合法地变了，位置不变"
+    ref = [e for e in cap if e.get("event") == "agency_about_refrozen"]
+    assert ref and ref[0]["reason"] == "ledger_face"
+    # 翻回去：再变一次、仍是合法变化
+    with structlog.testing.capture_logs() as cap:
+        rt.insert_system_notes(_cc_shape(2), toolface_injected=True, ledger_face=True, session_id="cc-3")
+    assert _pos_and_hash(cap)[1] == h1
+
+
+def test_notes_upgrade_is_logged_as_notes_changed() -> None:
+    rt = _rt("v1 notes")
+    with structlog.testing.capture_logs():
+        rt.insert_system_notes(_cc_shape(0), toolface_injected=True, ledger_face=True, session_id="cc-4")
+    rt.about = "v2 notes (proxy upgraded TOOLS.md)"
+    with structlog.testing.capture_logs() as cap:
+        rt.insert_system_notes(_cc_shape(1), toolface_injected=True, ledger_face=True, session_id="cc-4")
+    ref = [e for e in cap if e.get("event") == "agency_about_refrozen"]
+    assert ref and ref[0]["reason"] == "notes_changed"
+
+
+def test_hermes_shape_stays_at_pos_1_with_freeze_too() -> None:
+    """不漂的 agent（hermes：一条 system + 纯追加）修后形态逐字不变：pos=1。"""
+    rt = _rt()
+    for turn in range(3):
+        msgs = [{"role": "system", "content": "hermes prompt"}] + \
+               [{"role": "user", "content": f"u{k}"} for k in range(turn + 1)]
+        with structlog.testing.capture_logs() as cap:
+            out = rt.insert_system_notes(msgs, toolface_injected=True, ledger_face=True, session_id="h")
+        assert _pos_and_hash(cap)[0] == 1 and ABOUT_BLOCK_OPEN in out[1]["content"]

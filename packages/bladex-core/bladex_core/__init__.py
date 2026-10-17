@@ -3,7 +3,7 @@
 v5 架构（ADR-0032；基座 ADR-0008/0009）：
   - fact: Fact + HardRule Pydantic 模型
   - consolidation_proxy: ProxyConsolidator（从 Memory Hub Turns 提炼 Fact）
-  - attribution / matter / routing / ledger / flash_tree：归属、Matter、路由、账本、Flash
+  - attribution / matter / routing / ledger / flash / behavior：归属、Matter、路由、账本、Flash、行为画像
   （2026-09-03 S1/S2：v3 的 prefetch / store / semantic / consolidation / compress_bridge
    已删除——主动注入检索路径退役，记忆经 `bladex_memory_search` 工具面按需取。）
 

@@ -7,7 +7,9 @@ Turn 里存引用（content_ref），读出时还原。仅本轮新增消息存�
 
 from __future__ import annotations
 
+import bisect
 import hashlib
+import threading
 from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
@@ -46,6 +48,152 @@ _JUDGMENT_PREFIX = "judgment/"
 _ANNOTATION_PREFIX = "annotation/"
 
 
+class HubMetaSnapshot:
+    """`MemoryHub.scan_meta_snapshot` 的产物：一趟扫描拿到的元数据档 + 墓碑 + 管理事件。
+
+    `scan_tombstones()` / `scan_admin_events()` 两个方法让它可以**冒充 hub** 喂给
+    `ledger_events.load_ledger_events` / `tombstoned_ledgers`——账本事件装载不用再各自
+    遍历一遍 DB（三个消费方共用那份判据，F2 只是换了数据来源）。
+    """
+
+    def __init__(self, *, rows: list[tuple[str, dict[str, Any]]], tombstoned: frozenset[str],
+                 tombstones: list[tuple[str, Tombstone]],
+                 admin_events: list[tuple[str, AdminEvent]]) -> None:
+        self.rows = rows
+        self.tombstoned = tombstoned
+        self.tombstones = tombstones
+        self.admin_events = admin_events
+
+    def scan_tombstones(self) -> Iterator[tuple[str, Tombstone]]:
+        yield from self.tombstones
+
+    def scan_admin_events(self) -> Iterator[tuple[str, AdminEvent]]:
+        yield from self.admin_events
+
+    def tombstone_hash(self) -> str:
+        """墓碑集合指纹（目标 key 全集，含 turn/fact/ledger 各型）；变了 ⇒ 增量状态作废（G2）。"""
+        blob = "\n".join(sorted(f"{getattr(t.target_type, 'value', t.target_type)}:{t.target_key}"
+                                 for _k, t in self.tombstones))
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+class _RecentTurnIndex:
+    """MQ-A91：Turn 的 (ts, key) 升序列表 + key→ts，供 `MemoryHub.recent_turns` 取最近 N 条。
+
+    **为什么是进程内而不是 Hub 里的派生键**：Hub 是唯一真相源，派生物落进去就多一个
+    要进 `_is_internal_key`、要随墓碑同步、要能重建的前缀——而全仓遍历 Hub 的地方很多，
+    漏一处就把派生键当成 Turn。进程内索引的"重建"就是进程启动后第一次调用时的那一趟全扫
+    （与修前单次代价相同），之后 `put()` 增量维护；**墓碑不进索引**，读侧按
+    `_tombstoned_keys()` 过滤——墓碑同步因此不需要任何额外写入点。
+
+    Turn key 只由 `put()` 写入、只由 `compact_tombstoned()` 删除（2026-09-29 全仓核对），
+    两处都挂了钩子。`put()` 跑在执行器线程里（`pipeline_worker`），故全部状态受锁保护；
+    建索引期间的写入先记进 pending，建完合并（RocksDB 迭代器是创建时刻的快照，看不到之后的写）。
+    """
+
+    _NONE, _BUILDING, _BUILT = 0, 1, 2
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._build_lock = threading.Lock()
+        self._state = self._NONE
+        self._pending: list[tuple[str, str]] = []
+        self._ts_of: dict[str, str] = {}
+        self._order: list[tuple[str, str]] = []  # (ts, key) 升序
+        self._keys: list[str] = []  # key 升序（prefix 区间用 bisect 定位）
+
+    def note(self, key: str, ts: str) -> None:
+        with self._lock:
+            if self._state == self._BUILT:
+                self._insert(key, ts)
+            elif self._state == self._BUILDING:
+                self._pending.append((key, ts))
+            # _NONE：尚未建，建时的全扫自然看得到这条
+
+    def drop(self, key: str) -> None:
+        with self._lock:
+            ts = self._ts_of.pop(key, None)
+            if ts is not None:
+                i = bisect.bisect_left(self._order, (ts, key))
+                if i < len(self._order) and self._order[i] == (ts, key):
+                    del self._order[i]
+                i = bisect.bisect_left(self._keys, key)
+                if i < len(self._keys) and self._keys[i] == key:
+                    del self._keys[i]
+
+    def _insert(self, key: str, ts: str) -> None:
+        old = self._ts_of.get(key)
+        if old == ts:
+            return
+        if old is not None:  # 同 key 覆盖写（Hub key 以 entry id 结尾，正常不会发生）
+            i = bisect.bisect_left(self._order, (old, key))
+            if i < len(self._order) and self._order[i] == (old, key):
+                del self._order[i]
+        else:
+            bisect.insort(self._keys, key)
+        self._ts_of[key] = ts
+        bisect.insort(self._order, (ts, key))
+
+    def ensure_built(self, source: Any) -> None:
+        if self._state == self._BUILT:
+            return
+        with self._build_lock:
+            if self._state == self._BUILT:
+                return
+            with self._lock:
+                self._state = self._BUILDING
+                self._pending = []
+            ts_of = dict(source())
+            with self._lock:
+                for k, ts in self._pending:
+                    ts_of[k] = ts
+                self._pending = []
+                self._ts_of = ts_of
+                self._order = sorted((ts, k) for k, ts in ts_of.items())
+                self._keys = sorted(ts_of)
+                self._state = self._BUILT
+            logger.info("hub_recent_index_built", turns=len(ts_of))
+
+    def with_prefix(self, prefix: str, tombstoned: set[str]) -> list[tuple[str, str]]:
+        """prefix 下未被墓碑的 (key, ts)，key 升序——即 `scan_meta(prefix)` 的产出顺序。"""
+        out: list[tuple[str, str]] = []
+        with self._lock:
+            keys = self._keys
+            i = bisect.bisect_left(keys, prefix)
+            while i < len(keys) and keys[i].startswith(prefix):
+                k = keys[i]
+                if k not in tombstoned:
+                    out.append((k, self._ts_of[k]))
+                i += 1
+        return out
+
+    def visible_count(self, tombstoned: set[str]) -> int:
+        """未被墓碑的索引项数 = `scan_meta()` 产出条数（批 Q3C，`MemoryHub.count` 用）。"""
+        with self._lock:
+            return self._visible_locked(tombstoned)
+
+    def _visible_locked(self, tombstoned: set[str]) -> int:
+        return len(self._ts_of) - sum(1 for k in tombstoned if k in self._ts_of)
+
+    def page(self, tombstoned: set[str], *, limit: int, offset: int,
+             ) -> tuple[list[tuple[str, str]], int]:
+        """ts 降序、同 ts 按 key 升序，跳过被墓碑的 key。"""
+        want = offset + limit
+        out: list[tuple[str, str]] = []
+        with self._lock:
+            order = self._order
+            total = self._visible_locked(tombstoned)
+            i = len(order)
+            while i > 0 and len(out) < want:
+                ts = order[i - 1][0]
+                j = bisect.bisect_left(order, (ts, ""), 0, i)
+                for t, k in order[j:i]:
+                    if k not in tombstoned:
+                        out.append((k, t))
+                i = j
+        return out[offset:want], total
+
+
 class MemoryHub:
     """RocksDB 封装：put/get/scan + 内容 hash 去重。"""
 
@@ -72,6 +220,9 @@ class MemoryHub:
         self._session_last: dict[str, deque[tuple[str, int]]] = {}
         # ADR-0012: 墓碑缓存（target_key 集合），scan_prefix 用，写墓碑时失效
         self._tombstone_cache: set[str] | None = None
+        # MQ-A91：「最近 N 轮」内存索引（见 `_RecentTurnIndex`）。首次 `recent_turns` 时建，
+        # 之后由 `put()` 增量维护；墓碑在读侧按 `_tombstoned_keys()` 过滤。
+        self._recent = _RecentTurnIndex()
 
     def open(self) -> None:
         """打开（或重新打开）RocksDB。
@@ -118,6 +269,29 @@ class MemoryHub:
             self._db.try_catch_up_with_primary()
         except Exception as e:
             logger.debug("hub_catch_up_failed", error=str(e))
+
+    def seq(self) -> int:
+        """RocksDB 的 WAL 序列号（单调）——O(1) 回答"库里有没有新东西"。
+
+        MQ-W17：consolidator 的空载退避用它当唤醒信号。**不要用 P0（Redis stream）
+        的水位代替**——2026-09-23 01:54 实测：P0 水位比 Hub 落库**早**（唤醒
+        01:54:54 跑在 `hub.put` 01:54:57 前面），那一轮扫描 `candidates=0`，
+        要等下一个基准间隔才拾起，消费延迟反而不如不退避。序列号答的是
+        "Hub 现在有没有新数据"，正是扫描能扫到的**前提**，没有这个时间差。
+
+        secondary 模式下先 `catch_up()` 再读，否则看到的是追新之前的旧值。
+        实测 `catch_up + latest_sequence_number` = **0.25 ms**（20,123 key 库），
+        1800 s 退避里每秒轮询一次共 0.45 s CPU（0.025%），可忽略。
+        读不到（未打开 / 后端不支持）返回 0 —— 调用方按"没有新东西"处理。
+        """
+        if self._db is None:
+            return 0
+        try:
+            self.catch_up()
+            return int(self._db.latest_sequence_number())
+        except Exception as e:  # noqa: BLE001 —— 观测失败不该影响消化主线
+            logger.debug("hub_seq_failed", error=str(e))
+            return 0
 
     def close(self) -> None:
         if self._db is not None:
@@ -195,6 +369,7 @@ class MemoryHub:
         data = deduped_turn.model_dump(mode="json")
         value = msgpack.packb(data, use_bin_type=True)
         self.db[key.encode()] = value
+        self._recent.note(key, str(data.get("ts", "") or ""))
         if _self_made:
             logger.debug("hub_put", key=key, status=turn.status.value,
                          msg_count=len(turn.request_messages), inner_loop=True)
@@ -260,6 +435,98 @@ class MemoryHub:
                 logger.warning("hub_scan_meta_decode_failed", key=key_str, error=str(e))
                 continue
             yield key_str, str(data.get("ts", "") or "")
+
+    def recent_turns(self, prefix: str = "", *, limit: int, offset: int = 0,
+                     ) -> tuple[list[tuple[str, str]], int]:
+        """按 ts 降序取第 ``offset`` 起的 ``limit`` 条 (key, ts)，外加可见总数（MQ-A91）。
+
+        **结果逐条等于** ``sorted(scan_meta(prefix), key=ts, reverse=True)[offset:offset+limit]``
+        与 ``len(list(scan_meta(prefix)))``——同一套跳过规则（内部 key / 墓碑 / 解码失败），
+        同 ts 按 key 升序（旧实现是 key 序遍历后的稳定排序）。区别只在代价：
+
+        - 无 prefix：内存索引从尾部取，O(offset + limit)，总数 = 索引大小 − 被墓碑的索引项；
+        - 有 prefix：内存里按 key 有序表 bisect 定位区间，O(log N + 该前缀下的轮数)，不碰 RocksDB。
+
+        索引首次调用时一趟全扫建成（与旧实现单次同价），之后由 `put()` 增量维护，
+        `compact_tombstoned()` 同步删除。secondary 副本会经 `catch_up()` 看到别的进程写入，
+        索引跟不上 ⇒ 该模式退回旧的全扫路径。
+        """
+        if self._secondary:
+            items = list(self.scan_meta(prefix=prefix))
+            items.sort(key=lambda x: x[1], reverse=True)
+            return items[offset:offset + limit], len(items)
+        self._recent.ensure_built(self._iter_turn_ts)
+        tombstoned = self._tombstoned_keys()
+        if not prefix:
+            return self._recent.page(tombstoned, limit=limit, offset=offset)
+        items = self._recent.with_prefix(prefix, tombstoned)
+        items.sort(key=lambda x: x[1], reverse=True)
+        return items[offset:offset + limit], len(items)
+
+    def _iter_turn_ts(self) -> Iterator[tuple[str, str]]:
+        """全部 Turn 的 (key, ts)，**不过滤墓碑**（墓碑在读侧过滤）；供 `_RecentTurnIndex` 建索引。"""
+        for key_raw, value_raw in self.db.items():
+            key_str = key_raw.decode() if isinstance(key_raw, bytes) else str(key_raw)
+            if _is_internal_key(key_str):
+                continue
+            try:
+                data = msgpack.unpackb(value_raw, raw=False)
+            except Exception as e:  # noqa: BLE001 -- 与 scan_meta 同一处理：跳过脏值
+                logger.warning("hub_scan_meta_decode_failed", key=key_str, error=str(e))
+                continue
+            yield key_str, str(data.get("ts", "") or "")
+
+    def scan_meta_snapshot(self) -> HubMetaSnapshot:
+        """一趟扫描：全部 Turn 的元数据切片 + **新鲜的**墓碑 + 管理事件（F2 行为画像的数据档）。
+
+        与 :meth:`scan_meta` 同价（每条只 `msgpack.unpackb` 顶层、不校验、不解 content_ref），
+        多给三样：
+        ① 每行除 ``ts`` 外带 ``identity`` 里的 ``project_id`` / ``project_name`` /
+          ``project_root`` / ``subagent`` 与顶层 ``auxiliary``（都是**已存在**的字段，
+          不是新生产点；老轮次没有 ⇒ 空 / False）；
+        ② 墓碑与管理事件**在同一趟里收集**（各自一趟 = 各自再遍历一遍 5.8G 的 items，
+          daemon 的 CPU 判据不允许），并刷新 `_tombstone_cache`——secondary 副本的
+          `catch_up()` 不失效缓存，`scan_meta` 在长命进程里会看不见后来的 TURN 墓碑
+          （补遗 G2 要"墓碑集合变 ⇒ 丢状态"，前提是先看得见）；
+        ③ 返回物化的快照而非 iterator：墓碑要扫完才知道全集，行在末尾统一过滤。
+
+        性能：20.9k 轮实测 ≈4 s（与 `scan_meta` 同量级），300 s 一次可承受。
+        """
+        rows: list[tuple[str, dict[str, Any]]] = []
+        tombstones: list[tuple[str, Tombstone]] = []
+        events: list[tuple[str, AdminEvent]] = []
+        for key_raw, value_raw in self.db.items():
+            key_str = key_raw.decode() if isinstance(key_raw, bytes) else str(key_raw)
+            try:
+                if key_str.startswith(_TOMBSTONE_PREFIX):
+                    tombstones.append((key_str, Tombstone.model_validate(
+                        msgpack.unpackb(value_raw, raw=False))))
+                    continue
+                if key_str.startswith(_ADMIN_EVENT_PREFIX):
+                    events.append((key_str, AdminEvent.model_validate(
+                        msgpack.unpackb(value_raw, raw=False))))
+                    continue
+                if _is_internal_key(key_str):
+                    continue
+                data = msgpack.unpackb(value_raw, raw=False)
+            except Exception as e:  # noqa: BLE001 —— 脏值不该中断整轮扫描
+                logger.warning("hub_scan_meta_decode_failed", key=key_str, error=str(e))
+                continue
+            ident = data.get("identity") or {}
+            rows.append((key_str, {
+                "ts": str(data.get("ts", "") or ""),
+                "project_id": str(ident.get("project_id", "") or ""),
+                "project_name": str(ident.get("project_name", "") or ""),
+                "project_root": str(ident.get("project_root", "") or ""),
+                "auxiliary": bool(data.get("auxiliary", False)),
+                "subagent": bool(ident.get("subagent", False)),
+            }))
+        tombstoned = frozenset(t.target_key for _k, t in tombstones)
+        self._tombstone_cache = set(tombstoned)
+        return HubMetaSnapshot(
+            rows=[r for r in rows if r[0] not in tombstoned],
+            tombstoned=tombstoned, tombstones=tombstones, admin_events=events,
+        )
 
     def scan_agent_ids(self) -> dict[str, tuple[str, int]]:
         """扫 key 里的 agent 段，返回 ``{agent_id: (代表 key, 轮次数)}``（G11.11）。
@@ -356,6 +623,33 @@ class MemoryHub:
                 self._resolve_messages(turn)
                 yield key_str, turn
 
+    def latest_reconstruction(self, session_prefix: str, *, max_turns: int = 50) -> dict[str, Any] | None:
+        """本会话最近一条**带装配判定**的 Turn 的 reconstruction（dict 原样）；反向 seek，不扫全库。
+
+        批 U · U1.3（ADR-0033 §2.7）：装配判定写穿 Hub（`ReconstructionRecord.verdicts`），
+        进程重启后首个冷轮用它把判定读回内存缓存——Hub 是真相源、重启可恢复。
+        只看本会话前缀下最近 `max_turns` 条（冷轮预算内），被墓碑覆盖的不读。
+        """
+        if not session_prefix:
+            return None
+        tombstoned = self._tombstoned_keys()
+        start = (session_prefix + "\uffff").encode()
+        seen = 0
+        for key_raw, value_raw in self.db.items(backwards=True, from_key=start):
+            key_str = key_raw.decode() if isinstance(key_raw, bytes) else str(key_raw)
+            if not key_str.startswith(session_prefix):
+                break
+            if _is_internal_key(key_str) or key_str in tombstoned:
+                continue
+            seen += 1
+            data = msgpack.unpackb(value_raw, raw=False)
+            rec = data.get("reconstruction") or {}
+            if isinstance(rec, dict) and rec.get("verdicts"):
+                return rec
+            if seen >= max_turns:
+                break
+        return None
+
     def count(self) -> int:
         """可见 Turn 条目数（不含内容存储 / meta / 墓碑 / 管理事件，也**不含被墓碑覆盖的 turn**）。
 
@@ -366,13 +660,22 @@ class MemoryHub:
         `lag_turns = count() − consumed_count()` 成了一个**永不消失的常数**：
         08-16 ADR-0021 迁移掉的 500 条残渣，让 status 从那天起恒报"落后 500 轮"，
         而 consolidator 早已追平在空转。
+
+        批 Q3C：
+        - **口径 = `scan_meta()` 的产出条数**：内部 key、墓碑覆盖项、**解码失败的脏值**都不计。
+          此前只看 key、脏值照样计数，而消费侧（`scan_meta`）永远跳过它 ⇒ 每条脏值都让
+          `lag_turns` 多一个永远消不掉的常数（MQ-R5 修过的同一个形状，换了个来源）。
+          选这一边而不是让索引也数脏值：「有多少轮」的读方全部是拿它去减已消费数，
+          消费不到的东西不该算进被减数；`recent_turns` 的 total 本来就是这个口径。
+        - **primary 模式读 MQ-A91 的进程内索引**（首次一趟全扫建成，之后 `put()` 增量维护），
+          不再每次迭代全库 key——W4 采样每 60 s、`/admin/status` 每次都调，生产 77k key
+          一次 3.5–4.6 s。secondary / read_only 会看到别的进程写入（或是静态快照、只调一次），
+          索引跟不上 ⇒ 仍全扫，同一口径。
         """
-        tombstoned = self._tombstoned_keys()
-        return sum(
-            1 for k in self.db.keys()
-            if not _is_internal_key(k)
-            and (k.decode() if isinstance(k, bytes) else str(k)) not in tombstoned
-        )
+        if self._secondary or self._read_only:
+            return sum(1 for _ in self.scan_meta())
+        self._recent.ensure_built(self._iter_turn_ts)
+        return self._recent.visible_count(self._tombstoned_keys())
 
     # ── T2: 前缀变化检测 ──
 
@@ -581,17 +884,21 @@ class MemoryHub:
         target_type: TombstoneTargetType,
         target_key: str,
         source: TombstoneSource = TombstoneSource.USER,
+        origin: str = "",
     ) -> str:
         """向 Memory Hub 追加一条墓碑记录（ADR-0012 §3.6）。
 
         墓碑是追加式记录，不违反 Memory Hub 追加不变式。
         写入后 scan_prefix 不再返回被覆盖的条目（原文仍在 Memory Hub）。
         返回墓碑的 Memory Hub key。
+
+        `origin`（Z4）：外部工具回流的删除标通道名（"obsidian" / "postgres"），其余留空。
         """
         entry_id = _generate_entry_id()
         key = f"{_TOMBSTONE_PREFIX}{entry_id}"
         tombstone = Tombstone(
             target_type=target_type, target_key=target_key, source=source,
+            origin=origin,
         )
         self.db[key.encode()] = msgpack.packb(
             tombstone.model_dump(mode="json"), use_bin_type=True,
@@ -601,6 +908,7 @@ class MemoryHub:
         logger.info(
             "hub_tombstone_appended", key=key,
             target_type=target_type.value, target_key=target_key,
+            origin=origin or None,
         )
         # ADR-0018 §4.1: turn->judgment 墓碑级联（删 turn 连带墓碑其专属裁决台账，
         # Memory Index 重建不复活）留 T7 实现--judgment key 含 fact_id = hash(ledger_key+content)，
@@ -637,12 +945,18 @@ class MemoryHub:
         return key
 
     def scan_tombstones(self) -> Iterator[tuple[str, Tombstone]]:
-        """扫描所有墓碑记录（按 entry_id 有序，ADR-0012 §3.6）。"""
-        for key_raw, value_raw in self.db.items():
+        """扫描所有墓碑记录（按 entry_id 有序，ADR-0012 §3.6）。
+
+        MQ-A91：从 `tombstone/` 前缀 seek，出前缀即停——代价随墓碑数而非 Hub 总量。
+        此前遍历全库 items（连 Turn 正文一起读），每写一条墓碑、缓存失效后第一次
+        `_tombstoned_keys()` 就要付一遍全库扫描。键按字节序排列，结果与全扫逐条相同。
+        """
+        for key_raw, value_raw in self.db.items(from_key=_TOMBSTONE_PREFIX.encode()):
             key_str = key_raw.decode() if isinstance(key_raw, bytes) else str(key_raw)
-            if key_str.startswith(_TOMBSTONE_PREFIX):
-                data = msgpack.unpackb(value_raw, raw=False)
-                yield key_str, Tombstone.model_validate(data)
+            if not key_str.startswith(_TOMBSTONE_PREFIX):
+                break
+            data = msgpack.unpackb(value_raw, raw=False)
+            yield key_str, Tombstone.model_validate(data)
 
     def scan_admin_events(self) -> Iterator[tuple[str, AdminEvent]]:
         """扫描所有管理事件（按 entry_id 有序，ADR-0012 §3.5）。"""
@@ -651,6 +965,24 @@ class MemoryHub:
             if key_str.startswith(_ADMIN_EVENT_PREFIX):
                 data = msgpack.unpackb(value_raw, raw=False)
                 yield key_str, AdminEvent.model_validate(data)
+
+    def latest_admin_event(self, event_type: AdminEventType) -> tuple[str, AdminEvent] | None:
+        """最近一条指定类型的管理事件（反向 seek，只走 `admin_event/` 段、不扫全库）。
+
+        Z1.2（MQ-W18）硬规则热加载每几秒问一次"最近一条 hard_rules_set 是什么"——
+        `scan_admin_events` 是全库遍历，不能放进轮询。entry_id 按时间有序，
+        从前缀末尾倒着走，第一条类型匹配的就是最近一条。
+        """
+        want = getattr(event_type, "value", event_type)
+        start = (_ADMIN_EVENT_PREFIX + "\uffff").encode()
+        for key_raw, value_raw in self.db.items(backwards=True, from_key=start):
+            key_str = key_raw.decode() if isinstance(key_raw, bytes) else str(key_raw)
+            if not key_str.startswith(_ADMIN_EVENT_PREFIX):
+                break
+            data = msgpack.unpackb(value_raw, raw=False)
+            if data.get("event_type") == want:
+                return key_str, AdminEvent.model_validate(data)
+        return None
 
     # ── ADR-0018 §4.1: 派生台账（distill / judgment）──
 
@@ -780,6 +1112,7 @@ class MemoryHub:
             target_key = tombstone.target_key
             if self.db.get(target_key.encode()) is not None:
                 del self.db[target_key.encode()]
+                self._recent.drop(target_key)
                 removed += 1
         if removed > 0:
             logger.info("hub_compact_tombstoned", removed=removed)
