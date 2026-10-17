@@ -114,7 +114,27 @@ def enforce_admin_key_policy(cfg: ProxyConfig) -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """启动/关闭：连 Redis、开 RocksDB、起 pipeline worker。"""
+    """启动/关闭：连 Redis、开 RocksDB、起 pipeline worker（本体见 `_lifespan_body`）。
+
+    这一层只补一件事：**启动中途失败**（worker 已起、后面拒启动——如
+    `BLADEX_ROUTE_STRICT`）时先停 worker 再原样上抛。否则它的任务留给事件循环关闭时
+    收尾，与批 CI1 卡死公开仓 CI 的是同一形状（根 conftest 第六节守卫）。
+    进了 yield 之后的语义与原来逐字相同。
+    """
+    entered = False
+    try:
+        async with _lifespan_body(app):
+            entered = True
+            yield
+    except BaseException:
+        worker = getattr(app.state, "pipeline_worker", None)
+        if not entered and worker is not None:
+            await worker.stop()
+        raise
+
+
+@asynccontextmanager
+async def _lifespan_body(app: FastAPI):
     cfg: ProxyConfig = app.state.config
     # V-A1（ADR-0032 §2.1）：模块注册表校验——misconfiguration fails loud，
     # 在打开任何资源之前拒启动（与 identity registry 校验同一形态）。

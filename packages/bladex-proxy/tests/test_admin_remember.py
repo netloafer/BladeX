@@ -64,11 +64,15 @@ def test_remember_persists_and_survives_rebuild():
         assert p2r.get_fact(fact_id).trust == 1.0
         p2r.close()
 
-        app.state.index = None  # 明确走"读句柄不可用"路径
-        resp2 = client.post("/admin/facts",
-                            json={"content": "用户的生产环境是 arm64"})
-        assert resp2.status_code == 200
-        assert resp2.json()["fact_id"] == fact_id  # 确定性 id 幂等
+        started = app.state.index  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
+        try:
+            app.state.index = None  # 明确走"读句柄不可用"路径
+            resp2 = client.post("/admin/facts",
+                                json={"content": "用户的生产环境是 arm64"})
+            assert resp2.status_code == 200
+            assert resp2.json()["fact_id"] == fact_id  # 确定性 id 幂等
+        finally:
+            app.state.index = started
 
     # full rebuild（无会话数据）→ journal 重放，remember 的 fact 不丢
     p3b = MemoryHub(cfg.rocksdb_path)

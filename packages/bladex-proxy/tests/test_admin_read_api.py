@@ -87,6 +87,7 @@ def test_status_index_lag_turns():
     app = create_app(_make_config())
     with TestClient(app) as client:
         index = _make_index()
+        started = app.state.index  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
         app.state.index = index
         try:
             # Memory Hub 写 2 轮、Memory Index 消费 0 → lag = 2
@@ -101,6 +102,7 @@ def test_status_index_lag_turns():
             assert data["index"]["lag_turns"] == 2
             assert data["index"]["facts"] == 0
         finally:
+            app.state.index = started
             index.close()
 
 
@@ -138,6 +140,7 @@ def test_facts_list_filters_and_pagination():
     with TestClient(app) as client:
         index = _make_index()
         _seed_facts(index)
+        started = app.state.index  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
         app.state.index = index
         try:
             # 全量
@@ -161,15 +164,20 @@ def test_facts_list_filters_and_pagination():
             data = client.get("/admin/facts", params={"limit": 2, "offset": 2}).json()
             assert len(data["facts"]) == 1
         finally:
+            app.state.index = started
             index.close()
 
 
 def test_facts_503_when_index_missing():
     app = create_app(_make_config())
     with TestClient(app) as client:
-        app.state.index = None
-        assert client.get("/admin/facts").status_code == 503
-        assert client.get("/admin/matters").status_code == 503
+        started = app.state.index  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
+        try:
+            app.state.index = None
+            assert client.get("/admin/facts").status_code == 503
+            assert client.get("/admin/matters").status_code == 503
+        finally:
+            app.state.index = started
 
 
 def test_facts_search_mode_without_embedder_returns_empty():
@@ -178,12 +186,14 @@ def test_facts_search_mode_without_embedder_returns_empty():
     with TestClient(app) as client:
         index = _make_index()
         _seed_facts(index)
+        started = app.state.index  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
         app.state.index = index
         try:
             data = client.get("/admin/facts", params={"q": "proxy 502"}).json()
             assert data["mode"] == "search"
             assert data["facts"] == []
         finally:
+            app.state.index = started
             index.close()
 
 
@@ -202,6 +212,7 @@ def test_matters_list_and_detail():
         index.add_edge(MatterEdge(edge_id="e2", matter_id="m1",
                                target_type=EdgeTargetType.SESSION,
                                target_key="u1/agentA/s1/"))
+        started = app.state.index  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
         app.state.index = index
         try:
             data = client.get("/admin/matters").json()
@@ -218,6 +229,7 @@ def test_matters_list_and_detail():
 
             assert client.get("/admin/matters/nope").status_code == 404
         finally:
+            app.state.index = started
             index.close()
 
 
@@ -330,41 +342,54 @@ class _StubWorker:
 def test_queue_endpoint_reports_the_split():
     app = create_app(_make_config())
     with TestClient(app) as client:
-        app.state.pipeline = _StubPipeline()
-        data = client.get("/admin/queue").json()
-        assert data["total"] == 487
-        assert data["orphan"] == 485
-        assert data["undelivered"] == 2
+        started = app.state.pipeline  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
+        try:
+            app.state.pipeline = _StubPipeline()
+            data = client.get("/admin/queue").json()
+            assert data["total"] == 487
+            assert data["orphan"] == 485
+            assert data["undelivered"] == 2
+        finally:
+            app.state.pipeline = started
 
 
 def test_queue_endpoint_503_when_pipeline_is_down():
     """Redis 掉线时不许假装队列是空的——那正是轮次在往磁盘落的时候。"""
     app = create_app(_make_config())
     with TestClient(app) as client:
-        app.state.pipeline = None
-        assert client.get("/admin/queue").status_code == 503
-        app.state.pipeline = _StubPipeline(fail=True)
-        assert client.get("/admin/queue").status_code == 503
+        started = app.state.pipeline  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
+        try:
+            app.state.pipeline = None
+            assert client.get("/admin/queue").status_code == 503
+            app.state.pipeline = _StubPipeline(fail=True)
+            assert client.get("/admin/queue").status_code == 503
+        finally:
+            app.state.pipeline = started
 
 
 def test_queue_flush_defaults_to_dry_run():
     """默认必须是预览：孤儿清理是不可逆的 XDEL。"""
     app = create_app(_make_config())
     with TestClient(app) as client:
+        # 换回 lifespan 起的真 worker：不换回 ⇒ 关停只停 stub，真 worker 的任务留给
+        # 事件循环收尾，Linux + 真 Redis 下整跑卡死在 TestClient.__exit__（批 CI1）
+        started = app.state.pipeline_worker
         worker = _StubWorker()
         app.state.pipeline_worker = worker
+        try:
+            data = client.post("/admin/queue/flush").json()
+            assert data["status"] == "dry-run"
+            assert worker.calls[-1][0] is False
 
-        data = client.post("/admin/queue/flush").json()
-        assert data["status"] == "dry-run"
-        assert worker.calls[-1][0] is False
+            data = client.post("/admin/queue/flush?apply=true&max_batches=5").json()
+            assert data["status"] == "applied"
+            assert worker.calls[-1] == (True, 5)
 
-        data = client.post("/admin/queue/flush?apply=true&max_batches=5").json()
-        assert data["status"] == "applied"
-        assert worker.calls[-1] == (True, 5)
-
-        # 取样是逐条扫 Ledger 的，必须有上限，不能由调用方随便开
-        client.post("/admin/queue/flush?sample=999")
-        assert worker.sample == 20
+            # 取样是逐条扫 Ledger 的，必须有上限，不能由调用方随便开
+            client.post("/admin/queue/flush?sample=999")
+            assert worker.sample == 20
+        finally:
+            app.state.pipeline_worker = started
 
 
 def test_heartbeat_marks_stale_beats_as_not_fresh():
@@ -416,8 +441,12 @@ def test_heartbeat_absent_is_none_not_an_error():
 def test_queue_flush_503_without_worker():
     app = create_app(_make_config())
     with TestClient(app) as client:
-        app.state.pipeline_worker = None
-        assert client.post("/admin/queue/flush").status_code == 503
+        started = app.state.pipeline_worker  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
+        try:
+            app.state.pipeline_worker = None
+            assert client.post("/admin/queue/flush").status_code == 503
+        finally:
+            app.state.pipeline_worker = started
 
 
 def test_unhealthy_models_lazy_expiry():

@@ -202,11 +202,15 @@ def test_upstream_error_returns_502_and_stores_failed():
             mock_pipeline = AsyncMock()
             mock_pipeline.enqueue = capture_enqueue
             mock_pipeline.close = AsyncMock()
-            app.state.pipeline = mock_pipeline
+            started = app.state.pipeline  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
+            try:
+                app.state.pipeline = mock_pipeline
 
-            resp = client.post("/v1/chat/completions",
-                json={"model": "gpt-4o", "messages": [{"role": "user", "content": "Hi"}], "stream": False},
-                headers={"Authorization": "Bearer any", "X-Agent-ID": "test"})
+                resp = client.post("/v1/chat/completions",
+                    json={"model": "gpt-4o", "messages": [{"role": "user", "content": "Hi"}], "stream": False},
+                    headers={"Authorization": "Bearer any", "X-Agent-ID": "test"})
+            finally:
+                app.state.pipeline = started
 
     assert resp.status_code == 502
     assert len(captured_turns) == 1
@@ -259,13 +263,17 @@ def test_non_stream_tool_events_captured():
             mock_pipeline = AsyncMock()
             mock_pipeline.enqueue = capture_enqueue
             mock_pipeline.close = AsyncMock()
-            app.state.pipeline = mock_pipeline
+            started = app.state.pipeline  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
+            try:
+                app.state.pipeline = mock_pipeline
 
-            resp = client.post(
-                "/v1/chat/completions",
-                json={"model": "gpt-4o", "messages": [{"role": "user", "content": "Search weather"}], "stream": False},
-                headers={"Authorization": "Bearer sk-test", "X-Agent-ID": "test"},
-            )
+                resp = client.post(
+                    "/v1/chat/completions",
+                    json={"model": "gpt-4o", "messages": [{"role": "user", "content": "Search weather"}], "stream": False},
+                    headers={"Authorization": "Bearer sk-test", "X-Agent-ID": "test"},
+                )
+            finally:
+                app.state.pipeline = started
 
     assert resp.status_code == 200
     assert len(captured_turns) == 1

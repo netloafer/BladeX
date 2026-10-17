@@ -50,6 +50,7 @@ def test_admin_files_empty_and_search_degrade():
     app = create_app(_make_config())
     with TestClient(app) as client:
         index = _make_index()
+        started = app.state.index  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
         app.state.index = index
         try:
             d = client.get("/admin/files").json()
@@ -58,6 +59,7 @@ def test_admin_files_empty_and_search_degrade():
             assert d["files"] == [] and d["mode"] == "search"
             assert client.get("/admin/files/nope").status_code == 404
         finally:
+            app.state.index = started
             index.close()
 
 
@@ -68,6 +70,7 @@ def test_admin_projects_list_and_detail():
     app = create_app(_make_config())
     with TestClient(app) as client:
         index = _make_index()
+        started = app.state.index  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
         app.state.index = index
         try:
             index.upsert_project(Project(
@@ -83,6 +86,7 @@ def test_admin_projects_list_and_detail():
             assert p["root_path"] == "/home/u/dev/BladeX"
             assert client.get("/admin/projects/nope").status_code == 404
         finally:
+            app.state.index = started
             index.close()
 
 
@@ -93,6 +97,7 @@ def test_admin_profiles_overview_and_rulefile_detail():
     app = create_app(_make_config())
     with TestClient(app) as client:
         index = _make_index()
+        started = app.state.index  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
         app.state.index = index
         try:
             index._profile_put("profile/user_md", {"content": "# USER"})
@@ -113,6 +118,7 @@ def test_admin_profiles_overview_and_rulefile_detail():
             assert client.get(
                 "/admin/profiles/codex/rulefiles/NOPE.md").status_code == 404
         finally:
+            app.state.index = started
             index.close()
 
 
@@ -121,11 +127,13 @@ def test_admin_profiles_empty_index_ok():
     app = create_app(_make_config())
     with TestClient(app) as client:
         index = _make_index()
+        started = app.state.index  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
         app.state.index = index
         try:
             d = client.get("/admin/profiles").json()
             assert d["user_md"] == "" and d["agents"] == []
         finally:
+            app.state.index = started
             index.close()
 
 
@@ -136,6 +144,7 @@ def test_admin_tools_per_agent_isolated():
     app = create_app(_make_config())
     with TestClient(app) as client:
         index = _make_index()
+        started = app.state.index  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
         app.state.index = index
         try:
             index._profile_put("profile/tool/codex/bash",
@@ -153,6 +162,7 @@ def test_admin_tools_per_agent_isolated():
             assert list(d["agents"].keys()) == ["hermes"]
             assert d["agents"]["hermes"][0]["name"] == "web_search"
         finally:
+            app.state.index = started
             index.close()
 
 
@@ -164,6 +174,7 @@ def test_admin_matters_expose_topic_keys():
     app = create_app(_make_config())
     with TestClient(app) as client:
         index = _make_index()
+        started = app.state.index  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
         app.state.index = index
         try:
             index.add_matter(Matter(matter_id="m1", title="泰安项目",
@@ -172,6 +183,7 @@ def test_admin_matters_expose_topic_keys():
             row = next(m for m in d["matters"] if m["matter_id"] == "m1")
             assert row["topic_keys"] == {"泰安": 3, "部署": 1}
         finally:
+            app.state.index = started
             index.close()
 
 
@@ -181,7 +193,11 @@ def test_admin_matters_expose_topic_keys():
 def test_admin_five_classes_503_without_index():
     app = create_app(_make_config())
     with TestClient(app) as client:
-        app.state.index = None
-        for path in ("/admin/files", "/admin/projects", "/admin/profiles",
-                     "/admin/tools"):
-            assert client.get(path).status_code == 503, path
+        started = app.state.index  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
+        try:
+            app.state.index = None
+            for path in ("/admin/files", "/admin/projects", "/admin/profiles",
+                         "/admin/tools"):
+                assert client.get(path).status_code == 503, path
+        finally:
+            app.state.index = started

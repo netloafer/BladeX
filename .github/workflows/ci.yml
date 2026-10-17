@@ -8,6 +8,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # 全程正常不到 3 分钟（0.2.0：2 分 49 秒）。默认 360 分钟太长：卡住时要尽快失败。
+    timeout-minutes: 20
     # integration 测试需要 Redis（Pipeline 接入缓冲）；unit 测试不依赖。
     services:
       redis:
@@ -49,6 +51,7 @@ jobs:
         run: uv run mypy packages/bladex-core/bladex_core packages/bladex-proxy/bladex_proxy
 
       - name: pytest
-        run: uv run pytest -q
+        # 单条用例超 300 秒就打出全部线程的调用栈，卡住时日志里直接有现场
+        run: uv run pytest -q -o faulthandler_timeout=300
         env:
           BLADEX_REDIS_URL: redis://127.0.0.1:6379/0

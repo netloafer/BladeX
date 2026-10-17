@@ -457,3 +457,39 @@ def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(fake))
     monkeypatch.setenv("USERPROFILE", str(fake))  # Windows 上 expanduser 认它
     return fake
+
+
+# ── 六、起过的 PipelineWorker 用例结束时必须已停（批 CI1，2026-10-17，公开仓 CI 卡死 driven）──
+#
+# 病灶：lifespan 关停只停 `app.state.pipeline_worker` 上**当时**挂着的那个。用例在
+# `with TestClient(app)` 里把它换成替身（或 None）不换回 ⇒ 真 worker 的任务没人停，
+# 留到 anyio 关事件循环时由 `_cancel_all_tasks` 收尾。macOS 上收得回、照绿；
+# Linux + 真 Redis 下整跑到第 ~1,080 条时收不回，CI 在 `TestClient.__exit__` 挂 29 分钟
+# （`test_admin_read_api.py::test_queue_flush_defaults_to_dry_run`）。
+#
+# 判据看 `_running` 而不是任务是否结束：漏停的任务最后也会被关循环取消掉（所以 macOS
+# 才绿），只有 `stop()` 会把 `_running` 置回 False ⇒ 这一位在任何平台上都能红。
+@pytest.fixture(autouse=True)
+def _pipeline_workers_stopped():
+    from bladex_proxy.storage.pipeline_worker import PipelineWorker
+
+    started: list = []
+    orig_start = PipelineWorker.start
+
+    def _tracking_start(self):  # type: ignore[no-untyped-def]
+        started.append(self)
+        return orig_start(self)
+
+    PipelineWorker.start = _tracking_start  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        PipelineWorker.start = orig_start  # type: ignore[method-assign]
+    leaked = [w for w in started if w._running]
+    if leaked:
+        pytest.fail(
+            f"{len(leaked)} 个起过的 PipelineWorker 在用例结束时没被 stop()——"
+            "多半是在 `with TestClient(app)` 里替换了 app.state.pipeline_worker 却没换回，"
+            "lifespan 关停只停替身。改法：记下原对象，finally 换回（见 test_agent_claim）。",
+            pytrace=False,
+        )

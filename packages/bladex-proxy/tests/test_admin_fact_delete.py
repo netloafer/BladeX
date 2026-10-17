@@ -56,18 +56,22 @@ def test_delete_fact_endpoint_tombstone_and_cascade():
 
     app = create_app(cfg)
     with TestClient(app) as client:
-        app.state.index = None  # 跳过读句柄存在性检查（沙盒无 embedder；语义幂等）
-        resp = client.delete("/admin/facts/f-del")
-        assert resp.status_code == 200, resp.text
-        data = resp.json()
-        assert data["status"] == "deleted"
-        assert data["tombstone_key"]
+        started = app.state.index  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
+        try:
+            app.state.index = None  # 跳过读句柄存在性检查（沙盒无 embedder；语义幂等）
+            resp = client.delete("/admin/facts/f-del")
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            assert data["status"] == "deleted"
+            assert data["tombstone_key"]
 
-        # Memory Hub 墓碑在场且类型正确
-        ledger: MemoryHub = app.state.hub
-        tombs = [(k, t) for k, t in ledger.scan_tombstones()]
-        assert any(t.target_type == TombstoneTargetType.FACT
-                   and t.target_key == "f-del" for _, t in tombs)
+            # Memory Hub 墓碑在场且类型正确
+            ledger: MemoryHub = app.state.hub
+            tombs = [(k, t) for k, t in ledger.scan_tombstones()]
+            assert any(t.target_type == TombstoneTargetType.FACT
+                       and t.target_key == "f-del" for _, t in tombs)
+        finally:
+            app.state.index = started
 
     # Memory Index 级联：fact 已不在
     index = MemoryIndex(cfg.index_path, embedder=None, read_only=False)
@@ -84,6 +88,7 @@ def test_delete_fact_404_when_not_found():
         tmpdir = tempfile.mkdtemp()
         index = MemoryIndex(Path(tmpdir) / "index", embedder=None, read_only=False)
         index.open()
+        started = app.state.index  # 换回 lifespan 起的真对象，关停才会停 / 关它（批 CI1）
         app.state.index = index
         try:
             resp = client.delete("/admin/facts/nonexistent")
@@ -91,6 +96,7 @@ def test_delete_fact_404_when_not_found():
             ledger: MemoryHub = app.state.hub
             assert not list(ledger.scan_tombstones())
         finally:
+            app.state.index = started
             index.close()
 
 

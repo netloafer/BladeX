@@ -45,7 +45,7 @@ def test_routing_config_error_is_reraised_before_the_index_degrade_path():
     from bladex_proxy.routing_config import RoutingConfigError
 
     assert A.RoutingConfigError is RoutingConfigError, "app_factory 没引入这个类型"
-    src = inspect.getsource(A.lifespan)
+    src = inspect.getsource(A._lifespan_body)  # 批 CI1：lifespan 外层只管启动失败停 worker，本体在这
     i_cfg = src.find("except RoutingConfigError")
     i_any = src.find("except Exception as e:\n        logger.warning(\"index_init_failed\"")
     assert i_cfg != -1, "配置错误没被单独接住 ⇒ 仍会掉进 except Exception 降级"
