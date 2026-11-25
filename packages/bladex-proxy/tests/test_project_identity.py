@@ -307,7 +307,7 @@ class TestResolveProject:
         sub.mkdir(parents=True)
         a = resolve_project(str(sub))          # 子目录向上找到仓库根
         assert a.source == "git-remote" and a.name == "proj"
-        assert a.project_id.startswith("p-") and len(a.project_id) == 14
+        assert a.project_id.startswith("p-") and len(a.project_id) == 18   # 批 BA2 拍板 (32)-b：[:16]
 
     def test_symlink_paths_converge_to_one_project(self, tmp_path):
         """🔴 本卡立卡实证：~/dev/BladeX 与旧软链两个 cwd 必须同一 project_id。"""

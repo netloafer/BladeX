@@ -24,7 +24,14 @@ from fastapi.responses import JSONResponse
 from bladex_proxy import metrics as metrics_mod
 from bladex_proxy import onboarding as _onb
 from bladex_proxy.assembly import estimate_context_chars
-from bladex_proxy.capture import CaptureResult, output_truncated
+from bladex_proxy.capture import (
+    CaptureResult,
+    cache_read_tokens,
+    extract_usage,
+    note_cache_reading,
+    output_truncated,
+    usage_raw,
+)
 from bladex_proxy.config import ModelRoute, ProxyConfig
 from bladex_proxy.identity import (
     AUX_REASON_ISOLATED,
@@ -36,6 +43,7 @@ from bladex_proxy.identity import (
     is_cheap_tier_auxiliary,
     is_isolated_subcall,
     is_ledgerless_auxiliary,
+    note_session_output,
     resolve_identity,
 )
 from bladex_proxy.inject import detect_required_capabilities, do_inject_async
@@ -55,6 +63,7 @@ from bladex_proxy.models import (
 )
 from bladex_proxy.modules import module_enabled
 from bladex_proxy.project_identity import extract_cwd
+from bladex_proxy.responses import strip_response_inline_reasoning
 from bladex_proxy.route import (
     NoCapableCandidateError,
     UnknownRequestedModelError,  # V-A2 边界：core 的路由异常经 route.py 门面拿
@@ -388,6 +397,15 @@ async def _prepare_round(
     identity.project_source = _proj.source
     identity.project_name = _proj.name
     identity.project_root = _proj.root
+    # 批 BA2（MQ-A94）：子任务项目继承 + 续段粘滞 + 母本定位（规则见 `subtask_lineage`）。
+    # 必须在这里：下游一切用项目键的（注入、账本作用域、入库）都要看到补完的值。
+    try:
+        from bladex_proxy.identity import is_subtask_request as _is_subtask
+        from bladex_proxy.subtask_lineage import lineage as _lineage
+        _lineage.apply(identity, _proj, req.messages,
+                       is_subtask=_is_subtask(identity, headers, req.messages))
+    except Exception as _le:  # noqa: BLE001 —— 归属判定失败 = 不继承（修前行为），不阻断这一轮
+        logger.warning("subtask_lineage_failed", error=str(_le))
     prep.ms_identity = (time.perf_counter() - t0) * 1000
 
     # ADR-0021 §3.3b: 敏感度解析前移到注入之前（身份的纯静态函数）。
@@ -1211,6 +1229,28 @@ async def _enqueue_turn(
     # 🔴 F1.3 / MQ-A49：收 `request`（请求作用域）不收 `agency`（进程级最近一次）。
     _ledger_next_referenced(request, _anchor, response_text, tool_events)
 
+    # 批 BA1：本轮产出登记给本轮会话（会话延续凭证 ②）。产出只在回复结束后才有，
+    # 身份层自己拿不到；这里是三协议 × 流式/非流式的唯一汇合点（拍板 (30) D4）。
+    if status == TurnStatus.OK:
+        try:
+            note_session_output(identity, response_text, tool_events)
+        except Exception as _ne:  # noqa: BLE001 —— 身份状态登记，不阻断入库（绝不丢 Turn）
+            logger.warning("session_output_note_failed", error=str(_ne))
+
+    # 批 BA2（MQ-A94 R3）：spawn 位置上的激活本当场记（拍板 (32)-a）。`ledger_ops` 每轮都要取走，
+    # 否则上一轮的调用会串进下一轮的位置计算。
+    _spawn_dispatches: list[dict] = []
+    if _ag is not None:
+        try:
+            from bladex_proxy.subtask_lineage import lineage as _lineage
+            _ops, _active_now = _ag.drain_ledger_ops(identity.agent_id, identity.session_id,
+                                                     identity.project_id)
+            if status == TurnStatus.OK:
+                _spawn_dispatches = _lineage.note_spawns(identity, tool_events,
+                                                         ledger_ops=_ops, active_now=_active_now)
+        except Exception as _le:  # noqa: BLE001 —— 归属记录，不阻断入库（绝不丢 Turn）
+            logger.warning("spawn_dispatch_note_failed", error=str(_le))
+
     turn = Turn(
         identity=identity, model=model, request_messages=messages,
         task_units=units,
@@ -1219,7 +1259,7 @@ async def _enqueue_turn(
         ledger_anchor=_anchor,
         reconstruction=_recon,
         injected_memory=injected_text, response_text=response_text,
-        tool_events=tool_events, status=status, error=error,
+        tool_events=tool_events, spawn_dispatches=_spawn_dispatches, status=status, error=error,
         ms_identity=ms_identity, ms_inject=ms_inject, ms_total=ms_total,
         agent_source=agent_source,
         logical_turn=logical_turn, roundtrip=roundtrip,
@@ -1422,6 +1462,7 @@ def _build_response_meta_from_capture(result: CaptureResult) -> ResponseMeta:
     return ResponseMeta(
         reasoning_text=result.reasoning_text,
         usage=dict(result.usage),
+        usage_raw=dict(result.usage_raw),
         finish_reason=result.finish_reason,
         ms_first_chunk=result.ms_first_chunk,
     )
@@ -1464,7 +1505,9 @@ def _loop_reply(response: Any) -> dict:
     try:
         usage = getattr(response, "usage", None)
         if usage is not None:
-            out["usage"] = _extract_usage_dict(usage)
+            # MQ-P34（批 AC）：挂**原文**——`loopledger` 入 Hub 时三键由 `normalize_usage`
+            # 从原文投影、原文进 `ResponseMeta.usage_raw`；`_loop_cost` 读 `total_tokens` 同样认。
+            out["usage"] = usage_raw(usage)
     except Exception:  # noqa: BLE001 —— usage 只是入账附件，取不到不阻断内循环
         pass
     return out
@@ -1493,27 +1536,32 @@ def _build_response_meta_from_response(response: Any) -> ResponseMeta:
         usage = getattr(response, "usage", None)
         if usage is not None:
             meta.usage = _extract_usage_dict(usage)
+            meta.usage_raw = usage_raw(usage)
     except Exception:
         pass
     return meta
 
 
+def _note_nonstream_cache_reading(identity: Identity, response: Any) -> None:
+    """非流式三路径登记本轮 cache 读数（MQ-CA20 剩余，批 AC · U2 修法 A）。
+
+    流式三路径在 capture 收尾各调一次 `capture.note_cache_reading`；非流式三条
+    `_handle_*_non_stream` 此前一处都没有 ⇒ 这些会话的下一轮装配触发门永远读到
+    "无读数"、每轮判冷（U2：R1 后 54 会话里 20 个有缺读数轮）。这里**不另写登记逻辑**，
+    只把非流式响应的 usage 交给同一个登记点；None（上游没报）照登记，语义与流式一致。
+    """
+    probe = CaptureResult(session_id=identity.session_id)
+    note_cache_reading(probe, cache_read_tokens(getattr(response, "usage", None)))
+
+
 def _extract_usage_dict(usage: Any) -> dict:
-    """从上游 usage 对象提取 token 计数（非流式复用）。"""
-    try:
-        if hasattr(usage, "model_dump"):
-            data = usage.model_dump()
-        elif isinstance(usage, dict):
-            data = usage
-        else:
-            data = dict(usage)
-        return {
-            "prompt": int(data.get("prompt_tokens", 0)),
-            "completion": int(data.get("completion_tokens", 0)),
-            "total": int(data.get("total_tokens", 0)),
-        }
-    except Exception:
-        return {}
+    """从上游 usage 对象提取 token 计数（非流式复用）—— 委托 `capture.extract_usage`。
+
+    批 AC：此前这里是第二份实现，只认 `model_dump` / dict，只有属性的对象 `dict(obj)`
+    抛 TypeError ⇒ 静默 `{}`（流式那份 09-09 已补第三种载体，这份没跟上）——
+    六格守卫 `test_ac_usage_lossless` 的 namespace 载体当场抓住。同一件事收成一处。
+    """
+    return extract_usage(usage)
 
 
 def _inject_top_k() -> int:
@@ -1695,6 +1743,9 @@ async def _intercept_non_stream(request: Request, response: Any, *, model: str,
         r2 = await call_model(model, msgs, stream=False, route=route,
                               failover=failover, health=health,
                               on_success=on_used, **extra_kwargs)
+        # MQ-P45：内循环最终回复的孤立 `</think>` 前缀走与 responses 流式内循环同一个单一实现点——
+        # 前缀并进 reasoning_content（随 aux 轮入 Hub），正文不带标记。
+        strip_response_inline_reasoning(r2, "intercept:non_stream_loop")
         return _loop_reply(r2)
 
     processed, _transcript, mode = await agency.process_message(

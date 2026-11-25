@@ -26,8 +26,10 @@ import uuid
 from typing import Any
 
 import structlog
+from bladex_core.flags import flag_number
 
 from bladex_proxy.embed_server import (
+    ERROR_KIND_REPLY,
     PRIORITY_BULK,
     PRIORITY_HOT,
     STREAM_LIMIT,
@@ -35,19 +37,40 @@ from bladex_proxy.embed_server import (
 
 logger = structlog.get_logger()
 
+_HINT_LOCAL = "loading a local model in this process (memory doubles until restart)"
+
+
+class EmbedServerReplyError(RuntimeError):
+    """服务端在线，算了，但回包发不出去（序列化失败）。**不是**连接问题（MQ-W29）。"""
+
+
+def _fallback_hint(e: Exception) -> str:
+    """回落日志的 hint 按真实原因说：11-03 那次报「unreachable」，实际服务端活着、是回包失败。"""
+    if isinstance(e, EmbedServerReplyError):
+        return ("embed module is up but its reply failed; see embed_send_failed in "
+                f"logs/embed-*.log; {_HINT_LOCAL}")
+    return f"embed module unreachable; {_HINT_LOCAL}"
+
 
 class IPCEmbedAdapter:
     """经 IPC 调 `bladex-embed` 模块；不可用时回落到本地 embedder。"""
 
     def __init__(self, transport: str, address: str, *, priority: str = PRIORITY_HOT,
-                 timeout_s: float = 120.0, local_factory: Any = None) -> None:
+                 timeout_s: float | None = None, chunk: int | None = None,
+                 local_factory: Any = None) -> None:
         self._transport = transport
         self._address = address
         self._priority = PRIORITY_HOT if priority == PRIORITY_HOT else PRIORITY_BULK
-        self._timeout_s = timeout_s
+        # 批 AA · MQ-A28：超时与单次请求块上限进 flags（此前写死 120 s、整批一次送）。
+        # 显式传参仍优先（测试 / 特殊调用方）。
+        self._timeout_s = (float(flag_number("BLADEX_EMBED_IPC_TIMEOUT_S"))
+                           if timeout_s is None else timeout_s)
+        self._chunk = max(1, int(flag_number("BLADEX_EMBED_IPC_CHUNK")
+                                 if chunk is None else chunk))
         self._local_factory = local_factory      # () -> embedder（懒建，回落时才付钱）
         self._local: Any = None
         self._identity: str = ""
+        self._fingerprint: str = ""
         self._degraded = False
 
     # ── 传输 ──
@@ -66,11 +89,16 @@ class IPCEmbedAdapter:
             await writer.drain()
             line = await asyncio.wait_for(reader.readline(), timeout=self._timeout_s)
             if not line:
-                raise ConnectionError("embed module closed the connection")
+                raise ConnectionError(
+                    "embed module closed the connection before replying (no reply frame; "
+                    "the process likely exited or was stopped)")
             resp = json.loads(line.decode("utf-8", "replace"))
             if resp.get("error"):
+                if resp.get("error_kind") == ERROR_KIND_REPLY:
+                    raise EmbedServerReplyError(str(resp["error"]))
                 raise RuntimeError(str(resp["error"]))
             self._identity = resp.get("model_identity") or self._identity
+            self._fingerprint = resp.get("vector_fingerprint") or self._fingerprint
             return resp.get("vectors") or []
         finally:
             try:
@@ -115,15 +143,30 @@ class IPCEmbedAdapter:
     def _call(self, texts: list[str], input_type: str) -> list[list[float]]:
         if not texts:
             return []
-        if not self._degraded:
+        out: list[list[float]] = []
+        # 批 AA · MQ-A28：按块往返。单次请求的耗时由块大小钉住（不再随批量线性逼近超时），
+        # 块与块之间服务端可以先处理 hot 请求。某块失败 ⇒ 该块起回落（与原语义一致）。
+        while not self._degraded and len(out) < len(texts):
+            part = texts[len(out):len(out) + self._chunk]
             try:
-                return self._run_sync(self._roundtrip(texts, input_type))
+                vecs = self._run_sync(self._roundtrip(part, input_type))
             except Exception as e:  # noqa: BLE001 —— 任何传输失败都回落
                 self._degraded = True
                 logger.warning("embed_ipc_fallback_local", error=str(e),
+                               error_type=type(e).__name__,
                                transport=self._transport, address=self._address,
-                               hint="embed module unreachable; loading a local model "
-                                    "in this process (memory doubles until restart)")
+                               chunk=len(part), done=len(out), total=len(texts),
+                               timeout_s=self._timeout_s,
+                               hint=_fallback_hint(e))
+                break
+            out.extend(vecs)
+            if len(vecs) != len(part):      # 服务端少回（旧语义：原样交给调用方）
+                return out
+        if not self._degraded:
+            return out
+        return out + self._local_embed(texts[len(out):], input_type)
+
+    def _local_embed(self, texts: list[str], input_type: str) -> list[list[float]]:
         emb = self._fallback()
         if input_type == "query" and hasattr(emb, "embed_query"):
             return emb.embed_query(texts)
@@ -172,6 +215,20 @@ class IPCEmbedAdapter:
                 logger.debug("embed_identity_probe_failed", error=str(e),
                              transport=self._transport, address=self._address)
         return self._identity
+
+    @property
+    def vector_fingerprint(self) -> str:
+        """算向量的库版本与 dtype，取**服务端**报的；回落后取本地 embedder 的（MQ-I45）。
+        空串 = 现在答不上来（模块没起 / 旧版服务端），台账这次旁路。握手同 `model_identity`。"""
+        if self._degraded:
+            return getattr(self._local, "vector_fingerprint", "") if self._local is not None else ""
+        if not self._fingerprint:
+            try:
+                self._run_sync(self._roundtrip([], "passage"))
+            except Exception as e:  # noqa: BLE001 —— 握手失败不改变 adapter 状态
+                logger.debug("embed_identity_probe_failed", error=str(e),
+                             transport=self._transport, address=self._address)
+        return self._fingerprint
 
     @property
     def degraded(self) -> bool:

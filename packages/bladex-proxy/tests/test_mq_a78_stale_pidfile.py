@@ -45,6 +45,8 @@ def _isolated_deployment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pat
             monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("BLADEX_HOME", str(tmp_path))
     monkeypatch.chdir(tmp_path)
+    # FAKE_PID 是编出来的，可能恰好是别的用户的进程（EPERM）：受限判定不是这里测的（批 W33）
+    monkeypatch.setattr(lifecycle, "_shell_restriction", lambda **_k: None)
     return tmp_path.resolve()
 
 
@@ -54,6 +56,9 @@ def _fake_spawn(monkeypatch: pytest.MonkeyPatch) -> type[_FakePopen]:
     monkeypatch.setattr(lifecycle.subprocess, "Popen", _FakePopen)
     monkeypatch.setattr(lifecycle, "_pid_alive", lambda pid: pid != DEAD_PID)
     monkeypatch.setattr(lifecycle.time, "sleep", lambda _seconds: None)
+    # 假进程不写日志也不持锁（批 W33）
+    monkeypatch.setattr(lifecycle, "_CONSOLIDATOR_READY_WAIT_S", 0.0)
+    monkeypatch.setattr(lifecycle, "_embed_lock_owner", lambda: FAKE_PID)
     return _FakePopen
 
 
@@ -256,6 +261,7 @@ def test_old_version_process_without_home_marker_is_this_instance(
     _write_pid(pidfile, FAKE_PID)
     monkeypatch.setattr(lifecycle, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(lifecycle, "_process_home", lambda _pid: None)
+    monkeypatch.setattr(lifecycle, "_process_command", lambda _pid: "python -m bladex_proxy.x")
 
     if pidfile == _EMBED_PIDFILE:
         pid_reader = lifecycle._embed_pid
@@ -282,6 +288,7 @@ def test_old_version_process_status_stop_start_do_not_duplicate_or_lose_it(
         _write_pid(pidfile, FAKE_PID)
     monkeypatch.setattr(lifecycle, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(lifecycle, "_process_home", lambda _pid: None)
+    monkeypatch.setattr(lifecycle, "_process_command", lambda _pid: "python -m bladex_proxy.x")
     monkeypatch.setattr(lifecycle, "_redis_ping", lambda _url: False)
     monkeypatch.setattr(lifecycle, "_http_json", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(lifecycle, "_admin_key", lambda: "")
@@ -308,6 +315,8 @@ def test_old_version_process_status_stop_start_do_not_duplicate_or_lose_it(
     monkeypatch.setattr(
         lifecycle.os, "kill",
         lambda pid, sig: (sig != signal.SIGTERM or kills.append((pid, int(sig)))))
+    # 批 W33：要确认进程没了才删 pidfile，所以替身得在收到 SIGTERM 后「死掉」
+    monkeypatch.setattr(lifecycle, "_pid_alive", lambda _pid: not kills)
     lifecycle._stop_by_pidfile(_CONS_PIDFILE, "Consolidator")
     stop_out = capsys.readouterr().out
     assert "Consolidator: stopped (PID 24680)" in stop_out

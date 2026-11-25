@@ -105,6 +105,14 @@ MEMORY_FLAG_DEFAULTS: dict[str, bool] = {
     # 既是回滚通道、也是本批判据④(a) 的阴性对照（关掉 ⇒ 周期回到 ~134s）。
     # 参数见 `BLADEX_CONSOLIDATOR_IDLE_AFTER` / `_IDLE_MAX_S`。
     "BLADEX_CONSOLIDATOR_IDLE_BACKOFF": True,
+    # 批 AB · MQ-W17 ②：增量扫描走 session 游标，空载轮不再全扫 Hub。=0 回到每轮全扫。
+    "BLADEX_SCAN_CURSOR": True,
+    # ── 批 BB · 步骤 2a（拍板 (102)）：矛盾标记（README ③ 的最小实现）──
+    # 🔴 公开默认**关**、标为实验性：步骤 2-0 读数——判定器在 Jason 标签上最差精确率 0.176
+    # [0.06, 0.41]，部署精确率 0.22–0.25，标出来的大多是错的，且每天花几十万 input token。
+    # 关着时：判定调用 0、Hub 事件 0、Index 写入 0（`test_bb_contradiction_switch.py`）。
+    # 只标不删：矛盾被标出来让用户裁定，BladeX 不替用户删（`test_bb_flag_never_deletes.py`）。
+    "BLADEX_CONTRADICTION_ENABLED": False,
 
     # ── V-P3 硬点 8：拦截播报（ADR-0032 §3.2 #8）──
     # 内循环期间以 reasoning/thinking 流播报 BladeX 在做什么，让用户感知工作进行中。
@@ -460,6 +468,13 @@ MEMORY_NUMERIC_DEFAULTS: dict[str, float] = {
     #   512 是保守起点，**未经标定**——真实速率由 `consolidate_embed_progress`
     #   的 `rate=` 给出，标定后再调。
     "BLADEX_EMBED_BATCH": 512.0,
+    # 批 AA · MQ-A28（2026-10-22）：嵌入模块 IPC 客户端的**单次请求**上限与超时。
+    #   此前 `IPCEmbedAdapter` 写死 `timeout_s=120.0`、一次请求送整批 ⇒ 全量重建只能绕道
+    #   `BLADEX_EMBED_BACKEND=local`（T1 三跑都带着它）。现在客户端按块切，每块一次往返：
+    #   单次请求的耗时被块大小钉住，超时不再随批量线性逼近；块之间 hot 请求可以插队。
+    #   64 = e5-large CPU 上一块秒级（远低于 120 s）；120 s = 原写死值，语义不变。
+    "BLADEX_EMBED_IPC_CHUNK": 64.0,
+    "BLADEX_EMBED_IPC_TIMEOUT_S": 120.0,
     # 一轮提炼里**降级成 ADD 的候选比例**达到该值 → 判为裁决侧上游中断：
     # 本轮不写事实、不标记消费，退避重试（MQ-S32 病 B，2026-08-31 立）。
     #   为什么要有它：裁决失败是**降级不抛**的，`_all_add` 把整块判成 ADD，
@@ -467,7 +482,24 @@ MEMORY_NUMERIC_DEFAULTS: dict[str, float] = {
     #   消费标记照打，当场制造同键并存（实测 46 条）。与蒸馏中断守卫同型同默认值。
     #   分母是候选条数不是调用次数（分块后一次调用判 25 条，按调用数会被稀释）。
     #   0 = 关闭守卫，回到旧行为。
-    "BLADEX_ADJUDICATE_OUTAGE_ABORT_RATIO": 0.5,
+    # 🔴 批 AA2（2026-10-22，拍板 (8)）0.5 → **0.01**。两件事让它可以收紧：
+    #   ① 网络错误不再进分子（批 AA · MQ-I35：退避等待，不降级）——分子只剩解析型；
+    #   ② 增量中止不再留副作用（memo / 画像提交时才写），且解析型降级按候选计次、
+    #      超 BLADEX_ADJUDICATE_RETRY_MAX 放行 ⇒ 中止 = 干净重试，不丢数据、不停摆。
+    #   T1 读数：0.5 下第一 / 二跑 30% / 43.5% blanket ADD 都不到线；第三跑解析型 0.24% < 0.01。
+    "BLADEX_ADJUDICATE_OUTAGE_ABORT_RATIO": 0.01,
+    # 批 AA2 · MQ-I32：同一候选连续多少个 pass 解析型降级后放行（照降级写 ADD、
+    # 打 `index_rebuild_adjudicate_retry_exhausted`）。与蒸馏侧 MS-1 的
+    # BLADEX_DISTILL_RETRY_MAX 同形同默认值。0 = 不放行（坏输入会让增量永久停摆）。
+    "BLADEX_ADJUDICATE_RETRY_MAX": 3.0,
+    # 批 AA · MQ-I35（2026-10-22）：裁决上游**不可达**（5xx / 429 / 超时 / 连接错误）时
+    # 单次断网的退避等待总上限（秒）。期间暂停裁决、指数退避（15 s 起、单次 ≤ 300 s）、
+    # 恢复后重试同一块；等满仍不通 ⇒ 本轮中止（不写、不消费；full 模式生产不动）。
+    #   为什么不再降级成 ADD：T1 两次夜间断网（2 h 15 m / ≥ 2 h 42 m）各把 43% / 30%
+    #   的候选判成 blanket ADD、整跑作废；09-28 同一隧道断了 5 h（Astrill DNS）。
+    #   6 h = 覆盖已观测的最长一次断网；过了它多半要人去修网络，干等无益。
+    #   上面那个比例阈值从此只管**解析型**降级（网络错误不再进它的分子）。
+    "BLADEX_ADJUDICATE_OUTAGE_MAX_WAIT_S": 21600.0,
     # GM-1「无新主体」的门槛：本轮相对上一轮新增的主体信号数 ≥ 该值 → 判为引入新任务、
     # 不进候选。🔴 **这个值不承重**（候选只送裁决），探针扫过 1→12 收益列全程高于
     # 风险列、两列不交叉（14.9%→18.0% vs 6.5%→2.3%）——结论不是阈值的产物。
@@ -556,6 +588,15 @@ MEMORY_NUMERIC_DEFAULTS: dict[str, float] = {
     # 4h 切 41 个明确跨会话点，激进备选 1h 切 69 个）。0 = 关闭（回旧撞桶行为）。
     # 只作用于 fp: 桶——显式 session 对照段零长尾（同一份读数），切它是替 agent 做主。
     "BLADEX_SESSION_FP_WINDOW_S": 14400.0,
+    # 批 BA1（拍板 (30)）：会话延续凭证 ②「产出携带」——每个活会话保留 BladeX 最近几份产出
+    # （identity.py `SessionCache.note_output`）。32 = 回放读数：hermes 同会话的后台复盘轮
+    # 会覆盖「最近一份」，T-HM 目标 16 份过 15/16、32 份过 16/16（命中时最大龄 18，64 与 32
+    # 逐字同结果）。存多久不另开参数，沿用上面的纪元窗。
+    "BLADEX_SESSION_OUTPUT_RING": 32.0,
+    # 同上：普通回复做文本凭证的最短字数（规范化后）。tool_call id 不设下限（上游随机生成）。
+    # 敏感性读数：16 / 64 / 128 字，回放集每一行结果相同，全库会话 id 差 32 / 0 / 3 轮；
+    # 全库 144 个压缩引擎轮里两份不同会话产出相同摘要 = 0，dsh 最短落地摘要 78 字。
+    "BLADEX_SESSION_OUTPUT_MIN_CHARS": 64.0,
     # 写入侧蒸馏并发路数（1 = 串行）。**唯一真相源**——三条消费路径都读这里：
     # `bladex sync run`、CLI 拉起的 consolidator 守护进程、`MemoryIndex.rebuild_from_hub`。
     # 收口前这三处各带一个默认值（4 / 1 / 1），没人说得出生产在跑哪个。
@@ -602,6 +643,10 @@ MEMORY_NUMERIC_DEFAULTS: dict[str, float] = {
     # 连续几轮 `candidates == 0` 之后开始退避（间隔 ×2 封顶）。
     # 取 3 的理由：一轮 ~134s ⇒ 三轮 ≈ 6.7 分钟真空载才开始省，短暂静默不受影响。
     "BLADEX_CONSOLIDATOR_IDLE_AFTER": 3.0,
+    # 批 AB · MQ-W17 ②：游标扫描的全扫对账周期（满足其一就全扫一次，代价约 5 s）。
+    # 兜底 overflow 回灌：entry_id 更小的旧轮次晚到时游标看不见，最迟等一个周期被补上。
+    "BLADEX_SCAN_RECONCILE_ROUNDS": 120.0,
+    "BLADEX_SCAN_RECONCILE_S": 3600.0,
     # 退避上限（秒）。🔴 **它不是消费延迟的上界**——退避期间 Memory Hub 的
     # WAL 水位动了会在 ≤1s 内打断 sleep 并立刻回落基准（`_HubWatermark`），所以上限
     # 只决定"一点流量都没有时多久空转一次"。
@@ -659,6 +704,24 @@ MEMORY_NUMERIC_DEFAULTS: dict[str, float] = {
     # 0 = 关闭清理。20 是审查时的原值（当时实测已积到 157 个），此前就地写在
     # `cli/lifecycle.py` 的 `os.environ.get(..., "20")` 里、不受 `.env.example` 对账约束。
     "BLADEX_LOG_KEEP": 20.0,
+    # ── 批 CB（F1 交接包，拍板 (41)）：五个上限，取值依据是 11-02 快照 74 本真实账本 ──
+    # 单包字符上限（`len(canonical_json)`）。最大一本五段正文 11,984 字符，加每条约 70 字符
+    # JSON 外壳约 15k；超限先裁「最近轮次」再裁 Matter 摘要，五段永不裁。
+    "BLADEX_HANDOFF_MAX_CHARS": 20000,
+    # 「最近轮次」条数。live 带写者轮的账本每本 p50 = 5。
+    "BLADEX_HANDOFF_MAX_ROUNDS": 5,
+    # 每轮用户话首段字符上限，超出带显式截断标记。首段 p90 = 418。
+    "BLADEX_HANDOFF_USER_TEXT_CHARS": 500,
+    # 每轮条目增、删各自的上限，超出计入 `trimmed.round_entries`。
+    "BLADEX_HANDOFF_ROUND_ENTRIES": 8,
+    # 导入文件硬上限（字节），先于解析判。五段永不裁，所以包可能超 MAX_CHARS，这里才是闸。
+    "BLADEX_HANDOFF_IMPORT_MAX_BYTES": 1048576,
+    # ── 批 BB · 步骤 2a（拍板 (102)）：矛盾判定成本上限（单一实现点 `consistency.JudgeBudget`）──
+    # 每条新 fact 的判定次数上限。依据：S4a ∪ top-3 实测 4.66 次 / fact（步骤 2-0 §3.3），取 6。
+    "BLADEX_CONTRADICTION_MAX_JUDGMENTS_PER_FACT": 6,
+    # 绝对日上限（input token，取响应 usage 的 prompt_tokens）。依据：64.6 条 fact / 天 × 6 次
+    # × 约 1,000 input token = 387,600，取整 400,000。对账读数而非目标：超限 = 停判、告警、不丢。
+    "BLADEX_CONTRADICTION_DAILY_INPUT_TOKENS": 400000,
 }
 
 # 字符串型参数（同样集中默认值；与 `.env.example` 由 test_flag_defaults 对账）。
@@ -715,6 +778,17 @@ FLAG_TIERS: dict[str, str] = {
 }
 FLAG_TIER_NAMES: tuple[str, ...] = ("mechanism", "calibration", "instrument")
 
+# ── 批 BD · 步骤 1（拍板 (128)-b）：bench 专用开关表 ──
+# 🔴 **不进上面三张表**：那三张与 `.env.example` 逐项对账（必须有 export 行），而 bench 开关
+# 恰恰**不许**在 `.env.example` / `config/.env` 里有 export（守卫 ③：不得常驻）。
+# 开关名只在本文件出现一次（下面的常量）；消费方一律经 `bench_ledger_filler_chars()` 读取。
+_BENCH_LEDGER_FILLER_FLAG = "BLADEX_BENCH_LEDGER_FILLER_CHARS"
+BENCH_NUMERIC_DEFAULTS: dict[str, int] = {
+    # 账本块等长填充（字符数）。0 = 关（默认，恒为 0）：开着时账本块被一段固定无关文本替换，
+    # 仅供 BD 受控对照臂在演练日临时打开，用完还原。开着时启动打 `bench_filler_active`、doctor 标 `!`。
+    _BENCH_LEDGER_FILLER_FLAG: 0,
+}
+
 _FALSEY = {"0", "false", "no", "off", ""}
 
 
@@ -761,3 +835,15 @@ def flag_number(name: str, default: float | None = None) -> float:
         return float(raw.strip())
     except ValueError:
         return float(fallback)
+
+
+def bench_ledger_filler_chars() -> int:
+    """账本块填充字符数（BD bench 开关）。未设 / 非数 / 负数 → 0（关）。"""
+    default = BENCH_NUMERIC_DEFAULTS[_BENCH_LEDGER_FILLER_FLAG]
+    raw = os.environ.get(_BENCH_LEDGER_FILLER_FLAG)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return max(int(float(raw.strip())), 0)
+    except ValueError:
+        return default

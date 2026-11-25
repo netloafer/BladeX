@@ -42,7 +42,12 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from typing import Any
+
+import structlog
+
+_usage_log = structlog.get_logger()
 
 # 🔴 必须在 import litellm **之前**：SDK 在 import 时会去
 # raw.githubusercontent.com 拉模型价格表，离线/网络受限时甩一条署名 LiteLLM 的
@@ -54,8 +59,11 @@ import litellm  # noqa: E402  （上面那行 env 是它的前置条件，顺序
 
 # ── 进程级开关（import 本模块即生效，不依赖调用方记得设）─────────────────────
 
-# drop 上游模型不支持的参数（如 reasoning_effort——Hermes 发送，ARK 系模型不支持
-# → UnsupportedParamsError 502）。
+# drop LiteLLM 认为上游不支持的参数，免得整轮被 UnsupportedParamsError 打断。
+# ⚠️ 它判的是 LiteLLM 的支持表，不是上游的真实能力。2026-11-03 批 BC 实测：ARK 4 个模型
+# 对 `reasoning_effort=high/low` 全部 200，0 / 40 条 502（原注释「ARK 不支持 → 502」今天不成立）；
+# 真实边界更窄，只有 glm-5.3 拒 none / minimal（400）和非法值 400。这个开关不动，别的上游还靠它；
+# 要放行某个参数用按调用的 `allowed_openai_params`（`route._do_call` 的 `/v1/responses` 路径）。
 litellm.drop_params = True
 
 # 关掉 SDK 直接 print() 到 stderr 的红色 banner（"Provider List: ..." /
@@ -190,21 +198,112 @@ def log_bridge_installed() -> bool:
 
 
 # ── 调用面（薄封装，签名与上游一致）──────────────────────────────────────────
+#
+# 批 AC2（MQ-P35 过渡）：BladeX **自身**的模型调用（蒸馏 / 裁决 / 链接…）不入 Hub，用量此前
+# 无处可查。三个出口各打**一处** `router_call_usage`（purpose / model / 规范化用量 / 耗时），
+# 让「BladeX 自己花了多少」能按日志复算。`purpose` 由调用方以关键字传入、这里先剥掉再转发；
+# 取值是下面的闭集（守卫 `tests/test_ac2_router_call_usage.py`：全仓直接调用点都显式传了它）。
+# 入 Hub 是 0.5.0 的事（拍板 (12)-c）；日志会轮转，所以这只是过渡。
+
+#: agent 的请求（主请求 + 内循环，都经 `route.call_model`）：本来就入 Hub，网关不再记一遍。
+PURPOSE_AGENT = "agent"
+#: 没传 purpose 的调用记成这个（守卫保证仓内不出现；第三方 / 漏网的调用照样留痕）。
+PURPOSE_UNKNOWN = "unknown"
+#: purpose 闭集。7 个 BladeX 自身调用点（批 AC 结算稿 §1.2）+ agent + 仓内脚本。
+PURPOSES = frozenset({
+    PURPOSE_AGENT,
+    "distill",          # distillation.LLMDistiller._distill_with（含重试）
+    "file_summary",     # distillation.summarize_file（含重试）
+    "adjudicate",       # adjudicator._complete_with_backoff
+    "link_judge",       # linking.judge_links（L4）
+    "assembly_review",  # assembly_review.router_judge（ADR-0033）
+    "consistency_judge",  # contradiction.RouterJudge（批 BB · 2b，矛盾标记，默认关）
+    "route_judge",      # route.MemoryAwareRouter.judge
+    "embedding",        # embedding.RouterEmbedAdapter（api 档）
+    "script",           # scripts/ 下的一次性工具与 bench
+})
+
+
+def _pop_purpose(kwargs: dict[str, Any]) -> str:
+    purpose = kwargs.pop("purpose", None)
+    if purpose is None:
+        return PURPOSE_UNKNOWN
+    if purpose not in PURPOSES:
+        raise ValueError(f"unknown Router call purpose {purpose!r}; "
+                         f"expected one of {sorted(PURPOSES)}")
+    return purpose
+
+
+def _note_call(purpose: str, kwargs: dict[str, Any], resp: Any, t0: float,  # noqa: ANN401
+               error: BaseException | None) -> None:
+    """`router_call_usage` 一行。用量 = `capture.usage_norm(usage_raw(resp.usage))`；拿不到 ⇒ None。"""
+    if purpose == PURPOSE_AGENT:
+        return
+    try:
+        from bladex_proxy.capture import (  # 延迟：capture 不该成为网关的 import 前置
+            usage_norm,
+            usage_raw,
+        )
+
+        usage = None
+        if resp is not None and error is None:
+            usage = resp.get("usage") if isinstance(resp, dict) else getattr(resp, "usage", None)
+        norm = usage_norm(usage_raw(usage))
+        _usage_log.info(
+            "router_call_usage", purpose=purpose, model=str(kwargs.get("model", "")),
+            ms=round((time.perf_counter() - t0) * 1000, 1), ok=error is None,
+            stream=bool(kwargs.get("stream")),
+            error=type(error).__name__ if error is not None else None, **norm)
+    except Exception as e:  # noqa: BLE001 —— 记账失败不能让调用失败
+        _usage_log.warning("router_call_usage_failed", purpose=purpose, error=str(e))
 
 
 async def acompletion(**kwargs: Any) -> Any:
     """异步 completion（流式/非流式都走这里）。返回上游原生对象。"""
-    return await litellm.acompletion(**kwargs)
+    purpose = _pop_purpose(kwargs)
+    t0 = time.perf_counter()
+    resp: Any = None
+    err: BaseException | None = None
+    try:
+        resp = await litellm.acompletion(**kwargs)
+        return resp
+    except BaseException as e:
+        err = e
+        raise
+    finally:
+        _note_call(purpose, kwargs, resp, t0, err)
 
 
 def completion(**kwargs: Any) -> Any:
     """同步 completion（consolidator 侧的蒸馏 / L4 裁决用；非热路径）。"""
-    return litellm.completion(**kwargs)
+    purpose = _pop_purpose(kwargs)
+    t0 = time.perf_counter()
+    resp: Any = None
+    err: BaseException | None = None
+    try:
+        resp = litellm.completion(**kwargs)
+        return resp
+    except BaseException as e:
+        err = e
+        raise
+    finally:
+        _note_call(purpose, kwargs, resp, t0, err)
 
 
 def embedding(**kwargs: Any) -> Any:
     """线上 embedding API（`BLADEX_EMBED_BACKEND=api` 档）。"""
-    return litellm.embedding(**kwargs)
+    purpose = _pop_purpose(kwargs)
+    t0 = time.perf_counter()
+    resp: Any = None
+    err: BaseException | None = None
+    try:
+        resp = litellm.embedding(**kwargs)
+        return resp
+    except BaseException as e:
+        err = e
+        raise
+    finally:
+        _note_call(purpose, kwargs, resp, t0, err)
 
 
 def retryable_error_types() -> tuple[type[BaseException], ...]:
@@ -218,3 +317,22 @@ def retryable_error_types() -> tuple[type[BaseException], ...]:
         if isinstance(t, type)
     )
     return named
+
+
+def is_transient_upstream_error(exc: BaseException) -> bool:
+    """上游**暂时**给不出答案：5xx / 429 / 超时 / 连接错误（不含其余 4xx）。
+
+    唯一实现点：热路径 failover（`route._is_failover_trigger`）与裁决器的退避
+    （批 AA · MQ-I35）共用。与"这次输入有问题"（400/401/解析失败）分开——
+    后者重试多少次都一样，前者等一等就好，**绝不能被当成判决**。
+    """
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        try:
+            code = int(status)
+        except (TypeError, ValueError):
+            code = None
+        if code is not None:
+            return code == 429 or code >= 500
+    named = retryable_error_types()
+    return bool(named) and isinstance(exc, named)

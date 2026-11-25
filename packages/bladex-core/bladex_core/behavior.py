@@ -659,7 +659,8 @@ def _ledger_facets(ledger_events: Iterable[Mapping], tombstoned: Mapping[str, fl
             f = per.setdefault(lid, {"creator": "", "created": None, "last": None,
                                      "status": "active", "verified": 0})
             wb = _writer_base(str(dump.get("last_writer") or ""))
-            if etype == "ledger_create":
+            # 批 CB：用户建的本只有 `ledger_user_edit` 没有 `ledger_create`；已有 created 时不变。
+            if etype in ("ledger_create", "ledger_user_edit"):
                 f["created"] = f["created"] or (_parse_ts(str(dump.get("created_at") or ""))
                                                 or ts)
             f["last"] = max(x for x in (f["last"], ts) if x) if (f["last"] or ts) else None

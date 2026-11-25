@@ -114,7 +114,7 @@ BladeX 的做法是：**一份任务状态、一种格式，放在代理层**。
 | **有任务状态，不只有事实** | ✅ 五段账本 | ❌ | ❌ |
 | **数据完全由你掌控** | ✅ 100% 在你自己的基础设施 | 取决于 Agent | 默认云端 |
 
-## 快速开始（v0.3.0）
+## 快速开始（v0.4.0）
 
 ### 环境要求
 
@@ -247,7 +247,7 @@ BladeX **只裁自己的**注入面来适应剩余预算——先裁切换候选
 请在**积累记忆之前**改成多语模型——事后再换需要全量重新嵌入：
 
 ```toml
-# config/routing.toml
+# config/bladex.toml
 [embedding]
 model = "intfloat/multilingual-e5-large"   # 2.24 GB，BladeX 的阈值就是在这个模型上标定的
 ```
@@ -258,7 +258,7 @@ embedding 模型默认在本机跑。机器跑不动（小 VPS、内存不够）
 ——配置项已经有了：
 
 ```toml
-# config/routing.toml
+# config/bladex.toml
 [embedding]
 backend = "api"
 model = "openai/text-embedding-3-small"   # Router 格式：provider/model
@@ -270,10 +270,24 @@ api_key_env = "OPENAI_API_KEY"             # 放密钥的环境变量名；密�
 
 - **隐私**：`api` 档下**每一条**蒸馏出的事实和**每一次**查询都会发给 embedding 服务商。BladeX 启动时会打
   `EMBED_API_PRIVACY` 提醒你。记忆必须留在本机的话，保持 `local`。
+  敏感层启用时，embedding 的 `api` 档会回落到本地（`local`）；strict 模式（`BLADEX_ROUTE_STRICT=true`）下则拒绝启动。
 - **换后端或换模型 = 换向量空间。** 要在记忆攒起来之前做；否则先停掉两个进程、跑一遍
   `python scripts/reembed_index.py`——不然 Memory Index 会因为模型不匹配拒绝启动。
 
 `api` 档不使用可选的 embedding 独立模块（`BLADEX_MODULE_EMBED`）；那个模块只用来在进程间共享一个**本地**模型。
+
+### embedding 配置放在哪
+
+embedding 配置已从 `config/routing.toml` 搬到 `config/bladex.toml`（`bladex init` 会生成，完整选项见
+`config/bladex.toml.example`）。每个键的优先级：`BLADEX_EMBED_*` 环境变量 > `config/bladex.toml` >
+`routing.toml [embedding]` > 默认值。
+
+`routing.toml` 里已有的 `[embedding]` 段至少再读一个版本。BladeX 每个进程打一次
+`config_embedding_section_deprecated`，`bladex doctor` 会列出要搬哪几行，但不会改你的文件。
+
+**回滚 0.3.0 前保留 `routing.toml` 的 `[embedding]` 段。** 0.3.0 只读那个文件，会静默忽略
+`config/bladex.toml`：没有旧段时 `backend` 回落到 `local`，`model` 回落到 Memory Index 盖章的模型（没有盖章就用默认模型）；
+`api` 档则会报 `engine changed` 拒绝启动。
 
 ## 我的数据存在哪里？
 
@@ -293,7 +307,7 @@ BladeX **绝不会把你的记忆发送给第三方服务器**。唯一的出站
 
 ## 功能特性
 
-### 核心（v0.3.0）
+### 核心（v0.4.0）
 
 - 🧾 **五段任务账本** —— Goal / Core / Verified / Open / Next；活过压缩、重启与跨 Agent 交接，
   Goal 归用户所有。做完的账本可以**关闭或标记被取代** —— Agent 用 `bladex_ledger_close`，你用
@@ -350,16 +364,27 @@ BladeX **绝不会把你的记忆发送给第三方服务器**。唯一的出站
 - `bladex memory tombstone-project` 这类耗时的管理命令改在 proxy 后台执行，不再卡住 proxy。
 - consolidator 空载轮的开销降到原来的约五分之一。
 
-### 下一步（0.4.0）
+### 0.4.0 已交付
+
+0.3.0 README「下一步」里列的每一条：
 
 - agent 自己压缩长对话之后，BladeX 仍把它当作同一个会话：账本保持绑定，轮次接着数。
-- 把一个任务交给另一个 agent：`bladex ledger handoff` 给出一页可携带的账本交接包；你也可以用
-  `bladex ledger create | edit` 自己建账本、改账本。
-- 互相矛盾的记忆会被标出来给你裁定，BladeX 不替你删。
+- 交接与导入可用：`bladex ledger handoff` 给出一页可携带的账本交接包；你也可以用
+  `bladex ledger create | edit` 自己建账本、改账本（dashboard 也有交接页）。
+- 互相矛盾的记忆可以被标出来给你裁定，BladeX 不替你删。该功能是实验性的、默认关闭（见「已知限制」）。
 - Codex 走 `/v1/responses` 时推理参数原样转发，输出里不再混入思考文本。
 - 全量重建可中断、可续跑，上游断网不作废，写入中途崩溃也不会留下写了一半的索引。
 
-## 已知限制（v0.3.0）
+### 下一步（0.5.0）
+
+**预告：0.5.0 对 Matter、事实检索、旧 Obsidian 导出是破坏性变更。**
+
+- 记忆围绕账本重建：没有账本的会话在停下来之后得到一页任务摘要，不再逐轮抽取零碎事实。
+- `bladex_memory_search` 搜的是账本与任务摘要，包括已经关掉的账本。
+- 一份你可以直接编辑的常驻笔记，放长期偏好与环境信息。
+- Obsidian 里看到并可编辑账本、任务摘要与常驻笔记。
+
+## 已知限制（v0.4.0）
 
 - 当前面向**个人自部署**优化 —— 企业多租户能力仍在开发中。
 - 账本工具面默认只对 `medium` / `strong` 档模型开（`BLADEX_LEDGER_TIERS`），或者本会话已经绑着
@@ -379,12 +404,36 @@ BladeX **绝不会把你的记忆发送给第三方服务器**。唯一的出站
   把那一行清空不会清空规则（保留原来的并告警）。
 - CLI 按当前目录（或 `BLADEX_HOME`）解析 `config/`、`data/`、`logs/`。在无关目录下跑
   `bladex status` 会看到一个空库——**数据没丢，只是你指错了地方**。
-- **还没有矛盾检测。** 两条互相冲突的事实可以同时存在于记忆里，不会被标出。
+- **矛盾标记是实验性功能，默认关闭。** 设 `BLADEX_CONTRADICTION_ENABLED=1` 并重启 consolidator 打开。
+  我们的测试里，标出的大约四条里只有一条是真矛盾（样本很小），所以多数是误报。开启后，每条新记忆会对每个相近的旧记忆各调用一次模型，
+  默认每天最多约 400,000 input token（`BLADEX_CONTRADICTION_DAILY_INPUT_TOKENS`）。它只标不删：不会替你删除或改动任何记忆。
+  用 `bladex memory conflicts` 查看，用 `bladex memory settle <pair> --verdict not_same_thing|confirmed` 逐条裁定。
+  只检查新写入的记忆，不回扫已有的。该功能的对象在 0.5.0 会调整。
 - **模型路由不使用你的记忆。** 路由由配置驱动（外加可选的 LLM 裁判）；记忆驱动的路由尚未实现。
-- **agent 自己压缩历史时**（如 Hermes 或 DeepSeek Harness 的长会话），BladeX 目前会把压缩后的下一个请求
-  当成新会话：轮次从头计，账本不再自动绑定。账本本身仍在 —— 它会作为切换候选提供给模型。
-- **Codex 上游是推理模型时**：`/v1/responses` 上的推理参数暂未转发，思考文本可能混进输出，
-  `apply_patch` 可能失败。
+- **Codex 的 `apply_patch` 需要目录声明。** 要让 Codex 经 BladeX 调用 `apply_patch`，它的模型目录里必须声明
+  `apply_patch_tool_type`；不声明时 Codex 改用 shell 改文件。`/v1/responses` 上的推理参数两种情况下都会转发。
+- **交接包不过滤个人信息。** `bladex ledger handoff` 把账本五段原样导出（凭证会被替换，个人信息不会），
+  导入的 Goal 是接手方模型会当作指令读的文字 —— 即提示注入面。导入前请先看一遍，不要导入来源不可信的包。
+- **还没有证据表明交接能省轮次。** 已有第一批测量，但没有有本 / 无本对照，所以 BladeX 不对「交接省了几轮」作任何说法。
+  三次构造出来的交接全部接上（Goal / Core 逐字，接手方没有重做），但三次都是 Codex 到 Codex，
+  没有一次是两个不同 agent 之间的真实交接。
+- **直接改账本 `.md` 文件，在下一次 agent 请求时才生效。** 改完文件后，BladeX 要等下一个请求进来才会读到改动；
+  系统空闲时在那之前不会有任何动静。
+- **子任务 / 子代理流量没有真实样本。** 账本在某些 agent 的子任务与压缩后的长任务、Claude Code 子代理、Codex 协作子任务上的行为，
+  还没有在真实流量上观察过。
+- **0.5.0 对 Matter、事实检索、旧 Obsidian 导出是破坏性变更。** 请不要在 Matter 页面或碎片级事实检索之上搭建工作流。
+- **重新找回旧账本有两处盲区。** 已关闭的账本只有在你的话与它共享稀有拉丁字母标识时才会重新列出，
+  所以用纯中文描述的周期性任务在关闭超过一天后不会被匹配；并且这项检查只对不超过 80 个字符的消息生效，
+  更长的消息不会把已关闭的旧账本带回来。
+- **并行会话可能被并成一个。** 一个运行中的会话转引了另一个运行中会话的产出时（例如 Hermes 的后台复盘），
+  BladeX 可能把它们当成同一个会话，账本作用域也可能随之串。这种情况少见、不会删除任何东西，但不是零。
+  该问题在内部登记为 MQ-A100。
+- **弱模型没有记忆兜底。** 不能调用工具的模型只看得到硬规则与账本块；BladeX 不会为它注入记忆摘要。
+- **dashboard 看不到会话接续。** 哪些请求被接到了哪个会话、为什么，目前只在 proxy 日志里；0.4.0 里 dashboard 没有对应面板。
+- **`deepseek-v4-flash` 的工具参数可能被截断。** 对部分单字符串参数的工具，模型会返回没有闭合的 JSON，
+  尾部带 `</｜DSML｜invoke>`（我们的测试里 13 次中有 3 次）。目前只有 `apply_patch` 这条路径会修复它，其它工具这次调用可能失败。
+- **embedding API：供应商侧换模型版本感知不到。** `backend = "api"` 时 BladeX 只知道模型名，
+  供应商在同名下换了模型，向量缓存不会失效。
 
 ## 许可证
 

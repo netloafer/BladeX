@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -616,7 +617,7 @@ class _FakeSocket:
 def _fake_connect(monkeypatch, connect_rc: int) -> None:
     from bladex_proxy.cli import lifecycle
 
-    # monkeypatch 打消费方子模块（CLAUDE.md 三包纪律）；`_probe_port` 住在 lifecycle
+    # monkeypatch 打消费方子模块（CLAUDE.md 三包纪律）；`_probe_port` 住在 doctor_cmd（批 LC）
     monkeypatch.setattr(lifecycle.socket, "socket", lambda *a, **k: _FakeSocket(connect_rc))
 
 
@@ -666,7 +667,8 @@ def test_recall_query_is_a_paraphrase_without_the_answer():
 def test_probe_port_free(monkeypatch):
     from bladex_proxy import cli
 
-    _fake_connect(monkeypatch, 1)
+    # 批 W33：要用真的「连接被拒」。这里曾写 1，那是 EPERM（沙箱），现在判「无法判定」
+    _fake_connect(monkeypatch, errno.ECONNREFUSED)
     state, detail = cli._probe_port("127.0.0.1", 38080)
     assert state == "free" and "free" in detail
 
@@ -680,8 +682,8 @@ def test_probe_port_in_use_by_our_proxy_is_not_a_warning(monkeypatch):
     from bladex_proxy import cli
 
     _fake_connect(monkeypatch, 0)
-    from bladex_proxy.cli import lifecycle as _lc  # F0.1 拆包：消费方在 cli/lifecycle.py
-    monkeypatch.setattr(_lc, "_probe_ready", lambda *a, **k: {"ready": True, "checks": {}})
+    from bladex_proxy.cli import doctor_cmd as _dc  # 批 LC：`_probe_port` 住在 cli/doctor_cmd.py
+    monkeypatch.setattr(_dc, "_probe_ready", lambda *a, **k: {"ready": True, "checks": {}})
     state, detail = cli._probe_port("127.0.0.1", 38080)
     assert state == "ours"
     assert "serving this proxy" in detail
@@ -692,8 +694,8 @@ def test_probe_port_in_use_by_stranger_still_warns(monkeypatch):
     from bladex_proxy import cli
 
     _fake_connect(monkeypatch, 0)
-    from bladex_proxy.cli import lifecycle as _lc  # F0.1 拆包：消费方在 cli/lifecycle.py
-    monkeypatch.setattr(_lc, "_probe_ready", lambda *a, **k: None)
+    from bladex_proxy.cli import doctor_cmd as _dc  # 批 LC：`_probe_port` 住在 cli/doctor_cmd.py
+    monkeypatch.setattr(_dc, "_probe_ready", lambda *a, **k: None)
     state, detail = cli._probe_port("127.0.0.1", 38080)
     assert state == "foreign"
     assert "not a BladeX proxy" in detail and "BLADEX_PORT" in detail

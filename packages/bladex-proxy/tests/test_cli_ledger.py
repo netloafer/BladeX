@@ -272,8 +272,8 @@ def test_ledger_show_404_prints_endpoint_detail(capsys, rec):
 def test_ledger_family_is_read_only(rec):
     """账本的作者是 agent 侧的模型，Goal 只有用户能改（ADR-0032 三红线）--
     CLI 命令族不得出现任何写动词。"""
-    write_verbs = ("create", "update", "delete", "forget", "write", "revise",
-                   "set", "edit", "add", "remove", "merge", "assign", "rename")
+    write_verbs = ("update", "delete", "forget", "write", "revise",
+                   "set", "add", "remove", "merge", "assign", "rename")
     command_names = set()
     for cmd in cli.ledger_app.registered_commands:
         if isinstance(cmd.name, str):
@@ -294,9 +294,13 @@ def test_ledger_family_is_read_only(rec):
     # 账本**对象**的生命周期写——只动 `status` / `superseded_by`，Goal 与五段正文一字不碰
     # （守卫见 test_ledger_lifecycle_z3.py / core test_ledger_lifecycle.py::test_close_never_touches_goal_or_sections），
     # 与 tombstone 同理不涉及作者边界；且三者互为撤销（追加式事件，reopen 撤 close）。
+    # `handoff`（批 CB）：导出只读；`--import` 新建一本账本，同 id 不覆盖。
+    # `create` / `edit`（批 CB，README 公开承诺，拍板 (41)）：**用户**写账本。这句 docstring 的
+    # 前提是"作者是模型"——而用户本来就能改 `.md`（ADR-0032 §4.1），Goal 也本就归用户。
+    # 模型的路仍只有工具面：HTTP 不收 origin=model，守卫见 test_cb_ledger_endpoints.py。
     assert set(command_names) <= {"list", "show", "doctor", "tombstone",
                                   "tombstone-memory", "close", "reopen",
-                                  "supersede"}, command_names
+                                  "supersede", "handoff", "create", "edit"}, command_names
     # 以及防御性断言：将来有人加写命令时，这里先炸。
     assert not (set(command_names) & set(write_verbs))
     # 全程只有 GET：跑一遍两个命令，录制桩里不允许出现非 GET。

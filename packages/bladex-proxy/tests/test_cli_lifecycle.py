@@ -6,11 +6,48 @@ sync 命令族回归由 test_sync_cli.py 钉住（typer 化后 main(argv) 签名
 from __future__ import annotations
 
 import os
+import re
 import socket
 from pathlib import Path
 
 import pytest
 from bladex_proxy import cli
+
+LIVE_PROXY_PORT = 38080  # ProxyConfig.port 的默认值，也是本机 live proxy 占着的端口
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.fixture
+def doctor_port(monkeypatch):
+    """doctor 探测的 proxy 端口指到一个空闲端口，并守住「没碰默认端口」（MQ-V43）。
+
+    `_probe_port` 先 connect_ex、端口被占再读 /ready，不隔离的话 doctor 用例直接碰到
+    本机 live proxy，结果还跟它在不在挂钩。connect 与 connect_ex 都记，结束时断言。
+    """
+    port = _free_port()
+    monkeypatch.setenv("BLADEX_PORT", str(port))
+    hits: list[int] = []
+    orig_connect, orig_connect_ex = socket.socket.connect, socket.socket.connect_ex
+
+    def _connect(self, address):  # type: ignore[no-untyped-def]
+        if isinstance(address, tuple):
+            hits.append(address[1])
+        return orig_connect(self, address)
+
+    def _connect_ex(self, address):  # type: ignore[no-untyped-def]
+        if isinstance(address, tuple):
+            hits.append(address[1])
+        return orig_connect_ex(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", _connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", _connect_ex)
+    yield port, hits
+    assert LIVE_PROXY_PORT not in hits, f"doctor 用例碰了 live proxy 端口：{hits}"
 
 
 @pytest.fixture(autouse=True)
@@ -128,7 +165,7 @@ def test_config_check_missing_env_file(_tmp_cwd: Path, capsys):
 # ── doctor ────────────────────────────────────────────────────────
 
 
-def test_doctor_reports_failures_without_crashing(_tmp_cwd: Path, capsys, monkeypatch):
+def test_doctor_reports_failures_without_crashing(_tmp_cwd: Path, capsys, monkeypatch, doctor_port):
     """无 redis / 无 env 的干净环境：doctor 给 ✗ + 修法、退出码 1、不崩。"""
     monkeypatch.setenv("BLADEX_REDIS_URL", "redis://127.0.0.1:1/0")  # 必不可达
     rc = cli.main(["doctor"])
@@ -137,6 +174,58 @@ def test_doctor_reports_failures_without_crashing(_tmp_cwd: Path, capsys, monkey
     assert "✗" in out
     assert "Redis" in out
     assert "fix:" in out
+
+
+def _doctor_output(capsys) -> tuple[int, str, list[str]]:
+    rc = cli.main(["doctor"])
+    # MQ-V48：日志行带时间戳，两次 doctor 跨秒就不一样（约 5% 假红），不进比较
+    lines = [ln for ln in capsys.readouterr().out.splitlines()
+             if not re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[", ln)]
+    port_lines = [ln for ln in lines if "Port" in ln]
+    return rc, "\n".join(port_lines), [ln for ln in lines if "Port" not in ln]
+
+
+def test_doctor_probes_the_configured_port_not_the_default(_tmp_cwd: Path, capsys, monkeypatch, doctor_port):
+    """MQ-V43：doctor 探的是配置的端口，默认端口 0 次（默认端口由 fixture 结束时断言）。"""
+    port, hits = doctor_port
+    monkeypatch.setenv("BLADEX_REDIS_URL", "redis://127.0.0.1:1/0")
+    cli.main(["doctor"])
+    assert port in hits
+    assert f"{port} free" in capsys.readouterr().out
+
+
+def test_doctor_result_same_whether_or_not_a_proxy_holds_the_port(_tmp_cwd: Path, capsys, monkeypatch, doctor_port):
+    """MQ-V43：proxy 不在 / 在（假 HTTP 服务占端口、答 /ready），除 Port 那一行外结果逐行相同。"""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Ready(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            data = json.dumps({"ready": True}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *_a):  # type: ignore[no-untyped-def]
+            pass
+
+    port, _ = doctor_port
+    monkeypatch.setenv("BLADEX_REDIS_URL", "redis://127.0.0.1:1/0")
+    rc_absent, port_absent, rest_absent = _doctor_output(capsys)
+    server = ThreadingHTTPServer(("127.0.0.1", port), _Ready)
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
+    try:
+        rc_present, port_present, rest_present = _doctor_output(capsys)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert f"{port} free" in port_absent
+    assert f"{port} serving this proxy" in port_present
+    assert rc_present == rc_absent == 1
+    assert rest_present == rest_absent
 
 
 # ── 生命周期 helpers ──────────────────────────────────────────────
@@ -431,6 +520,10 @@ def _fake_spawn(monkeypatch):
     from bladex_proxy.cli import lifecycle as _lc  # F0.1 拆包：消费方在 cli/lifecycle.py
     monkeypatch.setattr(_lc, "_consolidator_pid", lambda: None)  # 假装没在跑
     monkeypatch.setattr(_lc, "_pid_alive", lambda pid: True)
+    # 进程和存活判定都是替身，启动后那 1.5 s 观察期在这里只是干等（批 GT #7）
+    monkeypatch.setattr(_lc.time, "sleep", lambda _s: None)
+    # 假进程不写日志：等就绪日志直接到上限（批 W33）
+    monkeypatch.setattr(_lc, "_CONSOLIDATOR_READY_WAIT_S", 0.0)
     return _FakePopen
 
 
@@ -614,7 +707,7 @@ def _api_doctor_run(tmp_path, monkeypatch, *, model="openai/text-embedding-3-sma
     from types import SimpleNamespace
 
     from bladex_proxy import router_sdk
-    from bladex_proxy.cli import lifecycle
+    from bladex_proxy.cli import doctor_cmd
 
     if embed_fn is None:
         def embed_fn(**kwargs):
@@ -633,7 +726,7 @@ def _api_doctor_run(tmp_path, monkeypatch, *, model="openai/text-embedding-3-sma
             sensitivity_config=lambda: SimpleNamespace(enabled=sens_enabled)),
         index_path=str(index_dir))
     calls: list[tuple] = []
-    lifecycle._doctor_embedding(cfg, warmup,
+    doctor_cmd._doctor_embedding(cfg, warmup,
                                 lambda label, ok, detail="", fix="": calls.append((ok, detail, fix)))
     assert len(calls) == 1
     return calls[0]
@@ -690,7 +783,7 @@ def test_doctor_api_under_sensitivity_accepts_the_runtime_local_stamp(tmp_path, 
 
 
 def test_doctor_dispatch_sensitivity_forced_local_skips_probe_and_mismatch(
-        _tmp_cwd: Path, capsys, monkeypatch):
+        _tmp_cwd: Path, capsys, monkeypatch, doctor_port):
     """MQ-W12 判据①（经 doctor() 本体）：敏感层开 + toml 配 api ⇒
     ① _embed_api_probe 零外呼（敏感层的语义就是不外发，用 mock 计数断言）；
     ② 不报 mismatch（章=运行时真实 local 身份）；③ 一行说清被谁改写。"""
@@ -717,7 +810,7 @@ def test_doctor_dispatch_sensitivity_forced_local_skips_probe_and_mismatch(
     assert "sensitivity layer" in out
 
 
-def test_doctor_wires_api_backend_to_the_api_check(_tmp_cwd: Path, capsys, monkeypatch):
+def test_doctor_wires_api_backend_to_the_api_check(_tmp_cwd: Path, capsys, monkeypatch, doctor_port):
     """MQ-W13：backend=api 必须**经 doctor() 本体**走到 `_doctor_embed_api`。
 
     五条 G18.4 用例都直接驱动那个函数——把 doctor() 里的 `elif backend == "api"`
@@ -749,9 +842,9 @@ def _doctor_cfg(tmp_path, **over):
 
 def _doctor_verdict(cfg):
     """doctor 的 embedding 段对这份配置的结论：(全部 ok?, 各条 detail)。"""
-    from bladex_proxy.cli import lifecycle
+    from bladex_proxy.cli import doctor_cmd
     calls: list[tuple] = []
-    lifecycle._doctor_embedding(cfg, False,
+    doctor_cmd._doctor_embedding(cfg, False,
                                 lambda label, ok, detail="", fix="": calls.append((ok, detail)))
     return all(ok for ok, _ in calls), [d for _, d in calls]
 

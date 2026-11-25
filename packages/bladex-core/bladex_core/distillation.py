@@ -273,6 +273,26 @@ class PassthroughDistiller:
     def prompt_ver(self) -> str:
         return "passthrough"
 
+    def stats(self) -> dict[str, int | str]:
+        """MQ-W42：与 `LLMDistiller.stats()` 同键的空计数。
+
+        consolidator 在每个有产出的批次收尾处读 `distiller.stats()`；模型池为空
+        走透传时缺这个方法 ⇒ AttributeError ⇒ `index_consolidator_error` + 心跳
+        state=error + 退避（fact 已写、状态却报错）。键集由
+        `test_mq_w42_passthrough_stats.py` 与 `LLMDistiller.stats()` 对账。
+        """
+        return {
+            "calls": 0,
+            "fails": 0,
+            "parse_fails": 0,
+            "length_fails": 0,
+            "length_salvaged": 0,
+            "ledger_hits": 0,
+            "model": "passthrough",
+            "prompt_ver": "passthrough",
+            "turn_prompt_ver": "passthrough",
+        }
+
     def distill(self, user_message: str) -> DistillOutput:
         if not user_message or not user_message.strip():
             return DistillOutput()

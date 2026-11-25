@@ -298,8 +298,12 @@ EVIDENCE_MIN_CHARS = 2
 
 
 def _norm_evidence(text: str) -> str:
-    # 空白折叠 + casefold：模型摘录时换行/多空格/大小写的出入不算编造。
-    return " ".join(str(text or "").split()).casefold()
+    # 去掉**全部**空白 + casefold：模型摘录时换行 / 多空格 / 大小写 / 中英边界空格的出入
+    # 不算编造（MQ-L130：用户原话「如果摆在 iPhone」vs 摘录「如果摆在iPhone」曾因一个空格判 False）。
+    # 选「全去」而非「只去中英边界空格」：后者要先定义边界（数字？标点？全角空格？），
+    # 漏一类就复发；全去的代价是理论上「ab c」与「a bc」撞同，而举证本就是子串观测（只影响
+    # `evidence_ok`、不拦任何动作），且证据最短 2 字，这点误放可忽略。
+    return "".join(str(text or "").split()).casefold()
 
 
 def verify_switch_evidence(evidence: str, user_text: str) -> bool | None:
@@ -841,7 +845,7 @@ def _is_latin_unit(u: str) -> bool:
 # 判据与 `scripts/probe_ledger_files.py` **同一个定义点**（`looks_like_path` 从那里
 # 下沉到这里，探针改 import）——两份判据迟早分叉，那是本仓反复付过学费的形状。
 
-#: 末段必须带扩展名。`/Users/jasonye` 与 `…/site-packages` 因此出局。
+#: 末段必须带扩展名。`/Users/alice` 与 `…/site-packages` 因此出局。
 #: 代价 = 无扩展名的真文件（`Makefile`）漏掉——与"宁可漏不可错"的既定口径一致：
 #: 假阳性污染判据，漏报只是少一条证据。`\w` 在 str 模式下含 CJK，故中文文件名照收。
 _LOOKS_LIKE_FILE = None
@@ -906,11 +910,66 @@ def path_like_units(text: str) -> frozenset[str]:
     return frozenset(out)
 
 
-#: 批 HO（MQ-L99）：已关账本进相关性段的时间窗——关闭时刻距本轮 ≤ 此值才列。
+#: 批 HO（MQ-L99）：已关账本进相关性段的**无条件**时间窗——关闭时刻距本轮 ≤ 此值，按内容命中就列。
+#: 🔴 批 L116 · 2b 起含义收窄为「无条件列出的时长」：超过它的已关本不再一律不列，而是只在**强命中**
+#: 时列（见 `CLOSED_STRONG_*`；L115：周期性重复的同一件事隔 16 天再做，旧本按设计不可见）。
 #: 值沿用 E4（MQ-L98）「本会话近期关闭」小节的 24 h（那一节已并入相关性段，见
 #: `agency/runtime.py`）；30 天回放读数：「回到那件事」4 条全在关后 1 h 内，
 #: 24 h 之外的新增条目全是「新的同类事 / 无关」（`report-batch-HO-20261015.md` §3）。
 CLOSED_MATCH_WINDOW_S = 24 * 3600.0
+
+#: 批 L116 · 2b（MQ-L115，拍板 (76)）：关闭超过 `CLOSED_MATCH_WINDOW_S` 的久关本的**强命中**条件。
+#: 调度口径（拍板 (73)）：同一主体、同一动作、隔一段时间再做一次 = 同一本；BladeX 不自动重开，只保证模型在候选里
+#: 看得到它。强命中 = 与用户话共享至少一个**稀有拉丁标识**（df ≤ rare_df；`dsh` 这类）∧ 未取整分 ≥ 本值
+#: （30 天回放 W_B 口径，`report-batch-L116-20261106.md` §3/§10；纯中文主题的久关本不满足，已知边界）。
+CLOSED_STRONG_MIN_SCORE = 0.40
+#: 长度闸门（**过渡兜底**，拍板 (76)）：用户话（剥信封后、`relevant_ledgers` 收到的 `user_text`）超过本值时，
+#: 久关本不列。原因：今天没被识别成机器文本的信封（hermes 中断信封 / CC 压缩请求 / dsh 子代理回报等）
+#: 会触发久关本召回——30 天回放里这类机器行 109–624 字、人话行 16–107 字（只差 2 字符，刻度对着样本定，
+#: 不是机制）。批 DA 修好信封识别后重评，目标是放宽或去掉；日志 `closed_gt24h_gated_by_len` 就是为此留的读数。
+CLOSED_STRONG_MAX_USER_CHARS = 80
+
+#: 批 DA · E（MQ-L125，拍板 (120)）：短话 + 共享稀有拉丁标识 ⇒ 放行 `min_score`。
+#: 病例：用户话里三个横跨词边界的 CJK 2-gram 把分母抬高，`freetoken`（池内唯一）自己只占 0.262 < 0.30，
+#: 同主题旧本因此不进候选。放行条件 = 共享的拉丁单元 df ≤ 本值 ∧ 用户话 ≤ `CLOSED_STRONG_MAX_USER_CHARS`
+#: （同一长度闸门，不另立数字）；稀有锚 / shared / 状态 / 关闭规则照旧。纯 CJK 主题不在范围（MQ-L118）。
+LATIN_WAIVE_MAX_DF = 2
+#: 放行的分数下限（同批，gate 暴露）：10-15 交接池上「codex 刚才在…」共享的 `codex`（agent 名，df=2）会把两本
+#: 分 0.09 的无关账本带进来——放行只该补「分母被横跨词边界的 CJK 2-gram 稀释」的同主题本（本案 0.262），
+#: 不该把「只撞了一个名字」的本也列出。取值依据 = 0.09（噪声）与 0.262（本案）之间的空档，live 读数后再校准。
+LATIN_WAIVE_MIN_SCORE = 0.20
+
+
+#: 批 L116 · 2a（MQ-L116）：整条「连续命中片段」在池里算「极稀有」的账本数上限。
+#: 来历：用户话里一句常用约束套话（「不做任何动作」）按重叠 2-gram 拆成 5 个单元，df 4–7 落在
+#: `rare_df` 内，一句话同时过稀有锚和 shared≥2 两道门，4 本不相干的调研账本因此 0.45 压过真正同主题的
+#: 0.44（`report-task-l115-20261106.md` §3.2）。修法 = 相邻重叠且都命中的 2-gram 合为一条**链**，
+#: 一条链计 1 个单元；链若整条在池里只出现在 ≤ 本值本账本里（即这句话几乎是这件事独有的），
+#: 计 `min(链长, 2)`——否则「长整句逐字命中」（批 HO 旗舰病例，0.91，shared 9）会被误降成 1。
+#: 取值依据 = 30 天回放扫描（`report-batch-L116-20261106.md` §8）：本例排第 1 且 HO 旗舰 / 泰山 / BA1b 全保留的
+#: 区间里最保守（最小）的值。只会比逐个 2-gram 计数更严、不会更松。
+CHAIN_RARE_DF = 2
+
+
+def _hit_chains(text: str, hit: set[str]) -> list[tuple[str, ...]]:
+    """query 原文里的 CJK 2-gram 链：按出现顺序相邻（重叠）且**全部在 `hit` 里**的最长段，去重。
+
+    停表 2-gram 不在 `hit` ⇒ 自然断链；顺序取原文（`candidate_units` 是集合，丢了位置）。"""
+    import re
+    chains: set[tuple[str, ...]] = set()
+    for run in re.findall(r"[一-鿿]+", (text or "").lower()):
+        cur: list[str] = []
+        for i in range(len(run) - 1):
+            g = run[i:i + 2]
+            if g in hit:
+                cur.append(g)
+                continue
+            if cur:
+                chains.add(tuple(cur))
+            cur = []
+        if cur:
+            chains.add(tuple(cur))
+    return sorted(chains)
 
 
 @dataclass(frozen=True)
@@ -922,6 +981,8 @@ class LedgerMatch:
     #: 批 HO（MQ-L99）：命中的是一本**已关**的账本。渲染方据此标 `[closed …]`；
     #: 切过去 = 重开（`_h_ledger_switch` 的既有路径）。
     closed: bool = False
+    #: 未取整的分（只给探针的分差判定用；渲染与排序用 `score`）。
+    score_raw: float = 0.0
 
 
 def relevant_ledgers(pool: dict[str, Ledger], user_text: str, *,
@@ -931,6 +992,9 @@ def relevant_ledgers(pool: dict[str, Ledger], user_text: str, *,
                      include_closed: bool = True,
                      closed_window_s: float | None = CLOSED_MATCH_WINDOW_S,
                      include_superseded: bool = False,
+                     chain_rare_df: int | None = CHAIN_RARE_DF,
+                     closed_strong: bool = True,
+                     diag: dict[str, int] | None = None,
                      now_ms: float | None = None) -> list[LedgerMatch]:
     """按当前用户话找"像同一件事"的账本（MQ-L38 相关性位）。
 
@@ -943,7 +1007,13 @@ def relevant_ledgers(pool: dict[str, Ledger], user_text: str, *,
       归一后 score 0.47，但这些词池里人人都有——没有一个"只有这件事才有"的词，
       就不是同一件事（沙盒回放实测，去掉这条即误召）。
     - 拉丁 token 交集**按 2 计**：`freetoken` 这类唯一标识一个就够定一件事；
-      纯 CJK 仍要 ≥2 个 2-gram（单个 2-gram 太容易撞）。
+      纯 CJK 仍要 ≥2 个单元（单个 2-gram 太容易撞）。
+    - 🔴 **CJK 单元按「连续命中的链」计，不按逐个 2-gram 计**（MQ-L116，批 L116 · 2a）：query 里相邻重叠且
+      都命中的 2-gram 合成一条链，**一条链 = 1 个单元**（一个 N 字短语拆出 N-1 个重叠 2-gram，
+      逐个计是 N-1 倍的虚高）；链若整条在池里至多出现在 `chain_rare_df` 本账本里（含该链全部 2-gram 的账本数），
+      计 `min(链长, 2)`。**稀有锚与 shared 计数用同一套链**：锚 = 命中的拉丁单元或某条链里有 df ≤ rare_df
+      的 2-gram（与逐个计数时等价，链只改 shared，不改谁有锚）。`chain_rare_df=None` = 旧的逐个 2-gram 计数，
+      只给探针 / 阴性对照臂用；`0` = 纯链合并（不做极稀有例外），同样只给对照用。
     - 🔴 **`closed` 账本按内容命中时照列，带 `closed=True`**（批 HO，MQ-L99，2026-10-15；
       推翻批 Z · Z3 的「closed 不列」）。Z3 的理由是「close 是有人明确说了结束，再推到模型
       面前等于替它翻案」——这对**没有内容依据**的 recency 段仍成立（那一段照旧排除 closed，
@@ -961,24 +1031,40 @@ def relevant_ledgers(pool: dict[str, Ledger], user_text: str, *,
       （探针 / 阴性对照）用；`now_ms` 缺省取当前时刻（探针回放传该轮时刻）。
       idf / 稀有锚仍按**全池**算——关掉一本不改变其它账本的得分（Z3 判据 ② 的阴性对照）。
       排除激活本。
+    - 🔴 **久关本强命中**（批 L116 · 2b，MQ-L115）：关闭超过 `closed_window_s` 且未被取代、有 `closed_at` 的已关本，
+      只在**强命中**时列：共享稀有拉丁标识 ∧ 未取整分 ≥ `CLOSED_STRONG_MIN_SCORE` ∧ 用户话不超过
+      `CLOSED_STRONG_MAX_USER_CHARS`（长度闸门，过渡兜底）。它们与开着的、≤ 窗口的账本**一起竞争 `top_n`**，
+      不单独留位。≤ 窗口 / 被取代 / 开着的账本行为与 2a 逐项一致。`closed_strong=False` = 2a 口径（久关本恒不列），
+      只给对照臂 / 阴性对照用；`closed_window_s=None` = 任何已关本都列（W_all 对照臂）。
+    - 🔴 **短话稀有拉丁标识放行分数门**（批 DA · E，MQ-L125）：共享至少一个拉丁单元且其 df ≤ `LATIN_WAIVE_MAX_DF`、
+      用户话 ≤ `CLOSED_STRONG_MAX_USER_CHARS` ∧ 分 ≥ `LATIN_WAIVE_MIN_SCORE` ⇒ 不受 `min_score` 约束（分数照算照记）。`diag["score_gate_waived"]`
+      = 本次列出项里靠这条放行的条数。
+      `diag`（传入则填）：`closed_old_listed` = 本次列出的久关本条数；`closed_old_gated_by_len` = 内容上强命中、
+      仅因长度闸门没列的久关本条数（= 去掉闸门会多列的，按 `top_n` 之后算）。
     - 返回按 score 降序前 `top_n`；query 无有效单元 ⇒ 空（不猜）。
     """
     import math
+    if diag is not None:
+        diag["closed_old_listed"] = diag["closed_old_gated_by_len"] = 0
+        diag["score_gate_waived"] = 0
     q = candidate_units(user_text)
     if not q or not pool:
         return []
     _now = time.time() * 1000.0 if now_ms is None else now_ms
 
-    def closed_listable(led: Ledger) -> bool:
+    #: "listable" 三态：always = 无条件列；strong = 久关本，须强命中；never = 不列
+    def closed_class(led: Ledger) -> str:
         if not include_closed:
-            return False
+            return "never"
         if led.superseded_by and not include_superseded:
-            return False
+            return "never"
         if closed_window_s is None:
-            return True
+            return "always"
         if not led.closed_at:
-            return False
-        return 0 <= _now - iso_ms(led.closed_at) <= closed_window_s * 1000.0
+            return "never"
+        if 0 <= _now - iso_ms(led.closed_at) <= closed_window_s * 1000.0:
+            return "always"
+        return "strong" if closed_strong else "never"
 
     docs: list[tuple[str, str, set[str]]] = []
     df: dict[str, int] = {}
@@ -998,21 +1084,62 @@ def relevant_ledgers(pool: dict[str, Ledger], user_text: str, *,
     if denom <= 0:
         return []
     out: list[LedgerMatch] = []
+    old_gated: list[LedgerMatch] = []     # 内容上强命中、仅因长度闸门没列
+    len_ok = len((user_text or "").strip()) <= CLOSED_STRONG_MAX_USER_CHARS
+    waived_ids: set[str] = set()          # 靠「短话稀有拉丁」放行（本该被 min_score 挡）
     for lid, title, units in docs:
         closed = pool[lid].status == STATUS_CLOSED
-        if lid == exclude_id or (closed and not closed_listable(pool[lid])):
+        cls = closed_class(pool[lid]) if closed else "always"
+        if lid == exclude_id or cls == "never":
             continue
         shared_units = q_seen & units
         if not shared_units:
             continue
         if require_rare_anchor and not any(df[u] <= rare_df for u in shared_units):
             continue
-        shared = sum(2 if _is_latin_unit(u) else 1 for u in shared_units)
+        if chain_rare_df is None:
+            shared = sum(2 if _is_latin_unit(u) else 1 for u in shared_units)
+        else:
+            cjk_hit = {u for u in shared_units if not _is_latin_unit(u)}
+            shared = 2 * (len(shared_units) - len(cjk_hit))
+            for ch in _hit_chains(user_text, cjk_hit):
+                n_with_chain = sum(1 for _l, _t, us in docs if cjk_hit_all(ch, us))
+                shared += min(len(ch), 2) if n_with_chain <= chain_rare_df else 1
         score = sum(idf(u) for u in shared_units) / denom
-        if shared >= min_shared and score >= min_score:
-            out.append(LedgerMatch(lid, title, round(score, 2), shared, closed))
+        waive = (len_ok and LATIN_WAIVE_MIN_SCORE <= score < min_score
+                 and any(_is_latin_unit(u) and df[u] <= LATIN_WAIVE_MAX_DF for u in shared_units))
+        if shared >= min_shared and (score >= min_score or waive):
+            if cls == "strong":
+                strong = (score >= CLOSED_STRONG_MIN_SCORE
+                          and any(_is_latin_unit(u) and df[u] <= rare_df for u in shared_units))
+                if not strong:
+                    continue
+                if not len_ok:
+                    old_gated.append(LedgerMatch(lid, title, round(score, 2), shared, closed, score))
+                    continue
+            out.append(LedgerMatch(lid, title, round(score, 2), shared, closed, score))
+            if waive:
+                waived_ids.add(lid)
     out.sort(key=lambda m: (-m.score, -m.shared, m.ledger_id))
-    return out[:top_n]
+    top = out[:top_n]
+    if diag is not None:
+        diag["score_gate_waived"] = sum(1 for m in top if m.ledger_id in waived_ids)
+
+        def _is_old(m: LedgerMatch) -> bool:
+            led = pool[m.ledger_id]
+            return bool(m.closed and led.closed_at and closed_window_s is not None
+                        and _now - iso_ms(led.closed_at) > closed_window_s * 1000.0)
+        diag["closed_old_listed"] = sum(1 for m in top if _is_old(m))
+        # 去掉闸门会多列的：把被闸门挡的并回去，看它们能不能挤进 top_n
+        merged = sorted(out + old_gated, key=lambda m: (-m.score, -m.shared, m.ledger_id))[:top_n]
+        gated_ids = {m.ledger_id for m in old_gated}
+        diag["closed_old_gated_by_len"] = sum(1 for m in merged if m.ledger_id in gated_ids)
+    return top
+
+
+def cjk_hit_all(chain: tuple[str, ...], units: set[str]) -> bool:
+    """链里每个 2-gram 都在 `units` 里。"""
+    return all(g in units for g in chain)
 
 
 def session_of_turn_key(turn_key: str) -> str:
@@ -1150,6 +1277,9 @@ def turn_activation_scope(timeline: dict[str, list[tuple[float, str]]], turn_key
     agent = agent_of_turn_key(turn_key)
     if not agent:
         return ""
+    # 批 BA2：老轮次存的是旧项目键，时间轴已在 `load_ledger_events` 翻成现行键——两边同一张表。
+    from .project import canonical_project_id  # noqa: PLC0415
+    project_id = canonical_project_id(project_id)
     if project_id and turn_key_ts_ms(turn_key) < project_scope_since(timeline):
         project_id = ""
     return activation_scope(agent, project_id)

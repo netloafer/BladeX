@@ -114,7 +114,7 @@ def test_file_entry_caps():
 
 def test_project_id_deterministic():
     assert project_id_for("/dev/BladeX") == project_id_for("/dev/BladeX")
-    assert len(project_id_for("/dev/BladeX")) == 12
+    assert len(project_id_for("/dev/BladeX")) == 14   # 批 BA2：与 git-root 档同公式
 
 
 def test_infer_root_from_rulefile():

@@ -24,8 +24,8 @@ import structlog
 from bladex_proxy.capture import (
     CaptureResult,
     cache_read_tokens,
-    extract_usage,
     note_cache_reading,
+    note_usage,
     record_first_chunk,
     round_fields,
     warn_bare_reasoning,
@@ -621,26 +621,27 @@ async def anthropic_stream_generator(
                     result.finish_reason = str(choice.finish_reason)
                     stop_reason = _STOP_REASON_MAP.get(choice.finish_reason, "end_turn")
 
-                # usage（某些 chunk 带 usage）
-                chunk_usage = getattr(chunk, "usage", None)
-                if chunk_usage:
-                    # MQ-P20：上游真值优先，但**只在它真的是个正整数时**才覆盖估计值——
-                    # `getattr(obj, "prompt_tokens", 默认)` 在字段存在且为 None 时返回 None，
-                    # 会把估计值抹成 None ⇒ 又变回"客户端读不到用量"。
-                    _pt = getattr(chunk_usage, "prompt_tokens", None)
-                    if isinstance(_pt, int) and _pt > 0:
-                        input_tokens = _pt
-                    _ct = getattr(chunk_usage, "completion_tokens", None)
-                    if isinstance(_ct, int):
-                        output_tokens = _ct
-                    # MQ-P22：同上，此前这条路径不灌 `result.usage`。
-                    result.usage = extract_usage(chunk_usage)
-                    _cr = _cache_read_tokens(chunk_usage)
-                    if _cr is not None:
-                        cache_read_tokens = _cr
-
             except (AttributeError, IndexError, KeyError) as e:
                 logger.debug("anthropic_chunk_skip", error=str(e))
+            # 批 AC：usage 收在 `choices[0]` 的 try **之外**——OpenAI 原生形态的收尾块是
+            # `choices=[]` + usage，放在里面会被 IndexError 一并跳过（chat 的 `capture_stream`
+            # 一直在外面；Router 目前给 choices=1 的空 delta，所以 live 还没踩到）。
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage:
+                # MQ-P20：上游真值优先，但**只在它真的是个正整数时**才覆盖估计值——
+                # `getattr(obj, "prompt_tokens", 默认)` 在字段存在且为 None 时返回 None，
+                # 会把估计值抹成 None ⇒ 又变回"客户端读不到用量"。
+                _pt = getattr(chunk_usage, "prompt_tokens", None)
+                if isinstance(_pt, int) and _pt > 0:
+                    input_tokens = _pt
+                _ct = getattr(chunk_usage, "completion_tokens", None)
+                if isinstance(_ct, int):
+                    output_tokens = _ct
+                # MQ-P22：同上，此前这条路径不灌 `result.usage`。
+                note_usage(result, chunk_usage)
+                _cr = _cache_read_tokens(chunk_usage)
+                if _cr is not None:
+                    cache_read_tokens = _cr
 
         result.done = True
 

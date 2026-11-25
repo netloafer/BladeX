@@ -58,9 +58,8 @@ def inline_think_leaked(text: str) -> bool:
 def warn_inline_think(text: str, path: str) -> bool:
     """守卫：正文出现 `<think>`/`</think>` 即告警，返回是否命中（**唯一实现点**）。
 
-    只告警、不改正文 —— 剥离与否要等 MQ-P18 的两份抓包（出站请求体 / 上游响应体）
-    定了修法再动；在那之前**先让它可见**，否则下一次 `apply_patch` 全程 abort
-    依旧只能靠人眼在 codex 终端里发现。
+    这一层只是读数（看上游原文）：批 BC 起 `/v1/responses` 的剥离由 `split_inline_reasoning` 做，
+    这条告警继续打，用来量「上游还在不在漏」；chat / messages 路径仍只告警不改正文。
     """
     if not inline_think_leaked(text):
         return False
@@ -71,6 +70,164 @@ def warn_inline_think(text: str, path: str) -> bool:
         markers=[m for m in INLINE_THINK_MARKERS if m in text],
     )
     return True
+
+
+# ── 批 BC §2.2（README ④「no thinking text leaks」）：孤立 `</think>` 按结构剥离 ─────
+#
+# 只认结构，不认语义。每条规则对应 Hub 26,907 轮里 43 轮带标记的形状：
+#   1. 代码区内不算：围栏（行首 ≥3 个反引号，至配对或文末）+ 行内反引号（至配对的同长串或换行）。
+#      真实病例「默认先 `<think>` 再回答」就在反引号里，要逐字保留。
+#   2. 代码区外、前面没有未闭合 `<think>` 的 `</think>` 是**孤立闭标签**：最后一个之前的内容 =
+#      思考前缀（进 reasoning），之后 = 正文；标记本身不留（原则 13 登记的具名有损，见下）。
+#   3. 代码区外的 `<think>`：全库 0 例 ⇒ 不剥，只进 stats（不为没见过的形态写逻辑）；
+#      与它配对的 `</think>` 也不算孤立。
+#   4. 无标记的裸散文不动（MQ-P29 判据只当读数：抽读 33 条命中，绝大多数是真实回答）。
+#
+# 🔴 具名有损（原则 13）：`</think>` 这 8 个字符从正文和 reasoning 里都消失，
+# 轮次留 `inline_reasoning_stripped` 计数；前缀本身换字段入库，不丢。
+# ⚠️ 已知边界：行内反引号按「到换行为止」算（流式当下必须能判定，没法等后文确认它闭没闭合）。
+# 所以 ① 不带反引号、句中裸写 `</think>` 的合法正文会被切（全库 0 例）；
+# ② 同一行有落单反引号时，它后面的 `</think>` 不剥（宁留勿误删）。
+THINK_OPEN = "<think>"
+THINK_CLOSE = "</think>"
+#: 流式最多扣留的尾部字符数 = 标记长度。
+_THINK_MAX_HOLD = len(THINK_CLOSE)
+
+
+@dataclass
+class InlineReasoningStats:
+    """一段正文的剥离读数（`inline_reasoning_stripped` 的字段来源）。"""
+    orphan_closes: int = 0     # 剥掉的孤立 `</think>` 个数
+    open_tags: int = 0         # 代码区外的 `<think>` 个数（不剥，只告警）
+
+
+class InlineThinkFilter:
+    """孤立 `</think>` 的增量状态机（`split_inline_reasoning` 与流式共用这一份，判定不会分叉）。
+
+    `feed` / `flush` 返回「可以放行的文本段」，段之间的 `None` 表示那里吃掉了一个孤立闭标签。
+    只扣留还判不了的尾部：可能是标记前缀的 `<…`（≤ 8 字符），或可能还没结束的反引号串。
+    """
+
+    def __init__(self) -> None:
+        self.stats = InlineReasoningStats()
+        self._pending = ""          # 还判不了的尾部
+        self._fence = 0             # >0 = 在围栏里，值是开栏反引号数
+        self._inline = 0            # >0 = 在行内代码里，值是开串反引号数
+        self._line_start = True     # 只见过 ≤3 个空格的行首
+        self._indent = 0
+        self._depth = 0             # 未闭合的 `<think>` 个数
+
+    def feed(self, text: str) -> list[str | None]:
+        return self._scan(self._pending + text, final=False)
+
+    def flush(self) -> list[str | None]:
+        """把扣留的尾部判完放行（流结束 / 工具调用要关 message 时）。状态保留。"""
+        return self._scan(self._pending, final=True)
+
+    def _scan(self, buf: str, *, final: bool) -> list[str | None]:
+        self._pending = ""
+        out: list[str | None] = []
+        text_start = 0
+        i, n = 0, len(buf)
+        while i < n:
+            ch = buf[i]
+            if ch == "`":
+                j = i
+                while j < n and buf[j] == "`":
+                    j += 1
+                if j == n and not final:      # 反引号串可能还没结束
+                    break
+                self._on_backticks(j - i)
+                i = j
+                continue
+            if ch == "\n":
+                self._inline = 0
+                self._line_start, self._indent = True, 0
+                i += 1
+                continue
+            if ch == " " and self._line_start and self._indent < 3:
+                self._indent += 1
+                i += 1
+                continue
+            self._line_start = False
+            if ch != "<" or self._fence or self._inline:
+                i += 1
+                continue
+            tail = buf[i:i + _THINK_MAX_HOLD]
+            if tail.startswith(THINK_CLOSE):
+                if self._depth:
+                    self._depth -= 1
+                else:
+                    self.stats.orphan_closes += 1
+                    if i > text_start:
+                        out.append(buf[text_start:i])
+                    out.append(None)
+                    text_start = i + len(THINK_CLOSE)
+                i += len(THINK_CLOSE)
+                continue
+            if tail.startswith(THINK_OPEN):
+                self._depth += 1
+                self.stats.open_tags += 1
+                i += len(THINK_OPEN)
+                continue
+            if (not final and len(tail) < _THINK_MAX_HOLD
+                    and (THINK_CLOSE.startswith(tail) or THINK_OPEN.startswith(tail))):
+                break
+            i += 1
+        if i > text_start:
+            out.append(buf[text_start:i])
+        self._pending = buf[max(i, text_start):]
+        return out
+
+    def _on_backticks(self, run: int) -> None:
+        at_line_start, self._line_start = self._line_start, False
+        if self._fence:
+            if at_line_start and run >= self._fence:
+                self._fence = 0
+            return
+        if self._inline:
+            if run == self._inline:
+                self._inline = 0
+            return
+        if at_line_start and run >= 3:
+            self._fence = run
+        else:
+            self._inline = run
+
+
+def split_inline_reasoning(text: str) -> tuple[str, str, InlineReasoningStats]:
+    """正文 → `(思考前缀, 干净正文, stats)`（**唯一实现点**，纯函数，幂等）。
+
+    没有孤立闭标签时前缀为空、正文逐字不变。切开时思考前缀去尾部空白，正文去开头空白。
+    """
+    if THINK_CLOSE not in text and THINK_OPEN not in text:
+        return "", text, InlineReasoningStats()
+    flt = InlineThinkFilter()
+    segments = flt.feed(text) + flt.flush()
+    if not flt.stats.orphan_closes:
+        return "", text, flt.stats
+    last = len(segments) - 1 - segments[::-1].index(None)
+    prefix = "".join(s for s in segments[:last] if s is not None)
+    clean = "".join(s for s in segments[last + 1:] if s is not None)
+    return prefix.rstrip(), clean.lstrip(), flt.stats
+
+
+def merge_inline_reasoning(structured: str, prefix: str) -> str:
+    """结构化思考 + 正文里剥出来的前缀 → 入 Hub 的 `reasoning_text`（内容换字段，不丢）。"""
+    if not prefix:
+        return structured
+    return f"{structured}\n{prefix}" if structured else prefix
+
+
+def note_inline_reasoning_stripped(stats: InlineReasoningStats, prefix: str, clean: str,
+                                   rc_before: int, path: str) -> None:
+    """有孤立闭标签被吃 / 见到代码区外开标签时的可 grep 读数（**唯一实现点**）。"""
+    if stats.orphan_closes:
+        logger.warning("inline_reasoning_stripped", path=path, markers=stats.orphan_closes,
+                       chars=len(prefix), clean_len=len(clean), rc_before=rc_before)
+    if stats.open_tags:
+        logger.warning("inline_think_open_tag_kept", path=path, open_tags=stats.open_tags,
+                       hint="paired <think> outside code is not stripped; 0 live cases so far")
 
 
 #: MQ-P29 的判据阈值：正文超过这个字符数、且同轮结构化 reasoning 为 0 ⇒ 可疑形态。
@@ -122,6 +279,7 @@ class CaptureResult:
     # T4(ADR-0018 §4.4 C1/C2/C6): 响应侧元数据
     reasoning_text: str = ""                   # C1: delta.reasoning_content 累积
     usage: dict = field(default_factory=dict)  # C2: {prompt, completion, total}
+    usage_raw: dict = field(default_factory=dict)  # MQ-P34：上游 usage 原文（全部键），见 `note_usage`
     finish_reason: str = ""                    # C6: length/tool_calls/stop
     ms_first_chunk: float = 0.0                # C6: 首字延迟
     # 🔴 MQ-P25：**发起上游调用那一刻**的时钟（由端点在 `await call_model(...)` 之前写）。
@@ -242,6 +400,16 @@ def note_cache_reading(result: CaptureResult, cache_read: int | None) -> None:
         registry().note_cache_read(result.session_id, cache_read)
 
 
+def note_usage(result: CaptureResult, usage: Any) -> None:  # noqa: ANN401  上游 SDK 的 usage 对象
+    """三条流式 capture 路径登记上游 usage 的**唯一入口**（MQ-P22 三键 + MQ-P34 原文）。
+
+    此前三处各写 `result.usage = extract_usage(...)`，只留三键；原文从这里一并落进
+    `result.usage_raw`，经 `_build_response_meta_from_capture` 入 Hub。
+    """
+    result.usage = extract_usage(usage)
+    result.usage_raw = usage_raw(usage)
+
+
 def record_first_chunk(result: CaptureResult, t0: float) -> None:
     """首字延迟落数（MQ-P19 + MQ-P25）—— **三条入站路径的唯一实现点**。
 
@@ -330,7 +498,7 @@ async def capture_stream(
             # C2: usage（上游在最终 chunk 带 usage，字段在 chunk 顶层）
             usage = getattr(chunk, "usage", None)
             if usage is not None:
-                result.usage = extract_usage(usage)
+                note_usage(result, usage)
                 _cr = cache_read_tokens(usage)
                 if _cr is not None:
                     cache_read = _cr
@@ -432,6 +600,113 @@ def cache_read_tokens(usage: Any) -> int | None:  # noqa: ANN401  上游 SDK 的
     if isinstance(cached_flat, int):
         return cached_flat
     return None
+
+
+#: usage 原文递归展开的深度上限。真实上游 usage 最深 2 层（`prompt_tokens_details.cached_tokens`，
+#: AC0 夹具），8 层留足余量；超过的位置写显式截断标记而不是整份丢弃（原则 13）。
+USAGE_RAW_MAX_DEPTH = 8
+USAGE_RAW_TRUNC_DEPTH = "<bladex:truncated depth>"
+USAGE_RAW_TRUNC_CYCLE = "<bladex:truncated cycle>"
+#: 顶层就被截断（载体本身展开不出 dict，如 `MagicMock`）时，usage_raw 用这个键承载标记。
+USAGE_RAW_TRUNC_KEY = "_bladex_truncated"
+
+
+def _plain_json(obj: Any, depth: int = 0, seen: frozenset[int] = frozenset(),  # noqa: ANN401
+                cut: list[str] | None = None) -> Any:  # noqa: ANN401  上游 SDK 的任意嵌套对象
+    """嵌套 usage 载体 → 只含 JSON 标量 / dict / list 的原样拷贝（键一个不挑）。
+
+    批 AC2 加固：深度超过 `USAGE_RAW_MAX_DEPTH` 或遇到环（当前路径上已展开过的对象）⇒ **在该位置**
+    写截断标记、兄弟键照常展开；被截的位置记进 `cut`，由 `usage_raw` 打一条可 grep 的告警。
+    修前 `MagicMock` 形态的 usage（`model_dump()` 每次返回新的 mock）一路递归到 RecursionError，
+    整份返回 `{}`、单次耗时以秒计（DS1a 用例里 `/v1` 慢到 1.5 s）。
+    """
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if depth >= USAGE_RAW_MAX_DEPTH:
+        if cut is not None:
+            cut.append("depth")
+        return USAGE_RAW_TRUNC_DEPTH
+    if id(obj) in seen:
+        if cut is not None:
+            cut.append("cycle")
+        return USAGE_RAW_TRUNC_CYCLE
+    seen = seen | {id(obj)}
+    d = depth + 1
+    if hasattr(obj, "model_dump"):
+        return _plain_json(obj.model_dump(), d, seen, cut)
+    if isinstance(obj, dict):
+        return {str(k): _plain_json(v, d, seen, cut) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_plain_json(x, d, seen, cut) for x in obj]
+    if hasattr(obj, "__dict__") and not isinstance(obj, type):
+        return {k: _plain_json(v, d, seen, cut) for k, v in vars(obj).items()
+                if not k.startswith("_")}
+    return str(obj)
+
+
+def usage_raw(usage: Any) -> dict[str, Any]:  # noqa: ANN401  上游 SDK 的 usage 对象
+    """上游 usage **原文**：全部键、原样值（MQ-P34 / 批 AC，原则 13）。
+
+    `extract_usage` 只留 `{prompt, completion, total}`，cache 读写 / 推理 token 等键被静默挑掉，
+    而它们此前只进日志、日志一轮转就永久丢失。这里不挑字段——**上游报了什么就存什么**，
+    口径换算交给 `usage_norm`（读方单一实现点），存储侧不做任何解释。
+
+    三种载体（pydantic / dict / 只有属性的对象）一视同仁，嵌套对象递归展开；
+    `None` / 取不到 ⇒ `{}`（= 本轮上游没报，读方按 NO-DATA 处理，不是 0）。
+    超深 / 成环 ⇒ 该位置写截断标记（`_plain_json`），带 `capture_usage_raw_truncated` 告警；
+    顶层就展开不出 dict ⇒ `{USAGE_RAW_TRUNC_KEY: <标记>}`——显式标记，不是静默的 `{}`。
+    """
+    if usage is None:
+        return {}
+    cut: list[str] = []
+    try:
+        out = _plain_json(usage, cut=cut)
+    except Exception as e:  # noqa: BLE001 —— usage 只是附件，取不到不阻断入库
+        logger.warning("capture_usage_raw_failed", error=str(e))
+        return {}
+    if cut:
+        logger.warning("capture_usage_raw_truncated", positions=len(cut),
+                       reasons=sorted(set(cut)), max_depth=USAGE_RAW_MAX_DEPTH,
+                       carrier=type(usage).__name__)
+        if isinstance(out, str):
+            return {USAGE_RAW_TRUNC_KEY: out}
+    return out if isinstance(out, dict) else {}
+
+
+def usage_norm(raw: dict[str, Any] | None) -> dict[str, int | None]:
+    """usage 原文 → 规范化口径（**读方唯一实现点**；cache_read 复用 `cache_read_tokens`）。
+
+    返回 `input / output / cache_read / cache_creation / reasoning`，**上游没报的键是 None，
+    不是 0**（与 `cache_read_tokens` 同一条 None ≠ 0 纪律）。`raw` 为空 ⇒ 全 None（NO-DATA）。
+
+    - input：`prompt_tokens`（OpenAI / Router 归一）→ 退 `input_tokens`（Anthropic / Responses 原生）
+    - output：`completion_tokens` → 退 `output_tokens`
+    - cache_creation：`cache_creation_input_tokens`（Anthropic 原生，Router 透传）
+    - reasoning：`completion_tokens_details.reasoning_tokens` → 退 `output_tokens_details.reasoning_tokens`
+    """
+    def _int(v: Any) -> int | None:  # noqa: ANN401
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+    def _first(*vals: Any) -> int | None:  # noqa: ANN401
+        for v in vals:
+            iv = _int(v)
+            if iv is not None:
+                return iv
+        return None
+
+    if not raw:
+        return {"input": None, "output": None, "cache_read": None,
+                "cache_creation": None, "reasoning": None}
+    ctd = raw.get("completion_tokens_details") or {}
+    otd = raw.get("output_tokens_details") or {}
+    return {
+        "input": _first(raw.get("prompt_tokens"), raw.get("input_tokens")),
+        "output": _first(raw.get("completion_tokens"), raw.get("output_tokens")),
+        "cache_read": cache_read_tokens(raw),
+        "cache_creation": _int(raw.get("cache_creation_input_tokens")),
+        "reasoning": _first(ctd.get("reasoning_tokens") if isinstance(ctd, dict) else None,
+                            otd.get("reasoning_tokens") if isinstance(otd, dict) else None),
+    }
 
 
 def extract_usage(usage: Any) -> dict:

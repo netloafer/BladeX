@@ -10,8 +10,9 @@ from enum import Enum
 from typing import Any
 
 from bladex_core.distillation import DistillFact, MatterProposal
+from bladex_core.ledger import LedgerEntry
 from bladex_core.task_unit import TaskUnit
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator
 
 from bladex_proxy.splice import SpliceRecord
 
@@ -75,6 +76,11 @@ class Identity(BaseModel):
     project_source: str = ""   # explicit / git-remote / git-root / path / 空(Global)
     project_name: str = ""     # 人读名（仓库根 basename），树目录命名用，不参与身份
     project_root: str = ""     # 项目根 realpath——flash 蒸馏项目简介读声明文件用
+    # 批 BA2（MQ-A94，`subtask_lineage`）：本轮项目不是自报、是继承来的 ⇒ 规则名
+    # （`mother_unique` / `session_sticky`）；空 = 自报或 Global。可指认来源（原则 13 层 4）。
+    project_inherited: str = ""
+    # 子会话的母本 = 母会话 spawn tool_call 位置上的激活本（拍板 (32)-a）；每轮都写，重启靠它恢复。
+    parent_ledger_id: str = ""
 
     # ADR-0021 section 2.4/3.1: 可见集合 + 敏感度（身份解析产出，挂 Identity 供 Memory Index 检索 +
     # 敏感度解析消费）。空 = 个人模式现状回落（Memory Index search 走 user_id 兼容路径）。
@@ -156,6 +162,10 @@ class ResponseMeta(BaseModel):
     """响应侧元数据（C1/C2/C6）。事后不可回补。"""
     reasoning_text: str = ""                              # C1: 思考流（delta.reasoning_content 累积）
     usage: dict[str, int] = Field(default_factory=dict)  # C2: {prompt, completion, total}
+    # MQ-P34（批 AC）：上游 usage **原文**——全部键、原样值（`capture.usage_raw`）。`usage` 三键只是它的
+    # 投影，cache 读写 / 推理 token 只在这里。空 = 本轮没有原文（上游没报，或批 AC 之前的旧轮次）
+    # ⇒ 读方按 NO-DATA 处理，不许当 0；口径换算只走 `capture.usage_norm`。
+    usage_raw: dict[str, Any] = Field(default_factory=dict)
     finish_reason: str = ""                              # C6: length/tool_calls/stop
     ms_first_chunk: float = 0.0                          # C6: 首字延迟
 
@@ -335,6 +345,9 @@ class Turn(BaseModel):
     injected_memory: str = ""
     response_text: str = ""
     tool_events: list[ToolEvent] = Field(default_factory=list)
+    # 批 BA2（MQ-A94）：本轮 spawn tool_call 派出时的激活本 `{tool_call_id, tool_name, ledger_id}`。
+    # 这个值事后无法从事件流复算（S9 先派后切，切换事件比轮次入库只早几毫秒），必须当场记。
+    spawn_dispatches: list[dict[str, Any]] = Field(default_factory=list)
     status: TurnStatus = TurnStatus.OK
     error: str = ""
     ts: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -613,7 +626,7 @@ class AdminEventType(str, Enum):
     # FACT_CORRECT：用户在外部改了一条 fact 的文字。**状态式完整载荷**（照抄 FACT_IMPORT：
     # 重放 = 覆盖，不做 diff 重放）：
     #   payload = {fact_id, entity: <更正后的 Fact 完整 dump，不含 embedding>,
-    #              previous_content, origin: "obsidian"|"postgres", submitter}
+    #              previous_content, origin: "obsidian"|"postgres"|"dashboard", submitter}
     # 重放侧（`MemoryIndex.correct_fact`）先删旧向量行再写（LanceDB add 是追加），并把
     # fact_id 记进"已更正"集合 —— 蒸馏 / 裁决 / 取代再碰到这条一律让路（manual 压过 auto，
     # ADR-0012）。
@@ -624,6 +637,10 @@ class AdminEventType(str, Enum):
     # 消费方 = Z1.2 硬规则热加载（MQ-W18）：它的单一解析 / 生效点读 Hub 里最近一条本事件
     # 作为覆盖层；本批只负责采集与落账（结算稿 report-batch-Z4 §4 写明依赖）。
     HARD_RULES_SET = "hard_rules_set"
+
+
+#: MQ-V41：读路径判「不认识的事件类型」用（跳过并计数，见 `MemoryHub._admin_event_or_none`）。
+KNOWN_ADMIN_EVENT_TYPES: frozenset[str] = frozenset(t.value for t in AdminEventType)
 
 
 class AdminEvent(BaseModel):
@@ -646,6 +663,12 @@ class AdminEvent(BaseModel):
 #: Z4 回流通道白名单（原则 13 层 4：来源必须可指认，不收自由文本）。
 BACKFLOW_ORIGINS = frozenset({"obsidian", "postgres"})
 
+#: `POST /admin/facts/{id}/correct` 可收的 `origin`（批 DS2，DS-13）。**单独一张表，不往
+#: BACKFLOW_ORIGINS 里加**：那张表还管删除、assign、detach，语义是「外部工具回流」。
+#: `dashboard` 没有外部提交者，`submitter` 必须留空（端点判，不收自由文本）。
+FACT_CORRECT_ORIGIN_DASHBOARD = "dashboard"
+FACT_CORRECT_ORIGINS = BACKFLOW_ORIGINS | {FACT_CORRECT_ORIGIN_DASHBOARD}
+
 
 #: 账本生命周期 admin 端点可收的 `origin`（批 Z · Z3）。**不含 `model`**：模型只能经工具
 #: handler 关本（origin 由 handler 写死），HTTP 调用方不许冒充（原则 13 层 4）。
@@ -660,12 +683,50 @@ class LedgerLifecycleBody(BaseModel):
     superseded_by: str = ""      # 只有 supersede 用（且必填）
 
 
+class LedgerImportBody(BaseModel):
+    """POST /admin/ledgers/import 请求体（批 CB）。`package` 的校验归 `bladex_core.handoff.parse_package`。"""
+
+    package: dict[str, Any] = Field(default_factory=dict)
+    dry_run: bool = False
+
+
+#: 用户写账本的 HTTP 入口可收的 `origin`（批 CB）。**不含 `model`**：模型只能经工具面写。
+LEDGER_USER_WRITE_ORIGINS = frozenset({"cli", "dashboard"})
+
+
+class LedgerCreateBody(BaseModel):
+    """POST /admin/ledgers/create 请求体（批 CB）。"""
+
+    goal: str = ""
+    title: str = ""
+    core: list[str] = Field(default_factory=list)
+    verified: list[str] = Field(default_factory=list)
+    open: list[str] = Field(default_factory=list)
+    next: list[str] = Field(default_factory=list)
+    origin: str = "cli"          # ∈ LEDGER_USER_WRITE_ORIGINS
+
+
+class LedgerEditBody(BaseModel):
+    """POST /admin/ledgers/{id}/edit 请求体（批 CB）。`expected_rev` 必填（端点判，缺失 400）。
+
+    `sections` 只替换点名的段，没点名的段一字不动。`new_sections` 显式列出要新增的段，
+    防拼错段名静默建段。
+    """
+
+    expected_rev: StrictInt | None = None
+    title: str | None = None
+    goal: str | None = None
+    sections: dict[str, list[LedgerEntry]] | None = None
+    new_sections: list[str] = Field(default_factory=list)
+    origin: str = "cli"          # ∈ LEDGER_USER_WRITE_ORIGINS
+
+
 class CorrectFactBody(BaseModel):
     """POST /admin/facts/{fact_id}/correct 请求体（Z4 外部工具回流）。"""
 
     content: str = ""
-    origin: str = ""       # ∈ BACKFLOW_ORIGINS
-    submitter: str = ""    # 外部侧提交者（Obsidian = vault 路径；Postgres = 收件行 submitter）
+    origin: str = ""       # ∈ FACT_CORRECT_ORIGINS
+    submitter: str = ""    # 外部侧提交者（Obsidian = vault 路径；Postgres = 收件行 submitter；dashboard 留空）
 
 
 class HardRulesSetBody(BaseModel):

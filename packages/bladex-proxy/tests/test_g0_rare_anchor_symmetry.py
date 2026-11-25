@@ -130,7 +130,7 @@ def test_bare_directory_path_still_leaks_the_agent_name():
     `looks_like_path` 要求末段带扩展名（`v.endswith("/")` 直接判 False），
     所以"目录、没有文件名"的片段整片不算路径 ⇒ `hermes` 照样进 `seen_rare`。
 
-    为什么现在只登记不改（MQ-A54）：放宽末段判据会把 `/Users/jasonye` 这类
+    为什么现在只登记不改（MQ-A54）：放宽末段判据会把 `/Users/alice` 这类
     真有判别力的东西一起吃掉，那正是 A51 当初收紧它的原因。**首动作侧比账本侧
     更容易出现裸目录**（`ls` / `cd` / `rg <dir>`），所以这是双侧对称之后才浮出来的
     新形态，不是 A51 的旧代价——处置要凭 G-读② 的 A2 基线里它占多少来拍。

@@ -287,3 +287,17 @@ def test_candidates_event_carries_agent(monkeypatch):
     rows = [e for e in cap if e.get("event") == "agency_ledger_candidates"]
     assert rows, "候选段应打点"
     assert rows[0]["agent"] == "codex"
+
+
+# ── ⑤ MQ-V51（批 SW · 步骤 3）：事件带 agent，值 = 传入的 agent_id ──────────
+
+def test_block_injected_event_carries_the_agent(monkeypatch):
+    """此前没有 agent 字段，按 agent 拆读数只能靠前后行关联（原则 13 层 4）。
+    两个 agent 绑着同一本账本，各自的事件里 agent 必须是各自传入的那个。"""
+    _on(monkeypatch)
+    ag = AgencyRuntime()
+    _seed(ag)
+    _, row_cc = _inject(ag, [_SYS, _USER], agent="claude-code", session="s-a")
+    _, row_cx = _inject(ag, [_SYS, _USER], agent="codex", session="s-b")
+    assert row_cc["agent"] == "claude-code"
+    assert row_cx["agent"] == "codex"

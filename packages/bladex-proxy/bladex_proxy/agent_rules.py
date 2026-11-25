@@ -39,6 +39,8 @@ from typing import Any
 
 import structlog
 
+from bladex_proxy.toolface import is_bladex_tool
+
 logger = structlog.get_logger()
 
 __all__ = [
@@ -308,6 +310,19 @@ def load_agent_rules(user_path: str | Path | None = None) -> list[AgentFingerpri
                  "header_pattern (other dimensions of the rule stay in effect).",
         )
 
+    # 🔴 MQ-A110：规则里写了 BladeX 自己注入的工具名 = 任何挂 BladeX 工具面的请求都带它，
+    # 匹配层（identity）会忽略这类签名，所以那条签名永远不命中——要喊出来，不改用户文件。
+    for r in user_effective:
+        own = [t for t in r.tool_signatures if is_bladex_tool(t)]
+        if own:
+            logger.warning(
+                "agent_rule_tool_signature_is_bladex_tool",
+                rule=r.name, tools=own,
+                hint="bladex_* tools are injected by BladeX into every request; they "
+                     "identify BladeX, not the agent, and are ignored when matching. "
+                     "Remove them from tool_signatures.",
+            )
+
     merged = user_effective + [r for r in preset if r.name not in overridden]
 
     if not explicit:
@@ -411,7 +426,9 @@ def suggest_rule(
         rule["system_prompt_keywords"] = [keyword]
 
     # ② 工具名 —— 先剔掉别家已占用的（MQ-A6 不得复发）
-    own = sorted({t for t in (tools or []) if t and t not in taken_tools})
+    # 🔴 MQ-A110：BladeX 自己注入的 `bladex_*` 不是 agent 的工具，先剔掉。
+    own = sorted({t for t in (tools or [])
+                  if t and t not in taken_tools and not is_bladex_tool(t)})
 
     # 🔴 再按**形状**判区分度。实测（2026-08-19 Pi）：它的工具是
     # `bash` / `edit` / `read` / `write` —— 没有任何规则占用，但全是通用单词。

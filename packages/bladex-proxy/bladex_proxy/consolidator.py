@@ -30,6 +30,7 @@ import logging
 import os
 import sys
 import time
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -633,6 +634,8 @@ def main() -> int:
             model=distill_model,
             api_base=cfg.upstream_api_base,
             api_key=cfg.upstream_api_key,
+            # 批 AA · 步骤 5：判决缓存与蒸馏台账同一个对象（同库同锁，延迟 bind）
+            journal=distill_journal,
         )
     logger.info("index_distiller_configured", model=distill_model or "passthrough",
                 link_judge=distill_model or "none",
@@ -805,6 +808,51 @@ def main() -> int:
         hr_wake.inner = external
         external = hr_wake
 
+    # 批 BB · 2b：矛盾检测（默认关 `BLADEX_CONTRADICTION_ENABLED`）。判定上游复用蒸馏同一模型（与 L4 / 裁决同理：
+    # 少一个行为面）；Hub 写入经 proxy 正门（本进程对 Hub 只读）。关着时 `run_pass` 第一行返回——零读写、零调用。
+    contradiction_detector = None
+    if distill_model:
+        try:
+            from bladex_proxy import contradiction as _contra
+            from bladex_proxy.cli import _admin_key as _contra_admin_key
+            from bladex_proxy.export_backflow import http_requester as _contra_requester
+
+            contradiction_detector = _contra.build_detector(
+                index,
+                judge=_contra.RouterJudge(model=distill_model, api_base=cfg.upstream_api_base,
+                                          api_key=cfg.upstream_api_key),
+                sink=_contra.ProxySink(_contra_requester(f"http://127.0.0.1:{cfg.port}", _contra_admin_key())))
+        except Exception as e:  # noqa: BLE001 —— 矛盾检测是可选件，装配失败不拖垮 consolidator
+            logger.warning("contradiction_detector_init_failed", error=str(e))
+
+    # 批 BB · 2c：把「本进程矛盾检测是否真在跑」随每一拍心跳报出去，`/admin/status` 与 `bladex status`
+    # 以此为准（不再读 proxy 进程的 env）。= 开关打开 ∧ 检测器装配成功（装配失败时并没有在判，不能报 on）。
+    if control is not None:
+        from bladex_core.consistency import ENABLED_FLAG as _CONTRA_FLAG
+        from bladex_core.flags import flag_enabled as _contra_flag_enabled
+
+        from bladex_proxy.sync_control import HEARTBEAT_CONTRADICTION_FIELD
+
+        control.set_beat_base(**{HEARTBEAT_CONTRADICTION_FIELD: (
+            "1" if contradiction_detector is not None and _contra_flag_enabled(_CONTRA_FLAG) else "0")})
+
+    def _contradiction_tail(pass_started: Any, *, rebuilding: bool) -> None:  # noqa: ANN401 —— datetime
+        """pass 尾部：新 fact 落库后调一次检测（关着 / 重建期零动作）。永不外抛。"""
+        if contradiction_detector is None:
+            return
+        try:
+            from bladex_proxy import contradiction as _contra
+
+            with embed_purpose("contradiction"):
+                summary = _contra.run_pass(index, contradiction_detector, pass_started=pass_started,
+                                           rebuilding=rebuilding)
+            if not summary.skipped:
+                logger.info("contradiction_pass_done", new_facts=summary.new_facts, judged=summary.judged,
+                            flagged=summary.flagged, pending=summary.pending,
+                            budget_exhausted=summary.budget_exhausted)
+        except Exception as e:  # noqa: BLE001 —— 同上
+            logger.warning("contradiction_pass_failed", error=str(e))
+
     def _run_manual(cmd: dict) -> None:
         """执行一条手工同步任务（CLI 下发），进度回写控制通道。"""
         from bladex_proxy.sync_control import make_progress_writer
@@ -838,6 +886,7 @@ def main() -> int:
                 logger.error("index_reattribute_job_failed", job_id=job_id, error=str(e))
             return
 
+        _pass_started = datetime.now(UTC)
         try:
             ledger.catch_up()
             with embed_purpose(f"sync_job:{job_id}"):
@@ -851,6 +900,7 @@ def main() -> int:
                     distill_concurrency=int(cmd.get("concurrency") or 0) or None,
                     progress_cb=make_progress_writer(control, job_id),
                 )
+            _contradiction_tail(_pass_started, rebuilding=bool(cmd.get("full")))
             elapsed = round(time.perf_counter() - t0, 1)
             control.set_status(job_id, state="done", phase="done",
                                new_facts=nf, elapsed_s=elapsed,
@@ -935,6 +985,7 @@ def main() -> int:
             if traffic is not None:
                 traffic.mark()
             batch_error = False
+            _pass_started = datetime.now(UTC)
             try:
                 ledger.catch_up()  # ADR-0020 T1: secondary 追新 proxy 写入（非 secondary 空操作）
                 with embed_purpose(f"rebuild:batch{batch_no}"):
@@ -947,6 +998,7 @@ def main() -> int:
                         distill_concurrency=args.concurrency or None,
                         progress_cb=heartbeat,
                     )
+                _contradiction_tail(_pass_started, rebuilding=args.full)  # 批 BB · 2b
                 backlog = index.last_rebuild_backlog
                 # MQ-W17：空载判据取**候选数**不取 new_facts——见
                 # `MemoryIndex.last_rebuild_candidates` 的 docstring。

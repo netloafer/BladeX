@@ -179,6 +179,10 @@ dialog textarea{min-height:88px;resize:vertical}
 .toast.ok{border-left-color:var(--ok)}
 .toast.err{border-left-color:var(--err)}
 .toast.warn{border-left-color:var(--warn)}
+#page-loading{position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:40;
+  background:var(--surface-2);border:1px solid var(--border-2);border-left:3px solid var(--acc);
+  border-radius:var(--r-sm);padding:8px 14px;font-size:12.5px;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+#page-loading[hidden]{display:none}
 @keyframes tin{from{transform:translateY(8px);opacity:0}to{transform:none;opacity:1}}
 
 /* ── 骨架屏 / 空状态 / 横幅 ── */
@@ -246,6 +250,7 @@ dialog textarea{min-height:88px;resize:vertical}
 </div>
 <div id="overlay" onclick="closeDrawer()"></div>
 <aside id="drawer"></aside>
+<div id="page-loading" role="status" aria-live="polite" hidden></div>
 <div id="toasts"></div>
 <dialog id="dlg"></dialog>
 
@@ -342,10 +347,57 @@ async function api(method,path,body){
      ——前端判 `/confirm/i.test(e.message)`，而 message 恒为 "HTTP 400"。
      顺序：detail（人话）> status（机器码，判据用）> HTTP 码（兜底）。 */
   if(!r.ok&&r.status!==202){
-    const err=new Error((data.error&&data.error.message)||data.detail||data.status||("HTTP "+r.status));
+    const err=new Error(errText(data,r.status));
     err.status=data.status||"";err.httpStatus=r.status;err.data=data;throw err;
   }
   setConn("ok");data.__status=r.status;return data;
+}
+/* 批 DS1：错误文本单一实现点。400 有两种形状，都要读成一句人话：
+   端点自己报的 `{"error":{"message":…}}`，与严格参数机制（`_strict_query` /
+   `_strict_body`）报的 `{"detail":"unknown body key(s): …"}`。FastAPI 自己的 422
+   `detail` 是列表，逐项拼成 `字段: 原因`，不显示 "[object Object]"。 */
+function errText(data,httpStatus){
+  data=data||{};
+  if(Array.isArray(data.detail)&&data.detail.length)
+    return data.detail.map(x=>x&&x.msg?`${(x.loc||[]).slice(1).join(".")||"body"}: ${x.msg}`:String(x)).join("; ");
+  const msg=(data.error&&typeof data.error==="object"&&data.error.message)
+    ||(typeof data.error==="string"&&data.error)||data.detail||data.status;
+  return msg?String(msg):"HTTP "+httpStatus;
+}
+/* 批 DS1（MQ-W25）：写操作回 202 = Hub 已记账、Index 稍后生效，**不是失败**。 */
+const MSG_DEFERRED="Recorded; takes effect shortly";
+/* 批 DS1（DS-04）：user-edit 带 expected_rev，账本在这期间被写过 ⇒ 409，服务端什么都没写。 */
+const MSG_REV_CONFLICT="The ledger was updated meanwhile; refresh before editing";
+function writeDone(r,okMsg){
+  if(r&&r.__status===202){toastMsg(MSG_DEFERRED,"warn");return "deferred";}
+  toastMsg(okMsg||"Done");return "ok";
+}
+/* 批 DS1（MQ-I42）：慢请求的加载状态单一实现点。发出即把按钮置为不可点并换成进行中文案，
+   结束（成功或失败）才恢复；已在进行中的按钮再点直接忽略——不会发第二个请求。 */
+async function busy(btn,label,fn){
+  if(btn&&btn.disabled)return undefined;
+  const old=btn?btn.textContent:"";
+  if(btn){btn.disabled=true;btn.textContent=label||"Working…";}
+  try{return await fn();}
+  finally{if(btn){btn.disabled=false;btn.textContent=old;}}
+}
+/* 批 DS2（MQ-I42 尾巴）：页面级加载提示的单一实现点。给拿不到按钮的调用方用：
+   认领 / 改名的行内调用形状被 test_admin_agents_drift_ui 钉死，按钮传不进函数，用不了 busy()。
+   结束（成功或失败）都熄灭；重叠时显示最后点亮的那条，全部结束才熄灭。 */
+const _pageLoads=[];
+function _renderPageLoading(){
+  const e=$("#page-loading"),cur=_pageLoads[_pageLoads.length-1];
+  e.hidden=!cur;e.textContent=cur?cur.label:"";
+}
+async function withPageLoading(label,fn){
+  const tok={label};_pageLoads.push(tok);_renderPageLoading();
+  try{return await fn();}
+  finally{_pageLoads.splice(_pageLoads.indexOf(tok),1);_renderPageLoading();}
+}
+/* 整页首屏加载中的占位（Agents / Graph 这类要等几秒的页）：带 data-loading 标记 */
+function loadingBlock(text){
+  return `<div class="card" data-loading="1"><div class="empty"><div class="t">${esc(text||"Loading…")}</div>
+    <div class="s">This can take several seconds on a large memory.</div></div>${skel(3)}</div>`;
 }
 
 /* ═══════════════ toast / 弹窗 / 抽屉 ═══════════════ */
@@ -413,6 +465,11 @@ function drawerShell(title,tags,body,foot){
     <div class="drawer-body">${body}</div>
     ${foot?`<div class="drawer-foot">${foot}</div>`:""}`;
 }
+/* 带跳转的字段（DS-19）：值为空照 field 显示 "-"，不出一个点不动的空链接 */
+function linkField(k,v,fn){
+  if(!v)return field(k,v,1);
+  return `<div class="f"><div class="fk">${esc(k)}</div><div class="fv mono"><a class="link" onclick="${fn}('${esc(v)}')">${esc(v)}</a></div></div>`;
+}
 function field(k,v,mono){
   return `<div class="f"><div class="fk">${esc(k)}</div><div class="fv ${mono?"mono":""}">${v===""||v===null||v===undefined?'<span class="dim2">-</span>':esc(v)}</div></div>`;
 }
@@ -430,12 +487,13 @@ const IC={
   agents:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 2v6M15 2v6"/><path d="M6 8h12v3a6 6 0 0 1-12 0z"/><path d="M12 17v5"/></svg>',
   config:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6z"/></svg>',
   ledgers:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 4h11a2 2 0 0 1 2 2v14H7a2 2 0 0 1-2-2z"/><path d="M9 8h6M9 12h6M9 16h3"/></svg>',
+  usage:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>',
   activity:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>'
 };
 const TABS=[["overview","Overview"],["ledgers","Ledgers"],["facts","Memory"],
             ["matters","Matters"],
             ["files","Files"],["projects","Projects"],["profiles","Profiles"],
-            ["activity","Activity"],
+            ["activity","Activity"],["usage","Usage"],
             ["graph","Graph"],["sessions","Sessions"],["agents","Agents"],
             ["config","Rules & Config"]];
 const SUBS={overview:"Pipeline, storage tiers, routing and degradation",
@@ -444,8 +502,9 @@ const SUBS={overview:"Pipeline, storage tiers, routing and degradation",
   matters:"MatterGraph cards, attribution edges and manual operations",
   files:"File index: names, types, summaries and keywords from traffic",
   projects:"Project library: roots, languages and progress",
-  profiles:"USER.md, per-agent habit docs, rule file copies and tool usage",
+  profiles:"Generated summaries (not injected), rule file copies and tool usage",
   activity:"Behaviour profile: per-agent turns, sessions and ledgers (behavior.json)",
+  usage:"Token usage from the Memory Hub, by day, agent, model, lane and session",
   graph:"Force-directed view of Matters and member facts",
   agents:"Connected agents, unrecognised clients and claim history",
   sessions:"Hub sessions and turn-level replay",
@@ -505,13 +564,42 @@ function driftBanner(s){
     <div class="item">The running process differs from config/.env for ${drift.length} value(s) - the file was edited without a restart, or a stale export shadows it. Details in <a class="link" href="#/config">Rules &amp; Config</a>.</div>
     ${drift.map(x=>`<div class="item mono">${esc(x.key)}: declared ${esc(x.declared)}, effective ${esc(x.effective)}</div>`).join("")}</div>`;
 }
+/* DS-20：Memory Flash 新鲜度（status.flash，daemon 写 .flash_state.json）。
+   available=false ⇒「没有读数」，不显示成 lag 0（原则 13 层 4：恒 0 要能证明是真没新轮）。 */
+function flashCard(f){
+  f=f||{};
+  /* MQ-F16：null = 没有读数，不显示成 0 */
+  const refused=Array.isArray(f.user_edit_refused)?f.user_edit_refused:null;
+  const body=f.available
+    ?`<div class="kv"><span class="k">Lag</span><span class="num">${esc(f.flash_lag_s)} s ${f.lag_exceeded?'<span class="tag err">over bound</span>':'<span class="tag ok">within bound</span>'}</span></div>
+      <div class="kv"><span class="k">Bound</span><span class="num">${esc(f.lag_bound_s??"-")} s</span></div>
+      <div class="kv"><span class="k">Last pass</span><span>${tsCell(f.computed_at)} <span class="dim2">${esc(fmtAgo(f.computed_at))}</span></span></div>
+      <div class="kv"><span class="k">Turns folded / total</span><span class="num">${fmtNum(f.turns_folded)} / ${fmtNum(f.turns_total)}</span></div>`
+    :`<div class="kv"><span class="k">Lag</span><span class="dim2">no reading (the flash maintenance process has not reported)</span></div>`;
+  return `<div class="card"><h3>Memory Flash</h3>${body}
+    <div class="kv"><span class="k">Direct edits refused</span><span class="num" id="frefused">${refused===null?'<span class="dim2">n/a</span>':fmtNum(refused.length)}</span></div>
+    <div class="kv"><span class="k">Ledger projections</span><span class="num">${fmtNum(f.ledgers_projected??0)}</span></div></div>`;
+}
+function ledgerSummaryCard(d){
+  if(!d)return "";
+  if(d.__err)return `<div class="card"><h3>Ledgers</h3><span class="dim2">unavailable: ${esc(d.__err)}</span></div>`;
+  if(d.enabled===false)return `<div class="card"><h3>Ledgers</h3><span class="dim2">ledger module is off in this proxy</span></div>`;
+  const rows=d.ledgers||[],closed=rows.filter(r=>r.status==="closed").length;
+  const inUse=rows.filter(r=>(r.active_in||[]).length).length;
+  return `<div class="card"><h3>Ledgers</h3>
+    <div class="kv"><span class="k">Active / closed</span><span class="num">${fmtNum(rows.length-closed)} / ${fmtNum(closed)}</span></div>
+    <div class="kv"><span class="k">Bound to an agent scope now</span><span class="num">${fmtNum(inUse)}</span></div>
+    <div class="kv"><a class="link" href="#/ledgers">Open ledgers</a></div></div>`;
+}
 async function viewOverview(){
   const m=$("#main");
   m.innerHTML=`<div class="stats">${'<div class="stat"><div class="skel" style="height:40px"></div></div>'.repeat(5)}</div>`+skel(4,80);
   async function poll(){
     if(document.hidden)return;
-    let s;
-    try{s=await api("GET","/admin/status");}
+    let s,led;
+    /* DS-20：账本概况取 /admin/ledgers（池在内存，≈1 ms）；它失败不拖垮整页，卡片里显示原因 */
+    try{[s,led]=await Promise.all([api("GET","/admin/status"),
+      api("GET","/admin/ledgers").catch(e=>({__err:e.message}))]);}
     catch(e){clearInterval(statusTimer);
       if(e.auth)return authGate();
       m.innerHTML=errorCard(e.message,"route()");return;}
@@ -573,6 +661,8 @@ async function viewOverview(){
         ${diskRows.map(([k,v])=>`<div class="hbar"><span class="lbl">${esc(k)}</span>
           <span class="track"><span class="fill" style="width:${((v||0)/diskMax*100).toFixed(1)}%"></span></span>
           <span class="cnt">${fmtBytes(v)}</span></div>`).join("")}</div>
+      ${flashCard(s.flash)}
+      ${ledgerSummaryCard(led)}
       ${job?`<div class="card"><h3>Last sync job</h3>
         <div class="kv"><span class="k">State</span><span><span class="tag ${job.state==="done"?"ok":job.state==="failed"?"err":"acc"}">${esc(job.state||"?")}</span></span></div>
         ${job.phase?`<div class="kv"><span class="k">Phase</span><span>${esc(job.phase)}</span></div>`:""}
@@ -585,14 +675,17 @@ async function viewOverview(){
 /* ═══════════════ Memory（facts 浏览 / 搜索 / 管理）═══════════════ */
 const PAGE=50;
 let fOffset=0;
+/* 批 DS1（DS-23）：条目类型的闭集 = core `bladex_core.fact.ItemKind`（ADR-0026 §4.2 六类）。
+   旧的 Kind 下拉是 `Fact.kind`（preference/event/task/decision/general），蒸馏早已只写 general，
+   四个选项恒空。这份列表由 test_dashboard 与 ItemKind 逐项对账，改枚举不改这里会红。 */
+const ITEM_KINDS=["assertion","preference","procedure","lesson","file_ref","profile_obs"];
 async function viewFacts(){
   const m=$("#main");
   m.innerHTML=`<div class="row">
     <input class="input q" id="fq" placeholder="Semantic search (empty = list by time)"
       onkeydown="if(event.key==='Enter'){fOffset=0;loadFacts();}">
-    <select class="input" id="fkind"><option value="">All kinds</option>
-      <option>preference</option><option>event</option><option>task</option>
-      <option>decision</option><option>general</option></select>
+    <select class="input" id="fitem" onchange="fOffset=0;loadFacts()"><option value="">All item kinds</option>
+      ${ITEM_KINDS.map(k=>`<option value="${k}">${k}</option>`).join("")}</select>
     <select class="input" id="forigin"><option value="">All origins</option>
       <option value="conclusion">conclusion</option><option value="progress">progress</option>
       <option value="manual">manual</option></select>
@@ -603,23 +696,23 @@ async function viewFacts(){
     <span class="grow"></span>
     <button class="btn btn-primary" onclick="rememberFact()">+ Remember</button></div>
   <div class="card"><div class="tbl-wrap"><table id="ftab"><thead><tr>
-    <th style="width:42%">Content</th><th>Kind</th><th>Subject</th><th class="r">Trust</th>
+    <th style="width:42%">Content</th><th>Item kind</th><th>Subject</th><th class="r">Trust</th>
     <th>Flags</th><th>Created</th><th></th>
   </tr></thead><tbody><tr><td colspan="7">${skel(4)}</td></tr></tbody></table></div>
   <div class="pager" id="fpager"></div></div>`;
   await loadFacts();
 }
 async function loadFacts(){
-  const q=$("#fq").value.trim(),kind=$("#fkind").value,origin=$("#forigin").value,
+  const q=$("#fq").value.trim(),itemKind=$("#fitem").value,origin=$("#forigin").value,
         exp=$("#fexp").value,cur=$("#fcur").checked;
   const p=new URLSearchParams({limit:String(PAGE),offset:String(fOffset)});
-  if(q)p.set("q",q);if(kind)p.set("kind",kind);if(origin)p.set("origin",origin);
+  if(q)p.set("q",q);if(itemKind)p.set("item_kind",itemKind);if(origin)p.set("origin",origin);
   if(exp)p.set("exposure",exp);if(cur)p.set("current_only","true");
   let d;try{d=await api("GET","/admin/facts?"+p);}
   catch(e){if(e.auth)return authGate();toastMsg(e.message,"err");return;}
   $("#ftab tbody").innerHTML=(d.facts||[]).map(f=>`<tr class="click" onclick="factDetail('${esc(f.id)}')">
     <td>${esc(f.content).slice(0,140)}</td>
-    <td><span class="tag">${esc(f.kind)}</span>${f.item_kind&&f.item_kind!=="assertion"?`<span class="tag acc">${esc(f.item_kind)}</span>`:""}</td>
+    <td><a class="tag ${f.item_kind&&f.item_kind!=="assertion"?"acc":""}" title="Show only this item kind" onclick="event.stopPropagation();filterItemKind('${esc(f.item_kind||"")}')">${esc(f.item_kind||"-")}</a></td>
     <td class="dim">${esc(f.subject||"")}</td>
     <td class="r num">${(f.trust??1).toFixed(2)}</td>
     <td>${(f.tags||"").includes("origin:manual")?'<span class="tag manual">manual</span>':""}
@@ -633,20 +726,72 @@ async function loadFacts(){
     q?"Try a different query or clear the filters":"Facts appear here once the consolidator distills traffic")}</td></tr>`;
   $("#fpager").innerHTML=pagerHtml(d.total,fOffset,"fPage")+`<span class="dim2">mode: ${esc(d.mode)}</span>`;
 }
-function pagerHtml(total,offset,fn){
-  const from=total?offset+1:0,to=Math.min(offset+PAGE,total);
+function pagerHtml(total,offset,fn,size){
+  const n=size||PAGE,from=total?offset+1:0,to=Math.min(offset+n,total);
   return `<span>${from}-${to} of ${fmtNum(total)}</span>
     <button class="btn btn-sm" ${offset<=0?"disabled":""} onclick="${fn}(-1)">Prev</button>
     <button class="btn btn-sm" ${to>=total?"disabled":""} onclick="${fn}(1)">Next</button>`;
 }
 function fPage(dir){fOffset=Math.max(0,fOffset+dir*PAGE);loadFacts();}
-async function factDetail(id){
+function filterItemKind(k){if(!ITEM_KINDS.includes(k))return;$("#fitem").value=k;fOffset=0;loadFacts();}
+/* 批 DS2（DS-13）：修改史读不到 ≠ 没有修改过，要分开显示（原则 13 层 4）。
+   事件是按 type 区分的开放列表：不认识的 type 照常列出，不丢。 */
+async function factHistory(id){
+  try{return await api("GET","/admin/facts/"+encodeURIComponent(id)+"/history");}
+  catch(e){return {__err:e.message};}
+}
+function factEventRow(e){
+  const when=tsCell(e.at),who=e.origin?`<span class="tag">${esc(e.origin)}</span>`:"";
+  if(e.type==="fact_correct")
+    return `<div class="kv"><span>Corrected ${who}</span><span>${when}</span></div>
+      <div class="dim" style="margin:0 0 8px"><div>Before: ${esc(e.previous_content??"n/a")}</div><div>After: ${esc(e.content??"n/a")}</div></div>`;
+  if(e.type==="tombstone")
+    return `<div class="kv"><span>Deleted ${who}</span><span>${when}</span></div>`;
+  const {type,at,origin,key,...rest}=e;
+  return `<div class="kv"><span>${esc(type)} ${who}</span><span>${when}</span></div>
+    <pre style="margin:0 0 8px">${esc(JSON.stringify(rest))}</pre>`;
+}
+function factHistoryHtml(h){
+  const title='<div class="sect">History</div>';
+  if(!h||h.__err||!Array.isArray(h.events))
+    return `${title}<div class="kv dim2">n/a${h&&h.__err?` (${esc(h.__err)})`:""}</div>`;
+  if(!h.events.length)return `${title}<div class="kv dim2">Never corrected or deleted</div>`;
+  return title+h.events.map(factEventRow).join("");
+}
+/* 更正：origin 固定 dashboard，submitter 留空（服务端判）。被拒时带着稿子重开，不丢输入。 */
+async function factCorrect(id,btn){
   let f;try{f=await api("GET","/admin/facts/"+encodeURIComponent(id));}
   catch(e){toastMsg(e.message,"err");return;}
+  let draft=f.content||"";
+  for(;;){
+    const v=await ask({title:"Correct this fact",ok:"Save",
+      body:"Only the text changes; the fact keeps its id and attribution. The old text stays in the history. Line breaks become spaces.",
+      fields:[{name:"content",label:"Text",type:"textarea",value:draft}]});
+    if(!v)return;
+    draft=String(v.content||"");
+    const content=draft.replace(/\n/g," ").trim();
+    if(!content){toastMsg("Text cannot be empty","err");continue;}
+    if(content===f.content){toastMsg("No change");return;}
+    try{
+      const r=await busy(btn,"Saving…",()=>api("POST","/admin/facts/"+encodeURIComponent(id)+"/correct",
+        {content,origin:"dashboard",submitter:""}));
+      if(!r)return;
+      writeDone(r,r.status==="unchanged"?"No change":"Fact corrected");
+      /* Index 读句柄最多落后约 1 s：corrected 时直接显示新文字，不靠马上重读 */
+      await factDetail(id,r.status==="corrected"?{content}:undefined);
+      return;
+    }catch(e){toastMsg(e.message,"err");}
+  }
+}
+async function factDetail(id,opts){
+  let f,hist;
+  try{[f,hist]=await Promise.all([api("GET","/admin/facts/"+encodeURIComponent(id)),factHistory(id)]);}
+  catch(e){toastMsg(e.message,"err");return;}
+  const shownText=(opts||{}).content??f.content;
   const tags=(f.tags||"").split(",").map(s=>s.trim()).filter(Boolean);
   openDrawer(drawerShell(`Fact`,
     `${f.t_invalid?'<span class="tag warn">superseded</span>':'<span class="tag ok">current</span>'}`,
-    `<p style="margin:0 0 6px;font-size:13.5px;line-height:1.6">${esc(f.content)}</p>
+    `<p style="margin:0 0 6px;font-size:13.5px;line-height:1.6">${esc(shownText)}</p>
      <div class="fields">
        ${field("id",f.id,1)}${field("kind",f.kind)}${field("item kind",f.item_kind)}
        ${field("subject",f.subject)}${field("attribute",f.attribute)}
@@ -655,11 +800,18 @@ async function factDetail(id){
        ${field("created",fmtTs(f.created_at))}${field("updated",fmtTs(f.updated_at))}
        ${field("t_valid",fmtTs(f.t_valid))}${field("t_invalid",fmtTs(f.t_invalid))}
        ${field("source user",f.source_user_id,1)}${field("source session",f.source_session,1)}
+       ${field("audience",f.audience)}${field("importance",typeof f.importance==="number"?f.importance.toFixed(2):f.importance)}
+       ${linkField("matter",f.matter_id,"matterDetail")}
+       ${linkField("superseded by",f.superseded_by,"factDetail")}
+       ${linkField("source turn (Memory Hub)",f.source_ledger_key,"turnDetail")}
      </div>
+     ${f.corrects?`<div class="sect">Corrects (the fact's own claim)</div><p class="dim" style="margin:0">${esc(f.corrects)}</p>`:""}
      ${tags.length?`<div class="sect">Tags</div>${tags.map(t=>`<span class="tag ${t==="origin:manual"?"manual":""}">${esc(t)}</span>`).join(" ")}`:""}
      ${f.entities?`<div class="sect">Entities</div><span class="dim">${esc(String(f.entities))}</span>`:""}
+     ${factHistoryHtml(hist)}
      <details style="margin-top:14px"><summary>Raw JSON</summary><pre>${esc(JSON.stringify(f,null,2))}</pre></details>`,
-    `<button class="btn" onclick="promoteScope('fact','${esc(f.id)}')">Promote scope</button>
+    `<button class="btn" data-act="correct" onclick="factCorrect('${esc(f.id)}',this)">Correct…</button>
+     <button class="btn" onclick="promoteScope('fact','${esc(f.id)}')">Promote scope</button>
      <button class="btn btn-danger" onclick="forgetFact('${esc(f.id)}')">Delete</button>`));
 }
 async function forgetFact(id){
@@ -667,7 +819,7 @@ async function forgetFact(id){
     body:`Tombstone semantics: a tombstone is appended to the Memory Hub, the Memory Index entry is cascaded out, and rebuilds never revive it.<br><span class="mono">${esc(id)}</span><br><br>This cannot be undone.`});
   if(!v)return;
   try{const r=await api("DELETE","/admin/facts/"+encodeURIComponent(id));
-    toastMsg(r.__status===202?"Tombstone written (Memory Index cleanup deferred)":"Deleted");
+    writeDone(r,"Deleted");
     closeDrawer();loadFacts();
   }catch(e){toastMsg(e.message,"err");}
 }
@@ -678,7 +830,7 @@ async function rememberFact(){
             {name:"scope",label:"Scope (optional)",ph:"personal / team:<id> / org:<id>"}]});
   if(!v||!(v.content||"").trim())return;
   try{const r=await api("POST","/admin/facts",{content:v.content.trim(),scope:(v.scope||"").trim()});
-    toastMsg(r.__status===202?"Journaled (Memory Index apply deferred)":"Remembered");
+    writeDone(r,"Remembered");
     fOffset=0;loadFacts();
   }catch(e){toastMsg(e.message,"err");}
 }
@@ -689,7 +841,7 @@ async function promoteScope(type,id){
   if(!v||!(v.scope||"").trim())return;
   try{const r=await api("POST","/admin/scope/promote",
       {target_type:type,target_key:id,new_scope:v.scope.trim()});
-    toastMsg(r.__status===202?"Journaled (Memory Index apply deferred)":"Scope promoted");
+    writeDone(r,"Scope promoted");
   }catch(e){toastMsg(e.message,"err");}
 }
 
@@ -701,12 +853,12 @@ async function viewMatters(){
     <select class="input" id="mstatus" onchange="mOffset=0;loadMatters()"><option value="">All statuses</option>
       <option>active</option><option>closed</option><option>provisional</option></select>
     <button class="btn" onclick="loadMatters()">Refresh</button>
-    <button class="btn" onclick="mergeCandidates()">Merge candidates</button>
+    <button class="btn" id="mcbtn" onclick="mergeCandidates(this)">Merge candidates</button>
     <span class="grow"></span>
     <button class="btn btn-primary" onclick="matterCreate()">+ New Matter</button></div>
   <div class="card"><div class="tbl-wrap"><table id="mtab"><thead><tr>
-    <th style="width:34%">Title</th><th>Status</th><th>Origin</th><th>Topic keys</th><th>Updated</th><th>Id</th>
-  </tr></thead><tbody><tr><td colspan="6">${skel(4)}</td></tr></tbody></table></div>
+    <th style="width:30%">Title</th><th>Status</th><th>Origin</th><th>Topic keys</th><th>Ledger</th><th>Updated</th><th>Id</th>
+  </tr></thead><tbody><tr><td colspan="7">${skel(4)}</td></tr></tbody></table></div>
   <div class="pager" id="mpager"></div></div>`;
   await loadMatters();
 }
@@ -725,8 +877,9 @@ async function loadMatters(){
     <td><span class="tag ${x.status==="active"?"ok":x.status==="provisional"?"warn":""}">${esc(x.status)}</span></td>
     <td>${x.origin==="manual"?'<span class="tag manual">manual</span>':'<span class="tag">auto</span>'}</td>
     <td>${topicKeyChips(x.topic_keys,3)||'<span class="dim2">-</span>'}</td>
+    <td>${x.ledger_id?`<a class="link mono" title="This Matter is anchored to a ledger" onclick="event.stopPropagation();ledgerDetail('${esc(x.ledger_id)}')">${esc(x.ledger_id)}</a>`:'<span class="dim2">-</span>'}</td>
     <td class="dim num">${tsCell(x.updated_at,"min")}</td>
-    <td class="mono dim">${esc(x.matter_id)}</td></tr>`).join("")||`<tr><td colspan="6">${emptyState("No Matters yet","Matters are proposed by the consolidator or created manually")}</td></tr>`;
+    <td class="mono dim">${esc(x.matter_id)}</td></tr>`).join("")||`<tr><td colspan="7">${emptyState("No Matters yet","Matters are proposed by the consolidator or created manually")}</td></tr>`;
   $("#mpager").innerHTML=pagerHtml(d.total,mOffset,"mPage");
 }
 function mPage(dir){mOffset=Math.max(0,mOffset+dir*PAGE);loadMatters();}
@@ -741,7 +894,7 @@ async function matterDetail(id){
      <div class="fields">
        ${field("id",id,1)}${field("scope",mt.scope)}
        ${field("created",fmtTs(mt.created_at))}${field("updated",fmtTs(mt.updated_at))}
-       ${mt.ledger_id?field("anchored to ledger",mt.ledger_id,1):""}
+       ${mt.ledger_id?`<div class="f"><div class="fk">anchored to ledger</div><div class="fv mono"><a class="link" onclick="ledgerDetail('${esc(mt.ledger_id)}')">${esc(mt.ledger_id)}</a></div></div>`:""}
      </div>
      ${mt.ledger_id?`<div class="kv dim2">Boundary comes from the ledger — this Matter
        records a task boundary rather than inferring one.</div>`:""}
@@ -767,7 +920,7 @@ async function matterDetail(id){
 async function matterOp(op,id){
   const run=async(path,body)=>{try{
       const r=await api("POST",`/admin/matters/${encodeURIComponent(id)}/${path}`,body);
-      toastMsg(r.__status===202?"Admin event written (Memory Index apply deferred)":"Done");
+      writeDone(r,"Done");
       matterDetail(id);if(tab==="matters")loadMatters();
     }catch(e){toastMsg(e.message,"err");}};
   if(op==="close"){
@@ -804,14 +957,21 @@ async function matterCreate(){
   const v=await ask({title:"New Matter",ok:"Create",body:"Created with origin=manual.",
     fields:[{name:"title",label:"Title"},{name:"summary",label:"Summary (optional)"}]});
   if(!v||!v.title)return;
-  try{await api("POST","/admin/matters",{title:v.title,summary:v.summary||""});
-    toastMsg("Created");loadMatters();
+  try{const r=await api("POST","/admin/matters",{title:v.title,summary:v.summary||""});
+    writeDone(r,"Created");loadMatters();
   }catch(e){toastMsg(e.message,"err");}
 }
-/* 合并提案（matter-dedup-keywords 拍板 C）：只读检测，合并永远走 manual merge */
-async function mergeCandidates(){
-  let d;try{d=await api("GET","/admin/matters/merge_candidates");}
-  catch(e){toastMsg(e.message,"err");return;}
+/* 合并提案（matter-dedup-keywords 拍板 C）：只读检测，合并永远走 manual merge。
+   批 DS1（MQ-I42）：live 上这一次要 33 s——先开抽屉显示进行中、按钮不可再点；
+   在途时再点（或从 mergePair 刷新）共用同一个请求，不叠第二个全扫。 */
+let mcInflight=null;
+async function mergeCandidates(btn){
+  if(btn&&btn.disabled)return;
+  openDrawer(drawerShell("Merge candidates","",loadingBlock("Comparing topic keys across all Matters…")));
+  if(!mcInflight)mcInflight=api("GET","/admin/matters/merge_candidates").finally(()=>{mcInflight=null;});
+  let d;
+  try{d=await busy(btn,"Finding candidates…",()=>mcInflight);}
+  catch(e){openDrawer(drawerShell("Merge candidates","",errorCard(e.message)));toastMsg(e.message,"err");return;}
   const pairs=d.candidates||[];
   openDrawer(drawerShell("Merge candidates",
     `<span class="tag">${pairs.length}</span>`,
@@ -832,15 +992,19 @@ async function mergePair(source,target){
   if(!v)return;
   try{const r=await api("POST",`/admin/matters/${encodeURIComponent(target)}/merge`,
       {source_matter_id:source});
-    toastMsg(r.__status===202?"Admin event written (Memory Index apply deferred)":"Merged");
+    writeDone(r,"Merged");
     mergeCandidates();if(tab==="matters")loadMatters();
   }catch(e){toastMsg(e.message,"err");}
 }
 
 /* ═══════════════ Graph（MatterGraph 力导向，vanilla canvas 零依赖）═══════════════ */
-async function viewGraph(){
-  const m=$("#main");
-  m.innerHTML=`<div class="row">
+/* DS-26：首屏一次批量读（批 DS1b，MQ-I41：一次全扫按 Matter 分组，生产快照 0.46 s）。
+   修前 = 1 次列表 + 每个 Matter 一次详情（329 个只画 200 个，估算 41 s）。limit 上限 500；
+   超过就按 offset 再取，最多 GRAPH_MAX_PAGES 次——首屏请求 ≤ 3，再多就明说只画了多少。 */
+const GRAPH_PAGE=500,GRAPH_MAX_PAGES=3,GRAPH_FACTS_TOP_K=30;
+let graphInflight=null;
+function graphShell(loading){
+  return `<div class="row">
     <div class="legend">
       <span><span class="dot" style="background:var(--acc)"></span>Matter (auto)</span>
       <span><span class="dot" style="background:var(--manual)"></span>Matter (manual)</span>
@@ -850,13 +1014,32 @@ async function viewGraph(){
       <span class="dim2">Drag to pan, scroll to zoom, click a Matter for details</span>
     </div>
     <span class="grow"></span>
-    <span class="dim2" id="gprog"></span>
-    <button class="btn btn-sm" onclick="viewGraph()">Reload</button></div>
-  <canvas id="graph-canvas"></canvas>`;
-  let matters;
-  try{matters=(await api("GET","/admin/matters?limit=200")).matters||[];}
-  catch(e){if(e.auth)return authGate();
+    <span class="dim2" id="gprog">${loading?"loading Matters and edges…":""}</span>
+    <button class="btn btn-sm" id="greload" onclick="viewGraph()"${loading?" disabled":""}>${loading?"Loading…":"Reload"}</button></div>
+  ${loading?loadingBlock("Loading every Matter with its edges…"):'<canvas id="graph-canvas"></canvas>'}`;
+}
+async function fetchGraphPages(){
+  const matters=[],members={};let total=0,pages=0;
+  do{
+    const p=new URLSearchParams({include:"members",facts_top_k:String(GRAPH_FACTS_TOP_K),
+      limit:String(GRAPH_PAGE),offset:String(matters.length)});
+    const d=await api("GET","/admin/matters?"+p);pages++;
+    total=d.total||0;matters.push(...(d.matters||[]));Object.assign(members,d.members||{});
+    if(!(d.matters||[]).length)break;
+  }while(matters.length<total&&pages<GRAPH_MAX_PAGES);
+  return {matters,members,total};
+}
+async function viewGraph(){
+  const m=$("#main");
+  m.innerHTML=graphShell(true);
+  if(!graphInflight)graphInflight=fetchGraphPages().finally(()=>{graphInflight=null;});
+  let g;
+  try{g=await graphInflight;}
+  catch(e){if(tab!=="graph")return;if(e.auth)return authGate();
     m.innerHTML=errorCard(e.message,"viewGraph()");return;}
+  if(tab!=="graph")return;
+  m.innerHTML=graphShell(false);
+  const {matters,members,total}=g;
   if(!matters.length){
     m.insertAdjacentHTML("beforeend",emptyState("Nothing to draw yet","The graph appears once Matters exist"));
     return;}
@@ -866,24 +1049,20 @@ async function viewGraph(){
     nodes.push({id:mt.matter_id,label:mt.title||mt.matter_id,type:"matter",
       manual:mt.origin==="manual",closed:mt.status==="closed"});
   }
-  /* 逐 Matter 拉边，并发限 6，带进度提示 */
-  const queue=[...matters];let done=0;
-  async function pull(){
-    while(queue.length){
-      const mt=queue.shift();
-      try{const d=await api("GET","/admin/matters/"+encodeURIComponent(mt.matter_id)+"?facts_top_k=30");
-        for(const e of (d.edges||[])){
-          const tid=(e.target_type==="fact"?"f:":"s:")+e.target_key;
-          if(!(tid in idx)){idx[tid]=nodes.length;
-            const fact=(d.facts||[]).find(f=>f.id===e.target_key);
-            nodes.push({id:e.target_key,type:e.target_type,
-              label:fact?fact.content.slice(0,40):e.target_key.slice(0,24)});}
-          links.push({a:idx["m:"+mt.matter_id],b:idx[tid],manual:e.provenance==="manual"});
-        }}catch(_){}
-      done++;const g=$("#gprog");if(g)g.textContent=`loading edges ${done}/${matters.length}`;
-    }}
-  await Promise.all([pull(),pull(),pull(),pull(),pull(),pull()]);
-  const g=$("#gprog");if(g)g.textContent=`${nodes.length} nodes, ${links.length} edges`;
+  for(const mt of matters){
+    const d=members[mt.matter_id]||{};
+    for(const e of (d.edges||[])){
+      const tid=(e.target_type==="fact"?"f:":"s:")+e.target_key;
+      if(!(tid in idx)){idx[tid]=nodes.length;
+        const fact=(d.facts||[]).find(f=>f.id===e.target_key);
+        nodes.push({id:e.target_key,type:e.target_type,
+          label:fact?fact.content.slice(0,40):e.target_key.slice(0,24)});}
+      links.push({a:idx["m:"+mt.matter_id],b:idx[tid],manual:e.provenance==="manual"});
+    }
+  }
+  const gp=$("#gprog");
+  if(gp)gp.textContent=`${matters.length}${matters.length<total?` of ${total}`:""} Matters, ${nodes.length} nodes, ${links.length} edges`
+    +(matters.length<total?` (stopped after ${GRAPH_MAX_PAGES} pages)`:"");
   runForce(nodes,links);
 }
 function runForce(nodes,links){
@@ -950,18 +1129,55 @@ function runForce(nodes,links){
 let sOffset=0;
 // ── V-L5 附卡：账本视图 ──────────────────────────────────────────────────
 // 在此之前 dashboard 完全看不到账本（只能靠 probe 脚本），而 0.1.0 gate 的
-// 演示剧本之一就是「账本机制稳定运转」。只读——账本的作者是 agent 侧的模型，
-// Goal 只有用户能改（三红线），编辑通路属 V-L3，不在这里。
+// 演示剧本之一就是「账本机制稳定运转」。账本的作者是 agent 侧的模型，
+// Goal 只有用户能改（三红线）——批 DS1 起这里就是用户改 Goal 的地方（DS-04）。
+// 关 / 重开 / 取代 / 编辑 / 新建 / 导入与 CLI 走同一组端点、落同一种 Hub 事件。
+// origin：生命周期端点只收 user / cli，记 `user`；新建与编辑记 `dashboard`（批 DS2，MQ-F18）。
+let ledgerRows=[];
+/* MQ-F16：被拒的直编。数据 = /admin/status 的 flash.user_edit_refused；null = 没有读数，不是 0。 */
+let ledgerRefusals=null,ledgerRefusedOnly=false;
+async function loadLedgerRefusals(){
+  try{const r=((await api("GET","/admin/status")).flash||{}).user_edit_refused;
+    ledgerRefusals=Array.isArray(r)?r:null;}
+  catch(e){ledgerRefusals=null;}
+}
+function ledgerRefusal(id){return (ledgerRefusals||[]).find(r=>r.ledger_id===id)||null;}
+function ledgerRefusalBanner(id){
+  const r=ledgerRefusal(id);
+  return r?`<div class="banner warn" data-refused="1" style="margin:0 0 12px">Your direct edit of this ledger's file was not adopted: ${esc(r.reason)}. Projection is paused for this ledger until you fix the file. Your file was not overwritten.</div>`:"";
+}
+function ledgerRefusedToggle(){ledgerRefusedOnly=!ledgerRefusedOnly;renderLedgerRows();}
 async function viewLedgers(){
   const m=$("#main");
-  m.innerHTML=`<div class="card"><div class="tbl-wrap"><table id="ltab"><thead><tr>
-    <th>Title</th><th>Active in</th><th>Sections</th><th>Anchor</th>
+  m.innerHTML=`<div class="row">
+    <select class="input" id="lstatus" onchange="renderLedgerRows()"><option value="">All statuses</option>
+      <option value="active">active</option><option value="closed">closed</option></select>
+    <span class="dim2" id="lcount"></span>
+    <span id="lrefused"></span>
+    <span class="grow"></span>
+    <button class="btn" data-act="new" onclick="ledgerCreate(this)">New ledger</button>
+    <button class="btn" data-act="import" onclick="ledgerImport(this)">Import handoff</button>
+    <button class="btn" onclick="viewLedgers()">Refresh</button></div>
+  <div class="card"><div class="tbl-wrap"><table id="ltab"><thead><tr>
+    <th>Title</th><th>Status</th><th>Active in</th><th>Sections</th><th>Anchor</th>
     <th>Updated</th><th>Ledger</th>
-  </tr></thead><tbody><tr><td colspan="6">${skel(6)}</td></tr></tbody></table></div></div>
+  </tr></thead><tbody><tr><td colspan="7">${skel(6)}</td></tr></tbody></table></div></div>
   <div id="ldetail"></div>`;
-  let d;try{d=await api("GET","/admin/ledgers");}
-  catch(e){if(e.auth)return authGate();m.innerHTML=errorCard(e.message,"viewLedgers");return;}
-  const rows=d.ledgers||[];
+  let d;try{[d]=await Promise.all([api("GET","/admin/ledgers"),loadLedgerRefusals()]);}
+  catch(e){if(e.auth)return authGate();m.innerHTML=errorCard(e.message,"viewLedgers()");return;}
+  ledgerRows=d.ledgers||[];
+  renderLedgerRows();
+}
+/* DS-02：状态列 + 状态筛选（列表是整个池，客户端筛，不再发请求） */
+function renderLedgerRows(){
+  const want=($("#lstatus")||{}).value||"";
+  const all=ledgerRows,rows=all.filter(l=>(!want||(l.status||"active")===want)
+    &&(!ledgerRefusedOnly||ledgerRefusal(l.ledger_id)));
+  const nRefused=ledgerRefusals===null?null:ledgerRefusals.length,rf=$("#lrefused");
+  if(rf)rf.innerHTML=nRefused===null?'<span class="dim2">Direct edits refused: n/a</span>'
+    :nRefused?`<a class="link" onclick="ledgerRefusedToggle()">${fmtNum(nRefused)} direct edit${nRefused===1?"":"s"} not adopted</a>`:"";
+  const nClosed=all.filter(l=>l.status==="closed").length;
+  const c=$("#lcount");if(c)c.textContent=`${rows.length} shown · ${all.length-nClosed} active / ${nClosed} closed`;
   $("#ltab tbody").innerHTML=rows.map(l=>{
     // 激活作用域 = (agent, project)（MQ-L11）。服务端已拆好——分隔符是 core 的
     // 实现细节，前端不碰。project=Global 是"还没有项目信号"，不占版面。
@@ -975,19 +1191,50 @@ async function viewLedgers(){
     return `<tr class="click" onclick="ledgerDetail('${esc(l.ledger_id)}')">
       <td>${esc(l.title||"(untitled)")}${l.parent_ledger_id
         ?' <span class="tag warn" title="sub-task ledger">sub</span>':""}</td>
+      <td>${ledgerStatusTag(l.status)}${ledgerRefusal(l.ledger_id)?' <span class="tag warn">edit not adopted</span>':""}</td>
       <td>${scopes}</td><td>${secs}</td>
       <td>${l.matter_id
         ?`<a class="link mono" onclick="event.stopPropagation();matterDetail('${esc(l.matter_id)}')">${esc(l.matter_id)}</a>`
         :'<span class="dim2">none</span>'}</td>
       <td class="dim num">${tsCell(l.updated_at,"min")}</td>
       <td class="mono dim">${esc(l.ledger_id)}</td></tr>`;
-  }).join("")||`<tr><td colspan="6">${emptyState("No ledgers yet",
-      "Ledgers are created by the agent's model via bladex_ledger_switch")}</td></tr>`;
+  }).join("")||`<tr><td colspan="7">${all.length?emptyState("No ledgers with this status")
+      :emptyState("No ledgers yet","Agents create them via bladex_ledger_switch, or use New ledger")}</td></tr>`;
 }
-async function ledgerDetail(id){
-  let d;try{d=await api("GET","/admin/ledgers/"+encodeURIComponent(id));}
+function ledgerStatusTag(st){
+  return (st||"active")==="closed"?'<span class="tag">closed</span>':'<span class="tag ok">active</span>';
+}
+function ledgerLink(lid,title){
+  return `<a class="link" onclick="ledgerDetail('${esc(lid)}')">${esc(title||lid)}</a> <span class="mono dim2">${esc(lid)}</span>`;
+}
+/* DS-03：取代链 + 关闭者。admin / CLI 关本没有会话与 agent ⇒ 两个字段为空，
+   显示成「by you / CLI」而不是空白——空是一种语义（ledger.py `closed_by_agent` 注释）。 */
+function ledgerLifecycleHtml(d){
+  const l=d.ledger||{},chain=d.superseded_chain||[],sups=d.supersedes||[];
+  let out="";
+  if(l.status==="closed"){
+    const who=l.closed_by_agent
+      ?`by <span class="tag acc">${esc(l.closed_by_agent)}</span>${l.closed_by_session?` <span class="mono dim2">${esc(l.closed_by_session)}</span>`:""}`
+      :'<span class="dim2">by you / CLI (no agent session)</span>';
+    out+=`<div class="sect">Closed</div><div class="kv"><span>${l.closed_at?tsCell(l.closed_at):'<span class="dim2">time not recorded</span>'} ${who}</span></div>`;
+  }
+  if(chain.length){
+    out+=`<div class="sect">Superseded by</div>`+chain.map((c,i)=>
+      `<div class="kv"><span>${"&rarr; ".repeat(i+1)}${ledgerLink(c.ledger_id,c.title)}</span>
+       <span class="tag ${c.status==="active"?"ok":""}">${esc(c.status)}</span></div>`).join("");
+  }
+  if(sups.length){
+    out+=`<div class="sect">Supersedes</div>`+sups.map(s=>
+      `<div class="kv"><span>${ledgerLink(s,(ledgerRows.find(r=>r.ledger_id===s)||{}).title)}</span></div>`).join("");
+  }
+  return out;
+}
+/* draft：编辑被 409 拒时用户没保存的那一版——摆出来给他复制，不丢，也不替他重发 */
+async function ledgerDetail(id,opts){
+  let d;try{[d]=await Promise.all([api("GET","/admin/ledgers/"+encodeURIComponent(id)),loadLedgerRefusals()]);}
   catch(e){toastMsg(e.message,"err");return;}
   const l=d.ledger||{},order=(l.section_order||[]).filter(s=>s!=="goal");
+  const draft=(opts||{}).draft;
   const body=order.map(s=>{
     const items=(l.sections||{})[s]||[];
     if(!items.length)return "";
@@ -1005,7 +1252,7 @@ async function ledgerDetail(id){
     // Goal 单列且标出来源——它是「取」不是「炼」，用户要能一眼核对原话
     // Goal 由模型提炼；你的原话存在 goal_verbatim 里（不注入，只为核对）。
     // goal_revisions > 0 = 任务中途改过目标，值得看一眼。
-    `${l.goal?`<div class="sect">Goal <span class="dim2">(${esc(({
+    `${ledgerRefusalBanner(id)}${l.goal?`<div class="sect">Goal <span class="dim2">(${esc(({
          user:"your words, verbatim",
          model:"written by the model from your request",
          model_revised:"revised mid-task at your request"
@@ -1018,15 +1265,259 @@ async function ledgerDetail(id){
             <p class="dim2" style="margin:6px 0 0">${esc(l.goal_verbatim)}</p>
            </details>`:""}`
       :`<div class="kv dim2">No goal captured yet.</div>`}
+     ${draft?`<details open class="banner err" style="margin:0 0 12px"><summary>Your edit was NOT saved (the ledger changed meanwhile)</summary>
+        <p class="dim" style="margin:6px 0">${esc(MSG_REV_CONFLICT)}. Copy what you need, then press Edit again on the version below.</p>
+        <pre>${esc(ledgerDraftText(draft))}</pre></details>`:""}
      <div class="fields">
        ${field("ledger",id,1)}
+       ${field("rev",l.rev)}
        ${l.matter_id?field("matter anchor",l.matter_id,1):""}
        ${l.parent_ledger_id?field("parent ledger",l.parent_ledger_id,1):""}
        ${field("created",fmtTs(l.created_at))}${field("updated",fmtTs(l.updated_at))}
      </div>
+     ${ledgerLifecycleHtml(d)}
      ${body||'<div class="kv dim2">No entries yet.</div>'}
      ${(d.children||[]).length?`<div class="sect">Sub-task ledgers</div>`+
-       d.children.map(c=>`<div class="kv"><a class="link" onclick="ledgerDetail('${esc(c.ledger_id)}')">${esc(c.title||c.ledger_id)}</a></div>`).join(""):""}`));
+       d.children.map(c=>`<div class="kv"><a class="link" onclick="ledgerDetail('${esc(c.ledger_id)}')">${esc(c.title||c.ledger_id)}</a></div>`).join(""):""}`,
+    ledgerFoot(l)));
+}
+/* DS-01：动作按状态给——活着的能关 / 被取代；关了的能重开。取代过的不再给取代（要改链先重开）。 */
+function ledgerFoot(l){
+  const id=esc(l.ledger_id),closed=l.status==="closed";
+  return `<button class="btn" data-act="edit" onclick="ledgerEdit('${id}',this)">Edit</button>
+    <button class="btn" data-act="handoff" onclick="ledgerHandoff('${id}')">Handoff…</button>
+    ${closed?"":`<button class="btn" data-act="close" onclick="ledgerLifecycle('close','${id}',this)">Close</button>`}
+    ${l.superseded_by?"":`<button class="btn" data-act="supersede" onclick="ledgerLifecycle('supersede','${id}',this)">Supersede…</button>`}
+    ${closed?`<button class="btn" data-act="reopen" onclick="ledgerLifecycle('reopen','${id}',this)">Reopen</button>`:""}`;
+}
+/* 账本写同时只许一个在途：两个动作交错（关的同时又点了重开）结果取决于到达顺序，用户看不出来 */
+let ledgerWriting=false;
+async function ledgerWrite(btn,label,path,body,okMsg){
+  if(ledgerWriting){toastMsg("Another ledger change is still being saved","warn");return null;}
+  ledgerWriting=true;
+  try{return await busy(btn,label,async()=>{
+      const r=await api("POST",path,body);writeDone(r,okMsg(r));return r;});}
+  finally{ledgerWriting=false;}
+}
+const LEDGER_OP={
+  close:{title:"Close ledger",ok:"Close",label:"Closing…",
+    body:"Marks the task as done. Any agent scope that has it active is released (the next turns are not anchored to it). Goal and entries are not touched. Reversible: Reopen.",
+    msg:r=>r.status==="noop"?"Already closed":"Ledger closed"},
+  reopen:{title:"Reopen ledger",ok:"Reopen",label:"Reopening…",
+    body:"Restores the status only and clears the superseded-by pointer. It is NOT re-activated: an agent switches to it when needed.",
+    msg:r=>r.status==="noop"?"Not closed; nothing to do":"Ledger reopened (not activated)"},
+  supersede:{title:"Supersede ledger",ok:"Supersede",label:"Saving…",
+    body:"Closes this ledger and records which ledger carries the task on. Reversible: Reopen.",
+    msg:r=>r.status==="noop"?"Already superseded by that ledger":"Ledger superseded"},
+};
+async function ledgerLifecycle(op,id,btn){
+  const spec=LEDGER_OP[op];if(!spec)return;
+  if(ledgerWriting){toastMsg("Another ledger change is still being saved","warn");return;}
+  const fields=[];
+  if(op==="supersede"){
+    /* 目标要**选**不要打：打错一个 id 服务端会 400，但选更不会错 */
+    let rows=ledgerRows;
+    if(!rows.length){try{rows=(await api("GET","/admin/ledgers")).ledgers||[];}
+      catch(e){toastMsg(e.message,"err");return;}}
+    const opts=rows.filter(r=>r.ledger_id!==id).map(r=>({value:r.ledger_id,
+      label:`${r.title||"(untitled)"} — ${r.ledger_id}${(r.status||"active")==="closed"?" (closed)":""}`}));
+    if(!opts.length){toastMsg("No other ledger to supersede with","err");return;}
+    fields.push({name:"target",label:"Superseded by (the ledger that carries the task on)",type:"select",
+      options:opts,value:opts[0].value});
+  }
+  fields.push({name:"reason",label:"Reason (optional, kept in the Memory Hub event)",type:"textarea"});
+  const v=await ask({title:spec.title,ok:spec.ok,body:`${esc(spec.body)}<br><span class="mono">${esc(id)}</span>`,fields});
+  if(!v)return;
+  const body={origin:"user",reason:(v.reason||"").trim()};
+  if(op==="supersede")body.superseded_by=v.target||"";
+  try{const r=await ledgerWrite(btn,spec.label,`/admin/ledgers/${encodeURIComponent(id)}/${op}`,body,spec.msg);
+    if(r){await ledgerDetail(id);if(tab==="ledgers")viewLedgers();}
+  }catch(e){toastMsg(e.message,"err");}
+}
+/* ── DS-04：用户编辑（`POST /admin/ledgers/{id}/edit`，批 DS2 · MQ-F18）──
+   此前走 `/user-edit`：事件只有 `{ledger}`，与 flash daemon 采纳逐字相同，Hub 里分不清谁改的
+   （原则 13 层 4）。现在 `origin=dashboard` ⇒ 事件 `origin=dashboard_edit`；`/user-edit` 留给 daemon。
+   ① 必带 `expected_rev` = 打开编辑时读到的 rev：这期间 agent 写过 ⇒ 409、服务端什么都没写，
+      页面不重发、不覆盖，把用户的稿子摆出来；
+   ② 只发改过的部分（服务端只替换点名的段）。段内没改的条目原样带回（来源 / ref / writer 不丢），
+      新增行记 source=user。段里有多行条目的不进编辑框（逐行编辑会把它拆碎）。
+   Goal 由服务端经 `update_goal` 变换，页面不算 goal_source / goal_revisions。 */
+function ledgerEditableSections(l){
+  return (l.section_order||[]).filter(s=>s!=="goal").map((key,idx)=>({key,idx,
+    multiline:(((l.sections||{})[key])||[]).some(e=>/[\r\n]/.test(String(e.text||"")))}));
+}
+function buildLedgerEdit(orig,v){
+  /* draft 只用来在 409 时把用户的稿子摆出来；发出去的是 body */
+  const draft=JSON.parse(JSON.stringify(orig)),body={},changed=[];
+  if(v.title!==undefined){const t=String(v.title).trim();
+    if(t!==String(orig.title||"").trim()){body.title=t;draft.title=t;changed.push("title");}}
+  if(v.goal!==undefined){const g=String(v.goal).trim();
+    if(g!==String(orig.goal||"").trim()){body.goal=g;draft.goal=g;changed.push("goal");}}
+  for(const s of ledgerEditableSections(orig)){
+    const raw=v["sec_"+s.idx];if(s.multiline||raw===undefined)continue;
+    const lines=String(raw).split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+    const pool=((orig.sections||{})[s.key])||[],used=new Set();
+    const next=lines.map(t=>{
+      const i=pool.findIndex((e,j)=>!used.has(j)&&String(e.text||"").trim()===t);
+      if(i>=0){used.add(i);return pool[i];}
+      return {text:t,source:"user",ref:"",writer:""};});
+    if(next.length!==pool.length||next.some((e,i)=>e!==pool[i])){
+      const copy=JSON.parse(JSON.stringify(next));
+      body.sections=body.sections||{};body.sections[s.key]=copy;
+      draft.sections=draft.sections||{};draft.sections[s.key]=copy;changed.push(s.key);}
+  }
+  return {body,draft,changed};
+}
+function ledgerDraftText(l){
+  const out=[`Title: ${l.title||""}`,"",`Goal: ${l.goal||""}`];
+  for(const s of (l.section_order||[]).filter(s=>s!=="goal")){
+    out.push("",`[${s}]`,...(((l.sections||{})[s])||[]).map(e=>"- "+e.text));}
+  return out.join("\n");
+}
+async function ledgerEdit(id,btn){
+  if(ledgerWriting){toastMsg("Another ledger change is still being saved","warn");return;}
+  let d;try{d=await api("GET","/admin/ledgers/"+encodeURIComponent(id));}
+  catch(e){toastMsg(e.message,"err");return;}
+  const l=d.ledger||{};
+  if(!Number.isInteger(l.rev)){toastMsg("This ledger has no revision number; editing is disabled","err");return;}
+  const secs=ledgerEditableSections(l),locked=secs.filter(s=>s.multiline).map(s=>s.key);
+  const v=await ask({title:"Edit ledger",ok:"Save",
+    body:`Saving changes only what you edit here (you are at rev ${esc(l.rev)}). If an agent writes to it before you save, nothing is saved and you are told so. One entry per line; unchanged lines keep their source.`
+      +(locked.length?`<br>Not editable here (they contain multi-line entries, kept as they are): ${locked.map(esc).join(", ")}`:""),
+    fields:[{name:"title",label:"Title",value:l.title||""},
+            {name:"goal",label:"Goal (only you can change it)",type:"textarea",value:l.goal||""},
+            ...secs.filter(s=>!s.multiline).map(s=>({name:"sec_"+s.idx,label:s.key,type:"textarea",
+              value:(((l.sections||{})[s.key])||[]).map(e=>e.text).join("\n")}))]});
+  if(!v)return;
+  const out=buildLedgerEdit(l,v);
+  if(!out.changed.length){toastMsg("No changes");return;}
+  try{const r=await ledgerWrite(btn,"Saving…",`/admin/ledgers/${encodeURIComponent(id)}/edit`,
+        {...out.body,expected_rev:l.rev,origin:"dashboard"},
+        r=>r.status==="noop"?"No changes":`Ledger saved (${out.changed.join(", ")}; rev ${r.rev})`);
+    if(r){await ledgerDetail(id);if(tab==="ledgers")viewLedgers();}
+  }catch(e){
+    if(e.httpStatus===409){toastMsg(MSG_REV_CONFLICT,"err");await ledgerDetail(id,{draft:out.draft});}
+    else toastMsg(e.message,"err");
+  }
+}
+
+/* ── DS-05：交接页（批 DS2，端点来自批 CB）──
+   预览与导出同一个端点，服务端已替换路径和凭证；页面不再加工 markdown。
+   exposure 默认 public：包要离开本机，目的地未知按最坏算（与 CLI 和端点默认相同）。
+   不提供激活（拍板 (41)-a-③）。警告句与 CLI `_handoff_export` 同一句（用例对账）。 */
+const HANDOFF_DEFAULT_EXPOSURE="public";
+const HANDOFF_REVIEW_WARNING="Review it before sending: the five sections are not filtered for personal information.";
+const MSG_NOT_ACTIVE="It is not active yet. An agent sees it among its ledger candidates and switches to it.";
+let handoffCur=null,handoffSeq=0;
+function handoffShell(id,exposure,body,foot){
+  const opts=["public","private","local"].map(x=>
+    `<option value="${x}"${x===exposure?" selected":""}>${x}</option>`).join("");
+  return drawerShell(`Handoff <span class="mono">${esc(id)}</span>`,"",
+    `<label class="dim2">Where the package is going
+       <select class="input" id="hexposure" onchange="ledgerHandoff('${esc(id)}',this.value)">${opts}</select></label>
+     <div class="banner warn" id="hwarning" style="margin:10px 0">${esc(HANDOFF_REVIEW_WARNING)}</div>${body}`,
+    foot||`<button class="btn" onclick="ledgerDetail('${esc(id)}')">Back to ledger</button>`);
+}
+function handoffCounts(title,obj,labels){
+  return `<div class="sect">${esc(title)}</div><div class="fields">`
+    +labels.map(([k,l])=>field(l,String((obj||{})[k]??"n/a"))).join("")+"</div>";
+}
+async function ledgerHandoff(id,exposure){
+  const exp=exposure||HANDOFF_DEFAULT_EXPOSURE,seq=++handoffSeq;
+  handoffCur=null;
+  openDrawer(handoffShell(id,exp,loadingBlock("Building the handoff package…")));
+  let d;try{[d]=await Promise.all([api("GET",`/admin/ledgers/${encodeURIComponent(id)}/handoff?`+new URLSearchParams({exposure:exp})),loadLedgerRefusals()]);}
+  catch(e){
+    if(seq!==handoffSeq)return;
+    openDrawer(handoffShell(id,exp,errorCard(e.message,`ledgerHandoff('${esc(id)}','${exp}')`)));return;
+  }
+  /* 用户又换了 exposure：只显示最后一次 */
+  if(seq!==handoffSeq)return;
+  handoffCur={id,data:d};
+  const p=d.package||{},t=p.trimmed||{};
+  openDrawer(handoffShell(id,exp,
+    `${ledgerRefusal(id)?`<div class="banner warn" data-refused="1" style="margin:0 0 10px">This ledger's file has an edit that was not adopted: ${esc(ledgerRefusal(id).reason)}. The package reflects the last adopted version.</div>`:""}
+     ${t.over_limit?'<div class="banner warn" style="margin:0 0 10px">The package went over its size limit, so some content was trimmed.</div>':""}
+     ${handoffCounts("Left out",p.omitted,[["matters_exposure","Matters above this exposure"],["rounds_exposure","rounds above this exposure"],
+        ["matters_unavailable","Matters unavailable"],["rounds_without_user_text","rounds without user text"]])}
+     ${handoffCounts("Trimmed",t,[["rounds","rounds"],["matters","Matters"],["round_entries","round entries"]])}
+     ${handoffCounts("Replaced (count only, the values are not shown)",p.rewrites,[["project","project paths"],["home","home paths"],["path","other paths"],["credential","credentials"]])}
+     ${(p.matters||[]).length?"":'<div class="kv dim2">No anchored Matter</div>'}
+     ${(p.recent_rounds||[]).length?"":'<div class="kv dim2">No recent rounds</div>'}
+     <div class="sect">Package</div><pre id="hmarkdown" style="white-space:pre-wrap">${esc(d.markdown||"")}</pre>`,
+    `<button class="btn" onclick="handoffCopy()">Copy Markdown</button>
+     <button class="btn" onclick="handoffDownload('md')">Download .md</button>
+     <button class="btn" onclick="handoffDownload('json')">Download .json</button>
+     <button class="btn" onclick="ledgerDetail('${esc(id)}')">Back to ledger</button>`));
+}
+async function handoffCopy(){
+  if(!handoffCur)return;
+  try{await navigator.clipboard.writeText(handoffCur.data.markdown||"");toastMsg("Copied");}
+  catch(e){toastMsg("Copy failed; select the text and copy it yourself","err");}
+}
+function handoffDownload(fmt){
+  if(!handoffCur)return;
+  const json=fmt==="json",text=json?JSON.stringify(handoffCur.data.package,null,2)+"\n":(handoffCur.data.markdown||"");
+  const url=URL.createObjectURL(new Blob([text],{type:json?"application/json":"text/markdown"}));
+  const a=document.createElement("a");
+  a.href=url;a.download=`handoff-${handoffCur.id}.${json?"json":"md"}`;a.click();
+  URL.revokeObjectURL(url);
+}
+/* 新建：不激活（激活键是 agent + project，这里没有 agent）。失败时带着稿子重开对话框，不丢输入。 */
+const ledgerLines=x=>String(x||"").split(/\r?\n/).map(t=>t.trim()).filter(Boolean);
+async function ledgerCreate(btn){
+  if(ledgerWriting){toastMsg("Another ledger change is still being saved","warn");return;}
+  let draft={};
+  for(;;){
+    const v=await ask({title:"New ledger",ok:"Create",body:`Set the Goal first, then let an agent work. ${esc(MSG_NOT_ACTIVE)}`,
+      fields:[{name:"goal",label:"Goal (what done looks like)",type:"textarea",value:draft.goal||""},
+              {name:"title",label:"Title (default: first line of the Goal)",value:draft.title||""},
+              ...["core","verified","open","next"].map(k=>({name:k,label:`${k} (one entry per line)`,type:"textarea",value:draft[k]||""}))]});
+    if(!v)return;
+    draft=v;
+    const goal=String(v.goal||"").trim();
+    if(!goal){toastMsg("Goal cannot be empty","err");continue;}
+    try{
+      const r=await ledgerWrite(btn,"Creating…","/admin/ledgers/create",
+        {goal,title:String(v.title||"").trim(),core:ledgerLines(v.core),verified:ledgerLines(v.verified),
+         open:ledgerLines(v.open),next:ledgerLines(v.next),origin:"dashboard"},
+        r=>`Created ${r.ledger_id}. ${MSG_NOT_ACTIVE}`);
+      if(!r)return;
+      await ledgerDetail(r.ledger_id);if(tab==="ledgers")viewLedgers();
+      return;
+    }catch(e){toastMsg(e.message,"err");}
+  }
+}
+/* 导入：先 dry-run 给用户看 Goal，确认后才真跑。服务端没确认 dry-run ⇒ 停下，不往下走（同 CLI 闸 A）。 */
+async function ledgerImport(btn){
+  if(ledgerWriting){toastMsg("Another ledger change is still being saved","warn");return;}
+  const IMPORT_PATH="/admin/ledgers/import";
+  let text="",pkg,r;
+  for(;;){
+    const v=await ask({title:"Import handoff",ok:"Check package",
+      body:"Paste the JSON form (<span class=\"mono\">bladex ledger handoff &lt;id&gt; --format json</span>, or Download .json here). Nothing is written until you confirm on the next step.",
+      fields:[{name:"package",label:"Package JSON",type:"textarea",value:text}]});
+    if(!v)return;
+    text=String(v.package||"");
+    try{pkg=JSON.parse(text);}
+    catch(e){toastMsg("This is not JSON; nothing was imported","err");continue;}
+    try{r=await busy(btn,"Checking…",()=>api("POST",IMPORT_PATH,{package:pkg,dry_run:true}));break;}
+    catch(e){toastMsg(e.message,"err");}
+  }
+  if(!r)return;
+  if(r.status!=="dry_run"||r.dry_run!==true){
+    toastMsg("The proxy did not confirm a dry run; stopping here. Restart the proxy if it is out of date.","err");return;}
+  const ok=await ask({title:"Import this ledger?",ok:"Import",fields:[],
+    body:`Would create ${r.id_conflict?"a new ledger (the original id is already taken here)":`<span class="mono">${esc(r.ledger_id)}</span>`}.
+      <br><br><b>Title:</b> ${esc(r.title||"")}<br><b>Goal:</b> ${esc(r.goal||"")}
+      <br><b>Entries:</b> <span class="mono">${esc(JSON.stringify(r.entry_counts||{}))}</span>
+      <br><br>The Goal becomes yours and is shown to your agents on every turn, so only import packages you trust. ${esc(MSG_NOT_ACTIVE)}`});
+  if(!ok)return;
+  try{
+    const done=await ledgerWrite(btn,"Importing…",IMPORT_PATH,{package:pkg,dry_run:false},
+      x=>`Imported as ${x.ledger_id}. ${MSG_NOT_ACTIVE}`);
+    if(done){await ledgerDetail(done.ledger_id);if(tab==="ledgers")viewLedgers();}
+  }catch(e){toastMsg(e.message,"err");}
 }
 
 async function viewSessions(){
@@ -1055,16 +1546,24 @@ async function loadSessions(){
   $("#spager").innerHTML=pagerHtml(d.total,sOffset,"sPage");
 }
 function sPage(dir){sOffset=Math.max(0,sOffset+dir*PAGE);loadSessions();}
-async function loadTurns(prefix){
-  let d;try{d=await api("GET","/admin/turns?"+new URLSearchParams({prefix,limit:"100"}));}
+function tPage(dir){loadTurns(tPrefix,tOffset+dir*TURN_PAGE);}
+/* DS-15：长会话翻页（offset / total），表头写总数——此前写死 limit=100 且不显示 total，
+   170 轮的会话只看得到最近 100 轮，也看不出还有没看到的。 */
+const TURN_PAGE=100;
+let tPrefix="",tOffset=0;
+async function loadTurns(prefix,offset){
+  if(prefix!==tPrefix){tPrefix=prefix;tOffset=0;}
+  if(typeof offset==="number")tOffset=Math.max(0,offset);
+  let d;try{d=await api("GET","/admin/turns?"+new URLSearchParams({prefix:tPrefix,limit:String(TURN_PAGE),offset:String(tOffset)}));}
   catch(e){toastMsg(e.message,"err");return;}
-  $("#sdetail").innerHTML=`<div class="card"><h3>Turns - <span class="mono">${esc(prefix)}</span></h3>
+  $("#sdetail").innerHTML=`<div class="card"><h3>Turns - <span class="mono">${esc(prefix)}</span> <span class="dim2 num">(${fmtNum(d.total)} total)</span></h3>
     <div class="tbl-wrap"><table><thead><tr><th>Turn</th><th>Timestamp</th><th></th></tr></thead><tbody>
     ${(d.turns||[]).map(t=>`<tr class="click" onclick="turnDetail('${esc(t.key)}')">
       <td class="mono">${esc(t.key.split("/").pop())}</td>
       <td class="dim num">${tsCell(t.ts)} <span class="dim2">${esc(fmtAgo(t.ts))}</span></td>
       <td><a class="link">replay</a></td></tr>`).join("")||`<tr><td colspan="3">${emptyState("No turns")}</td></tr>`}
-    </tbody></table></div></div>`;
+    </tbody></table></div>
+    <div class="pager" id="tpager">${pagerHtml(d.total||0,tOffset,"tPage",TURN_PAGE)}</div></div>`;
   const sd=$("#sdetail");
   if(sd.scrollIntoView)sd.scrollIntoView({behavior:"smooth",block:"start"});
 }
@@ -1073,7 +1572,7 @@ async function turnDetail(key){
   let t;try{t=await api("GET",turnPath(key));}
   catch(e){toastMsg(e.message,"err");return;}
   const dm=t.decision_meta||{},rm=t.response_meta||{};
-  const tabsDef=[["ov","Overview"],["route","Route"],["resp","Response"],["mem","Injected memory"],["msg","Messages"]];
+  const tabsDef=[["ov","Overview"],["route","Route"],["resp","Response"],["mem","Injected memory"],["led","Ledger"],["msg","Messages"]];
   openDrawer(drawerShell(`Turn <span class="mono">${esc(key.split("/").pop())}</span>`,
     `${t.auxiliary?'<span class="tag">auxiliary</span>':""}
      ${t.sensitivity&&t.sensitivity!=="normal"?`<span class="tag warn">${esc(t.sensitivity)}</span>`:""}`,
@@ -1097,6 +1596,7 @@ async function turnDetail(key){
      <div id="tt-mem" hidden>
        ${t.injected_memory?`<pre>${esc(t.injected_memory)}</pre>`:emptyState("Nothing injected","This turn ran on hard rules only, or memory injection was skipped")}
      </div>
+     <div id="tt-led" hidden>${turnLedgerHtml(t)}</div>
      <div id="tt-msg" hidden>
        <p class="dim" style="margin-top:0">Full request messages and response text are loaded on demand (payloads can reach hundreds of KB).</p>
        <button class="btn" onclick="turnMessages('${esc(key)}')">Load full messages</button>
@@ -1106,8 +1606,35 @@ async function turnDetail(key){
 }
 function turnTab(btn,id){
   btn.closest(".tabs").querySelectorAll("button").forEach(b=>b.classList.toggle("on",b===btn));
-  for(const s of ["ov","route","resp","mem","msg"])
+  for(const s of ["ov","route","resp","mem","led","msg"])
     $("#tt-"+s).hidden=(s!==id);
+}
+/* DS-08：这一轮锚在哪本账本、注入了什么账本面、有没有剥离-拼接、调了哪些工具、各段耗时。
+   `ledger_face` / `ledger_anchor` 是三态：null = 这一轮没有这项读数（历史轮 / aux 轮 / 模块关），
+   显示 n/a，不当成 false / 0（models.py LedgerAnchor 注释：缺数报缺数）。 */
+function turnLedgerHtml(t){
+  const a=t.ledger_anchor,face=t.ledger_face,sp=t.splice_records||[],te=t.tool_events||[];
+  const na='<span class="dim2">n/a (not recorded for this turn)</span>';
+  const ms=v=>typeof v==="number"?`${v.toFixed(1)} ms`:"-";
+  return `<div class="fields">
+      <div class="f"><div class="fk">ledger face injected</div><div class="fv">${face===true?'<span class="tag ok">yes</span>':face===false?'<span class="tag">no</span>':na}</div></div>
+      ${field("identity",ms(t.ms_identity))}${field("inject",ms(t.ms_inject))}${field("total",ms(t.ms_total))}
+    </div>
+    <div class="sect">Ledger anchor</div>
+    ${a?`<div class="fields">
+        <div class="f"><div class="fk">ledger</div><div class="fv mono">${a.ledger_id?`<a class="link" onclick="ledgerDetail('${esc(a.ledger_id)}')">${esc(a.ledger_id)}</a>`:'<span class="dim2">-</span>'}</div></div>
+        ${field("rev",a.rev)}${field("about chars",a.about_chars)}${field("added hash",a.added_hash,1)}</div>
+      ${Object.entries(a.sections||{}).map(([k,v])=>`<span class="tag" title="characters injected from this section">${esc(k)} ${fmtNum(v)}</span>`).join(" ")}`:na}
+    <div class="sect">Splice records (${sp.length})</div>
+    ${sp.length?sp.map(r=>`<div class="kv"><span class="mono">${esc(r.anchor)}</span>
+        <span class="dim2">${(r.calls||[]).length} call(s), age ${esc(r.age_turns)} turn(s)</span></div>`).join("")
+      +`<details><summary>Splice JSON</summary><pre>${esc(JSON.stringify(sp,null,2))}</pre></details>`
+      :'<span class="dim2">none</span>'}
+    <div class="sect">Tool events (${te.length})</div>
+    ${te.length?`<div class="tbl-wrap"><table><thead><tr><th>Tool</th><th>Direction</th><th>Call id</th></tr></thead><tbody>
+        ${te.map(e=>`<tr><td class="mono">${esc(e.tool_name)}</td><td>${esc(e.direction)}</td><td class="mono dim2">${esc(e.tool_call_id)}</td></tr>`).join("")}
+      </tbody></table></div><details><summary>Tool events JSON</summary><pre>${esc(JSON.stringify(te,null,2))}</pre></details>`
+      :'<span class="dim2">none</span>'}`;
 }
 async function turnMessages(key){
   const box=$("#tmsgs");box.innerHTML=skel(3);
@@ -1120,12 +1647,20 @@ async function deleteTurn(key){
   const v=await ask({title:"Delete turn",danger:true,ok:"Delete",
     body:`Tombstone semantics (ADR-0012): appended to the Memory Hub, cascaded in the Memory Index, never revived on rebuild.<br><span class="mono">${esc(key)}</span><br><br>This cannot be undone.`});
   if(!v)return;
-  try{await api("DELETE",turnPath(key));
-    toastMsg("Tombstone written");closeDrawer();
+  try{const r=await api("DELETE",turnPath(key));
+    writeDone(r,"Tombstone written");closeDrawer();
   }catch(e){toastMsg(e.message,"err");}
 }
 
 /* ═══════════════ Rules & Config（硬规则 + 实际生效配置 + drift）═══════════════ */
+/* 批 DS1（DS-12）：硬规则自批 Z1.2（MQ-W18）起热加载——每 BLADEX_HARD_RULES_RELOAD_S 秒
+   对账 config/.env 与 Hub 最近一条 hard_rules_set（Obsidian 回流），后写者赢
+   （bladex_proxy/hard_rules.py 文首）。周期取进程实际生效值；0 = 关热加载，才需要重启。 */
+function hardRulesHowTo(reloadS){
+  const n=Number(reloadS);
+  if(!(n>0))return `Hot reload is off in this process (<span class="mono">BLADEX_HARD_RULES_RELOAD_S=0</span>): edit <span class="mono">BLADEX_HARD_RULES</span> in config/.env, then restart the proxy.`;
+  return `Edit <span class="mono">BLADEX_HARD_RULES</span> in config/.env, or the Hard Rules page in the Obsidian export — either takes effect within ${esc(n)} s, no restart needed. If both change, the later write wins. A change that would leave zero rules is rejected and the current rules are kept (see <span class="mono">hard_rules_reload_rejected</span> in the log).`;
+}
 async function viewConfig(){
   const m=$("#main");m.innerHTML=skel(4,60);
   let rules,status;
@@ -1137,7 +1672,7 @@ async function viewConfig(){
     ${driftBanner(status)}
     <div class="card"><h3>MUST / NEVER hard rules (${rules.count}, injected every turn)</h3>
       ${(rules.hard_rules||[]).map(r=>`<div class="kv"><span>${esc(r)}</span></div>`).join("")||emptyState("No hard rules configured")}
-      <p class="dim" style="margin-bottom:0">Hard rules live in configuration: edit <span class="mono">BLADEX_HARD_RULES</span> in config/.env, then restart the proxy.</p></div>
+      <p class="dim" style="margin-bottom:0">${hardRulesHowTo(eff.BLADEX_HARD_RULES_RELOAD_S)}</p></div>
     <div class="grid">
       <div class="card"><h3>Effective memory configuration</h3>
         <p class="dim" style="margin-top:0">Values the running process is actually using - not what the file says.</p>
@@ -1226,31 +1761,50 @@ async function fileBody(id){
 }
 
 /* ═══════════════ Projects（项目库 E7.2）═══════════════ */
+/* DS-14（批 DS2）：BA2 之后这里是真实项目。翻页 + 总数，此前写死 limit=200 且看不出还有没看到的。 */
+let pOffset=0;
 async function viewProjects(){
-  const m=$("#main");
-  m.innerHTML=`<div class="card"><div class="tbl-wrap"><table id="ptab"><thead><tr>
-    <th style="width:22%">Name</th><th style="width:30%">Root path</th><th>Languages</th>
+  pOffset=0;
+  $("#main").innerHTML=`<div class="card"><div class="tbl-wrap"><table id="ptab"><thead><tr>
+    <th style="width:20%">Name</th><th>Project</th><th style="width:26%">Root path</th><th>Languages</th>
     <th>Agents</th><th>Origin</th><th>Updated</th>
-  </tr></thead><tbody><tr><td colspan="6">${skel(4)}</td></tr></tbody></table></div></div>`;
-  let d;try{d=await api("GET","/admin/projects?limit=200");}
-  catch(e){if(e.auth)return authGate();m.innerHTML=errorCard(e.message,"viewProjects()");return;}
+  </tr></thead><tbody><tr><td colspan="7">${skel(4)}</td></tr></tbody></table></div>
+  <div class="pager" id="ppager"></div></div>`;
+  await loadProjects();
+}
+async function loadProjects(){
+  const q=new URLSearchParams({limit:String(PAGE),offset:String(pOffset)});
+  let d;try{d=await api("GET","/admin/projects?"+q);}
+  catch(e){if(e.auth)return authGate();$("#main").innerHTML=errorCard(e.message,"viewProjects()");return;}
   $("#ptab tbody").innerHTML=(d.projects||[]).map(p=>`<tr class="click" onclick="projectDetail('${esc(p.project_id)}')">
     <td>${esc(p.name||"(unnamed)")}</td>
-    <td class="mono dim" title="${esc(p.root_path)}">${esc(p.root_path||"")}</td>
+    <td class="mono dim">${esc(p.project_id)}</td>
+    <td class="mono dim" title="${esc(p.root_path)}">${p.root_path?esc(p.root_path):'<span class="dim2">n/a</span>'}</td>
     <td>${(p.languages||[]).map(l=>`<span class="tag acc">${esc(l)}</span>`).join(" ")}</td>
     <td>${(p.agent_ids||[]).map(a=>`<span class="tag">${esc(a)}</span>`).join(" ")}</td>
     <td>${p.origin==="manual"?'<span class="tag manual">manual</span>':'<span class="tag">auto</span>'}</td>
-    <td class="dim num">${tsCell(p.updated_at,"min")}</td></tr>`).join("")||`<tr><td colspan="6">${emptyState("No projects discovered yet",
-      "Projects are inferred from rule files and member fact paths of Matters")}</td></tr>`;
+    <td class="dim num">${tsCell(p.updated_at,"min")}</td></tr>`).join("")||`<tr><td colspan="7">${emptyState("No projects discovered yet",
+      "Projects come from the identity of each request, rule files and member fact paths of Matters")}</td></tr>`;
+  $("#ppager").innerHTML=pagerHtml(d.total||0,pOffset,"pPage");
+}
+function pPage(dir){pOffset=Math.max(0,pOffset+dir*PAGE);loadProjects();}
+/* 关联账本：`active_in` 由服务端拆好（agent, project），这里只比对。读失败显示 n/a，不写「没有」。 */
+async function projectLedgersHtml(id){
+  let rows;try{rows=(await api("GET","/admin/ledgers")).ledgers||[];}
+  catch(e){return `<div class="sect">Active ledgers</div><div class="kv dim2">n/a (${esc(e.message)})</div>`;}
+  const hit=rows.filter(l=>(l.active_in||[]).some(s=>s.project===id));
+  return `<div class="sect">Active ledgers</div>`+(hit.map(l=>`<div class="kv"><span>${ledgerLink(l.ledger_id,l.title)}</span>${ledgerStatusTag(l.status)}</div>`).join("")
+    ||'<div class="kv dim2">No ledger is active in this project</div>');
 }
 async function projectDetail(id){
   let p;try{p=await api("GET","/admin/projects/"+encodeURIComponent(id));}
   catch(e){toastMsg(e.message,"err");return;}
+  const ledgersHtml=await projectLedgersHtml(id);
   openDrawer(drawerShell(esc(p.name||id),
     `${p.origin==="manual"?'<span class="tag manual">manual</span>':'<span class="tag">auto</span>'}`,
     `${p.description?`<p style="margin:0 0 10px;line-height:1.6">${esc(p.description)}</p>`:""}
      <div class="fields">
-       ${field("project id",p.project_id,1)}${field("root path",p.root_path,1)}
+       ${field("project id",p.project_id,1)}${field("root path",p.root_path||"n/a",1)}
        ${field("version",p.version)}${field("updated",fmtTs(p.updated_at))}
      </div>
      ${(p.languages||[]).length?`<div class="sect">Languages</div>
@@ -1258,10 +1812,20 @@ async function projectDetail(id){
      ${(p.agent_ids||[]).length?`<div class="sect">Agents</div>
        ${p.agent_ids.map(a=>`<span class="tag">${esc(a)}</span>`).join(" ")}`:""}
      ${p.progress_note?`<div class="sect">Progress</div><p class="dim" style="line-height:1.6">${esc(p.progress_note)}</p>`:""}
+     ${ledgersHtml}
      <details style="margin-top:14px"><summary>Raw JSON</summary><pre>${esc(JSON.stringify(p,null,2))}</pre></details>`));
 }
 
 /* ═══════════════ Profiles（用户偏好 E7.3 + 工具习惯 E7.4）═══════════════ */
+/* 批 DS1（DS-11）：USER.md / AGENT.md 的 Flash 投影已在批 F4 删除（MQ-F5），画像卡注入在批 S 删除。
+   这两份文本仍由 Index 空闲轮生成，**唯一的读者是这一页**——它们不进任何 agent 的上下文。
+   行为画像（last seen / 活跃度）在 /admin/behavior，即 Activity 页。 */
+const PROFILE_NOTE="Generated by the Memory Index on idle passes for inspection only. It is not injected into any agent and no longer projected as USER.md / AGENT.md files. The behaviour profile (last seen, activity) is on the Activity tab (/admin/behavior).";
+/* 「最近 ?」= last_seen 的生产链断了（behavior.py 文首 S4）。只删值为 ? 的那一截，真值照显，
+   并在卡片下写明删了什么——不静默改数据。 */
+// 匹配 USER.md 里的「，最近 ?）」（转义写法：UI 文案守卫不许代码行出现中文）
+const UNKNOWN_LAST_SEEN=/\uff0c\u6700\u8fd1 \?\uff09/g;
+function stripUnknownLastSeen(md){return String(md||"").replace(UNKNOWN_LAST_SEEN,"\uff09");}
 let profileData=null;
 async function viewProfiles(){
   const m=$("#main");m.innerHTML=skel(5,60);
@@ -1269,23 +1833,25 @@ async function viewProfiles(){
   catch(e){if(e.auth)return authGate();m.innerHTML=errorCard(e.message,"viewProfiles()");return;}
   profileData=d;
   m.innerHTML=`
-    <div class="card"><h3>USER.md - user profile (recall reference frame)</h3>
-      ${d.user_md?`<pre style="max-height:320px">${esc(d.user_md)}</pre>`
-        :emptyState("USER.md not generated yet","The consolidator renders profile docs on idle passes once facts exist")}</div>
+    <div class="card"><h3>Generated user summary</h3>
+      <p class="dim" style="margin-top:0">${PROFILE_NOTE}</p>
+      ${d.user_md?`<pre style="max-height:320px">${esc(stripUnknownLastSeen(d.user_md))}</pre>
+          ${String(d.user_md).search(UNKNOWN_LAST_SEEN)>=0?'<p class="dim2" style="margin-bottom:0">"last seen" is not produced for this summary and has been left out; per-agent last seen is on the <a class="link" href="#/activity">Activity</a> tab.</p>':""}`
+        :emptyState("No summary generated yet","The Memory Index renders it on idle passes once facts exist")}</div>
     <div class="card"><h3>Agents (${d.agent_count})</h3>
       <div class="tbl-wrap"><table><thead><tr>
-        <th>Agent</th><th>Habit doc</th><th>Rule files</th><th class="r">Tools tracked</th><th>Top tool</th>
+        <th>Agent</th><th>Generated note</th><th>Rule files</th><th class="r">Tools tracked</th><th>Top tool</th>
       </tr></thead><tbody>
       ${(d.agents||[]).map((a,i)=>{
         const top=(a.tools||[])[0];
         return `<tr class="click" onclick="profileDetail(${i})">
         <td><span class="tag acc">${esc(a.agent_base)}</span></td>
-        <td>${a.agent_md?'<span class="tag ok">generated</span>':'<span class="tag">none</span>'}</td>
+        <td>${a.agent_md?'<span class="tag">generated</span>':'<span class="tag">none</span>'}</td>
         <td>${(a.rule_files||[]).map(r=>`<span class="tag">${esc(r)}</span>`).join(" ")||'<span class="dim2">-</span>'}</td>
         <td class="r num">${(a.tools||[]).length}</td>
         <td>${top?`<span class="mono dim">${esc(top.name)}</span> <span class="dim2 num">(${top.calls??0} calls)</span>`:'<span class="dim2">-</span>'}</td>
       </tr>`;}).join("")||`<tr><td colspan="5">${emptyState("No agent profiles yet",
-        "Per-agent habit docs, rule file copies and tool stats appear as traffic flows")}</td></tr>`}
+        "Rule file copies and tool stats appear as traffic flows")}</td></tr>`}
       </tbody></table></div></div>`;
 }
 function profileDetail(i){
@@ -1294,12 +1860,13 @@ function profileDetail(i){
   const maxCalls=Math.max(1,...tools.map(t=>t.calls||0));
   openDrawer(drawerShell(`Agent <span class="tag acc">${esc(a.agent_base)}</span>`,"",
     `<div class="tabs">
-       <button class="on" onclick="profTab(this,'md')">Habit doc</button>
+       <button class="on" onclick="profTab(this,'md')">Generated note</button>
        <button onclick="profTab(this,'rules')">Rule files</button>
        <button onclick="profTab(this,'tools')">Tool usage</button></div>
      <div id="pt-md">
+       <p class="dim" style="margin-top:0">${PROFILE_NOTE}</p>
        ${a.agent_md?`<pre style="max-height:460px">${esc(a.agent_md)}</pre>`
-         :emptyState("Habit doc not generated yet")}
+         :emptyState("No note generated yet")}
      </div>
      <div id="pt-rules" hidden>
        <p class="dim" style="margin-top:0">Rule file copies captured from this agent, refreshed when content hash changes.</p>
@@ -1337,12 +1904,21 @@ async function ruleFileBody(base,name){
    未识别的客户端各自落一个 `unknown-<hash>` 桶（宁分勿合）。认领 = 给它起名字，
    可选同时写一条识别规则回 config/agent_rules.toml，下次直接被认出来。
    认领走 AGENT_CLAIM 管理事件，历史数据在下次重建时改归属；日志不追改。 */
+/* 批 DS1（MQ-I42）：/admin/agents 在 live 上 ≈7 s（Hub 全扫）。加载中占位 + Refresh 不可点；
+   在途时回到本页共用同一个请求；结果回来时用户已经切走就不覆盖别的页。 */
+let agentsInflight=null;
+function agentsToolbar(loading){
+  return `<div class="row"><span class="grow"></span>
+    <button class="btn" id="arefresh" onclick="viewAgents()"${loading?" disabled":""}>${loading?"Loading…":"Refresh"}</button></div>`;
+}
 async function viewAgents(){
-  const m=$("#main");m.innerHTML=skel(3,60);
-  let d;try{d=await api("GET","/admin/agents");}
-  catch(e){if(e.auth)return authGate();m.innerHTML=errorCard(e.message,"viewAgents()");return;}
+  const m=$("#main");m.innerHTML=agentsToolbar(true)+loadingBlock("Loading agents from the Memory Hub…");
+  if(!agentsInflight)agentsInflight=api("GET","/admin/agents").finally(()=>{agentsInflight=null;});
+  let d;try{d=await agentsInflight;}
+  catch(e){if(tab!=="agents")return;if(e.auth)return authGate();m.innerHTML=errorCard(e.message,"viewAgents()");return;}
+  if(tab!=="agents")return;
   const unknown=d.unknown_buckets||[],known=d.known_agents||[],claims=d.claims||[];
-  m.innerHTML=`
+  m.innerHTML=agentsToolbar(false)+`
     <div class="card"><h3>Unrecognised clients (${unknown.length})</h3>
       <p class="dim">Each unknown client gets its own bucket rather than sharing one
         <span class="mono">unknown</span> namespace — merging unrelated agents into one
@@ -1416,9 +1992,10 @@ async function viewAgents(){
    多个未识别 agent 摆一起分不出谁是谁。认领要求先认出这是什么客户端，
    那就得把判断依据摆出来——按辨识度排序：system prompt > 工具 > header > 干了什么。*/
 async function agentDetail(id){
+  openDrawer(drawerShell(esc(id),"",loadingBlock("Sampling this agent's turns…")));
   let d;
   try{d=await api("GET","/admin/agents/"+encodeURIComponent(id)+"/detail");}
-  catch(e){toastMsg(e.message,"err");return;}
+  catch(e){openDrawer(drawerShell(esc(id),"",errorCard(e.message)));toastMsg(e.message,"err");return;}
   const hdrs=Object.entries(d.headers||{});
   const body=`
     <div class="fields">
@@ -1503,14 +2080,29 @@ async function agentRuleEdit(agentId, ruleName){
 async function agentClaim(from,drift){ return _agentNameDialog(from,drift,"claim"); }
 async function agentRename(from){ return _agentNameDialog(from,null,"rename"); }
 
+let _agentPrefetching=false;
 async function _agentNameDialog(from,drift,mode){
+  /* 预取约 10 s（两次全扫）：在途时再点不叠请求 */
+  if(_agentPrefetching)return;
   const isClaim=mode==="claim";
   /* 规则由系统从**已抓到的会话内容**提议（system prompt / 工具 / UA），
      用户只需确认或改 —— 不该让用户凭空手写（Jason 2026-08-19）。 */
-  let sug={};
-  try{sug=(await api("GET","/admin/agents/"+encodeURIComponent(from)+"/detail")).suggested_rule||{};}
-  // 详情取不到不挡操作，只是没得预填
-  catch(e){}
+  let sug={},knownList=[];
+  const prefetchErrs=[];
+  _agentPrefetching=true;
+  try{
+    await withPageLoading(`Loading ${from}… this can take several seconds on a large memory.`,async()=>{
+      try{sug=(await api("GET","/admin/agents/"+encodeURIComponent(from)+"/detail")).suggested_rule||{};}
+      // 详情取不到不挡操作，只是没得预填；但要告诉用户为什么没有预填（批 DS2）
+      catch(e){prefetchErrs.push("Could not load the suggested rule: "+e.message);}
+      if(isClaim){
+        try{knownList=((await api("GET","/admin/agents")).known_agents||[])
+              .map(a=>a.agent_id).filter(a=>a&&a!==from);}
+        catch(e){prefetchErrs.push("Could not load known agents, so no merge targets are listed: "+e.message);}
+      }
+    });
+  }finally{_agentPrefetching=false;}
+  prefetchErrs.forEach(m=>toastMsg(m,"err"));
   const looks=(drift||{}).looks_like||"";
   const sugKw=(sug.system_prompt_keywords||[])[0]||"";
   const sugTools=(sug.tool_signatures||[]).join(", ");
@@ -1533,10 +2125,6 @@ async function _agentNameDialog(from,drift,mode){
                     {name:"tools",label:"Distinctive tool names, comma separated",value:sugTools}];
   let v,target,ruleMode="none",hdrRule=null;
   if(isClaim){
-    let knownList=[];
-    try{knownList=((await api("GET","/admin/agents")).known_agents||[])
-          .map(a=>a.agent_id).filter(a=>a&&a!==from);}
-    catch(e){}
     const opts=[{value:"__new__",label:"\u2014 New agent (type a name below) \u2014"}]
       .concat(knownList.map(a=>({value:a,label:"Merge into "+a})));
     const pre=(looks&&knownList.includes(looks))?looks:"__new__";
@@ -1598,7 +2186,8 @@ async function _agentNameDialog(from,drift,mode){
     payload.rule={name:target,agent_id:target,header_patterns:[hdrRule]};
   }
   let r;
-  try{r=await api("POST","/admin/agents/claim",payload);}
+  const postClaim=()=>withPageLoading(`Saving ${target}…`,()=>api("POST","/admin/agents/claim",payload));
+  try{r=await postClaim();}
   catch(e){
     /* 红线：合并需二次确认。端点返回 confirm_required，这里再问一次而不是直接放行。
        🔴 判据用**结构化的 `status` 字段**，不再对错误文案做正则猜测——
@@ -1611,11 +2200,12 @@ async function _agentNameDialog(from,drift,mode){
         fields:[]});
       if(!ok)return;
       payload.confirm_merge=true;
-      try{r=await api("POST","/admin/agents/claim",payload);}
+      try{r=await postClaim();}
       catch(e2){toastMsg(e2.message,"err");return;}
     }else{toastMsg(e.message,"err");return;}
   }
-  toastMsg(r.rule_path?"Claimed; rule saved":"Claimed");
+  if(r&&r.__status===202)toastMsg(MSG_DEFERRED,"warn");
+  else toastMsg(r&&r.rule_path?"Claimed; rule saved":"Claimed");
   /* 🔴 认领只让**新流量**归位。存量 Fact 与 Matter 卡的 agent_id 是创建时写死的，
      而增量重建会把"内容相同、只有归属该改"的纠正版当重复丢掉
      （novelty verdict=vector_kill）—— 不做这一步，用户会以为改完了。 */
@@ -1678,11 +2268,108 @@ async function viewActivity(){
           "Only agents with real turns appear here")}</td></tr>`}
     </tbody></table></div></div>`;
 }
+/* ═══════════════ Usage（批 DS2，MQ-P34 展示面）═══════════════
+   数据源 = /admin/usage。🔴 页面不汇总：totals / groups 都是服务端 `usage.aggregate` 的结果，
+   这里只排版、只切片（汇总的单一实现点在服务端，CLI 也只调它）。
+   「没有读数」不算 0：usageCell 与 CLI `_usage_lines._n` 同一口径（原则 13 层 4）。 */
+const USAGE_NOTE="n/d = turns with no data for that field (not counted as 0). BladeX's own distill / adjudicate / link calls are not in the Hub and not shown.";
+const USAGE_PAGE=100;
+let uRows=[],uOffset=0,uSeq=0;
+function usageCell(b,f){
+  const nd=b[f+"_nodata"]||0,t=b.turns||0;
+  const v=(nd&&nd>=t)?"n/a":Number(b[f]||0).toLocaleString("en-US");
+  return v+(nd?` (+${nd} n/d)`:"");
+}
+function usageParams(){
+  const val=id=>(($(id)||{}).value||"").trim(),p=new URLSearchParams();
+  const win=val("#uwin")||"7";
+  if(win==="custom"){
+    const since=val("#usince"),until=val("#uuntil");
+    if(!since&&!until)throw new Error("Enter since or until for a custom window");
+    if(since)p.set("since",since);
+    if(until)p.set("until",until);
+  }else p.set("days",win);
+  [["#uagent","agent"],["#umodel","model"],["#usession","session"],["#utz","tz"]].forEach(([id,k])=>{
+    const x=val(id);if(x)p.set(k,x);});
+  return p;
+}
+function usageWinChanged(){
+  const custom=$("#uwin").value==="custom";
+  $("#usince").hidden=!custom;$("#uuntil").hidden=!custom;
+}
+async function viewUsage(){
+  $("#main").innerHTML=`<div class="row">
+    <select class="input" id="uwin" onchange="usageWinChanged()">
+      <option value="1">Last 1 day</option><option value="7" selected>Last 7 days</option>
+      <option value="30">Last 30 days</option><option value="custom">Custom window</option></select>
+    <input class="input" id="usince" placeholder="since (ISO time)" hidden>
+    <input class="input" id="uuntil" placeholder="until (ISO time)" hidden>
+    <input class="input" id="uagent" placeholder="agent">
+    <input class="input" id="umodel" placeholder="model">
+    <input class="input" id="usession" placeholder="session">
+    <input class="input" id="utz" placeholder="tz, e.g. Asia/Shanghai">
+    <button class="btn" id="uapply" onclick="loadUsage(this)">Apply</button></div>
+  <div id="uresult"></div>`;
+  await loadUsage($("#uapply"));
+}
+async function loadUsage(btn){
+  let params;
+  try{params=usageParams();}catch(e){toastMsg(e.message,"err");return;}
+  const seq=++uSeq;
+  $("#uresult").innerHTML=loadingBlock("Reading usage from the Memory Hub…");
+  await busy(btn,"Loading…",async()=>{
+    let d;try{d=await api("GET","/admin/usage?"+params);}
+    catch(e){
+      if(seq!==uSeq||tab!=="usage")return;
+      if(e.auth)return authGate();
+      $("#uresult").innerHTML=errorCard(e.message,"loadUsage($('#uapply'))");return;
+    }
+    /* 用户已切走或又点了 Apply：不覆盖 */
+    if(seq!==uSeq||tab!=="usage")return;
+    uRows=d.groups||[];uOffset=0;renderUsage(d);
+  });
+}
+function usageWindowLine(d){
+  const w=d.window||{};
+  return `Window: [${w.since||"-"}, ${w.until||"now"})  tz ${w.tz}`;
+}
+function renderUsage(d){
+  const active=Object.entries(d.filters||{}).filter(([,v])=>v);
+  const totals=Object.entries(d.totals||{}).map(([lane,b])=>`<tr><td>${esc(lane)}</td>
+    <td class="r num">${fmtNum(b.turns||0)}</td><td class="r num">${esc(usageCell(b,"input"))}</td>
+    <td class="r num">${esc(usageCell(b,"output"))}</td><td class="r num">${esc(usageCell(b,"cache_read"))}</td></tr>`).join("");
+  $("#uresult").innerHTML=`<div class="card">
+      <div class="mono dim" id="uwindow" style="white-space:pre-wrap">${esc(usageWindowLine(d))}${active.length
+        ?"\n"+esc("Filters: "+active.map(([k,v])=>`${k}=${v}`).join("  ")):""}</div>
+      <div class="sect">Totals</div>
+      <div class="tbl-wrap"><table id="utotals"><thead><tr><th>Lane</th><th class="r">Turns</th>
+        <th class="r">Input</th><th class="r">Output</th><th class="r">Cache read</th></tr></thead>
+        <tbody>${totals}</tbody></table></div></div>
+    <div class="card"><div class="sect" id="ucount">By day, agent, model, lane and session (${fmtNum(uRows.length)} rows)</div>
+      <div class="tbl-wrap"><table id="ugroups"><thead><tr><th>Day</th><th>Agent</th><th>Model</th>
+        <th>Lane</th><th>Session</th><th class="r">Turns</th><th class="r">Input</th><th class="r">Output</th>
+        <th class="r">Cache read</th></tr></thead><tbody id="ugroups-body"></tbody></table></div>
+      <div class="pager" id="upager"></div>
+      <p class="dim2" id="unote">${esc(USAGE_NOTE)}</p></div>`;
+  renderUsageRows();
+}
+/* 明细可能很多：客户端切片翻页，不再计算 */
+function renderUsageRows(){
+  const page=uRows.slice(uOffset,uOffset+USAGE_PAGE);
+  $("#ugroups-body").innerHTML=page.map(g=>`<tr><td class="num">${esc(g.day)}</td>
+    <td><span class="tag acc">${esc(g.agent)}</span></td><td class="mono dim">${esc(g.model)}</td>
+    <td>${esc(g.lane)}</td><td class="mono dim" title="${esc(g.session)}">${esc(String(g.session).slice(0,12))}</td>
+    <td class="r num">${fmtNum(g.turns||0)}</td><td class="r num">${esc(usageCell(g,"input"))}</td>
+    <td class="r num">${esc(usageCell(g,"output"))}</td><td class="r num">${esc(usageCell(g,"cache_read"))}</td></tr>`).join("")
+    ||`<tr><td colspan="9">${emptyState("No turns in this window","Widen the window or clear the filters")}</td></tr>`;
+  $("#upager").innerHTML=pagerHtml(uRows.length,uOffset,"uPage",USAGE_PAGE);
+}
+function uPage(dir){uOffset=Math.max(0,uOffset+dir*USAGE_PAGE);renderUsageRows();}
 const VIEWS={overview:viewOverview,ledgers:viewLedgers,facts:viewFacts,
              matters:viewMatters,
              files:viewFiles,projects:viewProjects,profiles:viewProfiles,
              graph:viewGraph,sessions:viewSessions,agents:viewAgents,
-             config:viewConfig,activity:viewActivity};
+             config:viewConfig,activity:viewActivity,usage:viewUsage};
 window.addEventListener("hashchange",route);
 (function initTz(){
   const t=tzLabel(),el=$("#tz");

@@ -226,22 +226,88 @@ _BARE_PREFIX_RES = (
 #:
 #: 🔴 判据 = **整条以它开头**（`lstrip` 后 `startswith`），不是 `in`：
 #: 本仓的文档与结算稿会逐字引用这句话，用 `in` 就是 MQ-A19 自指陷阱的第 N 次复发。
+#:
+#: MQ-L103（2026-10-27）：dsh 0.2.1 停顿后会单发一条三行 user 消息
+#: `Time sampled while preparing turn …`（时间 / 时区 / 距上一条消息的间隔）。
+#: 它同样剥不掉，且常排在用户句之后 ⇒ Goal / 召回 / 点名 / 举证全拿时间戳。
+#: 修法沿用这张表：整条即机器文本 ⇒ 判空并继续往前找。Hub 快照反方向 0 例
+#:（没有「以前缀开头但后面还跟用户内容」的形态），所以不收紧成逐行校验。
 _MACHINE_ONLY_PREFIXES: tuple[tuple[str, str], ...] = (
     ("dsh_runtime_context", "current runtime context. this snapshot supersedes"),
+    ("dsh_time_sample", "time sampled while preparing turn"),
+    # MQ-L129（批 DA · F）：Pi 压缩后续接。整条 = `The conversation history before this point
+    # was compacted into the following summary:\n\n<summary>…</summary>`（CA 快照 9 条，
+    # 末尾即 </summary>，其后没有用户话）⇒ 整条机器文本。
+    ("pi_compaction_summary",
+     "the conversation history before this point was compacted into the following summary:"),
 )
+
+#: MQ-L129（批 DA · F，MQ-L81 同族）：Hermes 写在用户话**之前**的两种头部信封，剥头保尾。
+#: 形态与位置以 CA 快照 11-17 为准（interrupt 55 种独立原文、cron 1 种，逐条核过）：
+#: - `hermes_interrupt`：`[Context from the interrupted assistant response]\n
+#:   [This response was interrupted by a user correction.]\n\n<用户话>`——两行头 + 空行，
+#:   真话在空行之后；第二行放宽成「任意一行方括号注记」（快照里 55/55 都是上面那句）。
+#: - `hermes_cron`：`[IMPORTANT: You are running as a scheduled cron job. … [SILENT] …]\n\n<任务描述>`——
+#:   头部是单行指令（内含 `[SILENT]`，故不能按「第一个 ] 」截，只按「行尾 ] + 空行」）。
+#:   🔴 **只剥这句指令，保留任务描述**：cron 的任务描述就是用户布置的事（CA §9.2 两条
+#:   「换题不切」即此），全剥 = 这类轮的话题恒为空。描述超长由 Goal 的 `_GOAL_MAX_CHARS` 截。
+#: 🔴 只锚消息开头（`\A`），不在正文里搜：本仓文档会逐字引用这些句子（MQ-A19 自指陷阱）。
+#: 头部后必须紧跟空行或消息结束，剥完为空 ⇒ 按「整条机器文本」处理（调用方往前找）。
+_HEAD_ENVELOPE_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("hermes_interrupt", re.compile(
+        r"\A\s*\[Context from the interrupted assistant response\]"
+        r"(?:[ \t]*\n\[[^\n]*\])?(?=\s*\n\s*\n|\s*\Z)\s*")),
+    ("hermes_cron", re.compile(
+        r"\A\s*\[IMPORTANT: You are running as a scheduled cron job[^\n]*\]"
+        r"(?=\s*\n\s*\n|\s*\Z)\s*")),
+)
+
+
+#: MQ-L111：agent 网关写进用户消息的 `[System note: …]`。来源（Hermes `gateway/run.py`）两种位置：
+#: 会话重置注记挂在用户话**之后**（sidecar），中断 / 自动续轮注记在用户话**之前**，后者可能整条都是注记。
+#: 落点与 `_MACHINE_ONLY_PREFIXES` 同一条理由：不动蒸馏消费的 `strip_envelopes`。
+#:
+#: 🔴 只剥消息**两端**、独立成段的注记，正文中间引用的不动（MQ-A19 自指陷阱：讨论这句话的用户消息）。
+#: 注记内部不换行，尾部模式因此可以锚到行；首部注记后面必须紧跟空行或消息结束。
+_SYSTEM_NOTE_HEAD_RE = re.compile(r"\A\s*\[System note:[^\n]*\](?=\s*\n\s*\n|\s*\Z)")
+_SYSTEM_NOTE_TAIL_RE = re.compile(r"(?:\A|\s*\n)\s*\[System note:[^\n]*\]\s*\Z")
+
+
+def _strip_system_notes(text: str) -> tuple[str, int]:
+    """剥消息两端的 `[System note: …]`，返回 (剩下的文本, 剥掉几条)。"""
+    total = 0
+    for pat in (_SYSTEM_NOTE_HEAD_RE, _SYSTEM_NOTE_TAIL_RE):
+        while True:
+            text, n = pat.subn("", text, count=1)
+            if not n:
+                break
+            total += n
+    return text, total
 
 
 def _clean_user_text(raw: str) -> tuple[str, list[str]]:
     """一条 user 消息 → `(剥完的正文, marks)`。Goal 侧与召回侧的**唯一**清洗口径。
 
-    三道，顺序固定：① `envelope.strip_envelopes`（生产表，不动它）；
-    ② 整条即机器运行时上下文 ⇒ 判空（`_MACHINE_ONLY_PREFIXES`）；
-    ③ 裸前缀句 / 通用包装标签解包（`_BARE_PREFIX_RES` / `_WRAPPER_TAG_RE`）。
+    五道，顺序固定：① `envelope.strip_envelopes`（生产表，不动它）；
+    ② 消息两端的 `[System note: …]`（`_strip_system_notes`，MQ-L111）；
+    ②b 开头的 Hermes 中断恢复 / 定时任务信封，剥头保尾（`_HEAD_ENVELOPE_RES`，MQ-L129）；
+    ③ 整条即机器运行时上下文 ⇒ 判空（`_MACHINE_ONLY_PREFIXES`，含 Pi 压缩续接）；
+    ④ 裸前缀句 / 通用包装标签解包（`_BARE_PREFIX_RES` / `_WRAPPER_TAG_RE`）。
 
     返回空串 = 「这条里没有用户说的话」，调用方据此往前找。
     """
     from bladex_core.envelope import strip_envelopes
     cleaned, marks = strip_envelopes(raw)
+    cleaned, n_notes = _strip_system_notes(cleaned)
+    if n_notes:
+        marks = [*marks, "system_note"]
+    for kind, pat in _HEAD_ENVELOPE_RES:
+        stripped, n = pat.subn("", cleaned, count=1)
+        if n:
+            cleaned = stripped
+            marks = [*marks, kind]
+            if not cleaned.strip():
+                return "", marks
     head = cleaned.lstrip().lower()
     for kind, marker in _MACHINE_ONLY_PREFIXES:
         if head.startswith(marker):

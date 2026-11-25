@@ -33,8 +33,9 @@ from typing import Any
 import structlog
 from bladex_core.ledger import switch_timeline
 from bladex_core.ledger_runtime import agent_of_turn_key, split_scope
+from bladex_core.project import canonical_project_id
 
-from bladex_proxy.ledger_events import load_ledger_events
+from bladex_proxy.ledger_events import load_ledger_events, refresh_project_key_map
 
 logger = structlog.get_logger(__name__)
 
@@ -50,6 +51,10 @@ def project_scope_preview(hub: Any, project_ids: list[str]) -> dict[str, dict[st
     :returns: `{project_id: {"turn_keys", "turn_count", "agents", "first_ts", "last_ts",
               "project_names", "ledgers"}}`。请求了但一条轮次都没有的 project 也在返回里
               （读数为 0），**不静默丢键**——"没有这个 project"与"我没查"必须能分开。
+
+    批 BA2c（MQ-A101）：比的是**现行键**，存值与请求两边都过 `canonical_project_id`。迁移后同一项目
+    有新旧两个键（Hub 不改写），直接比存值会静默漏删。同时传了同一项目的新旧键时，轮次归第一个，
+    后面那个读数为 0 并带 `same_as`：端点逐行累加 total、逐行打墓碑，不能算两遍。
     """
     wanted = list(dict.fromkeys(project_ids))  # 去重保序
     if any(not (p or "").strip() for p in wanted):
@@ -59,17 +64,26 @@ def project_scope_preview(hub: Any, project_ids: list[str]) -> dict[str, dict[st
     if not wanted:
         raise EmptyProjectRefused("no project_id given")
 
+    # `hub` 是真实 MemoryHub（CLI 也只走 /admin 这一条）；下面的快照没有 `_path`，装不了表。
+    refresh_project_key_map(hub)
+    owner: dict[str, str] = {}
+    for p in wanted:
+        owner.setdefault(canonical_project_id(p), p)
+
     snapshot = hub.scan_meta_snapshot()
     out: dict[str, dict[str, Any]] = {
         p: {"turn_keys": [], "turn_count": 0, "agents": {}, "first_ts": None,
             "last_ts": None, "project_names": [], "ledgers": 0}
         for p in wanted
     }
+    for p in wanted:
+        first = owner[canonical_project_id(p)]
+        if first != p:
+            out[p]["same_as"] = first
     names: dict[str, set[str]] = {p: set() for p in wanted}
-    target = set(wanted)
     for key, meta in snapshot.rows:
-        pid = str(meta.get("project_id", "") or "")
-        if pid not in target:
+        pid = owner.get(canonical_project_id(str(meta.get("project_id", "") or "")))
+        if pid is None:
             continue
         row = out[pid]
         row["turn_keys"].append(key)
@@ -89,8 +103,9 @@ def project_scope_preview(hub: Any, project_ids: list[str]) -> dict[str, dict[st
     per_project: dict[str, set[str]] = {p: set() for p in wanted}
     for scope, seq in timeline.items():
         _agent, project = split_scope(scope)
-        if project in per_project:
-            per_project[project].update(lid for _ts, lid in seq if lid)
+        first = owner.get(project)      # `load_ledger_events` 已翻成现行键
+        if first is not None:
+            per_project[first].update(lid for _ts, lid in seq if lid)
 
     for pid, row in out.items():
         row["turn_count"] = len(row["turn_keys"])

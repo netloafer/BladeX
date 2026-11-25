@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 
 import typer
@@ -121,13 +122,113 @@ def memory_search(
     return 0
 
 
+def _fact_history_lines(d: dict) -> list[str]:
+    """`/admin/facts/{id}/history` 的响应 → 文本。只排版；不认识的事件类型照常列出，不丢。"""
+    state = d.get("fact_state")
+    head = {"present": "", "absent": " (no longer in the Memory Index)",
+            "no_reading": " (Memory Index not readable, so the current text is unknown)"}.get(state, "")
+    lines = [f"Fact {d.get('fact_id')}{head}"]
+    if d.get("content") is not None:
+        lines.append(f"  text: {d['content']}")
+    for section in ("source", "supersession"):
+        for k, v in (d.get(section) or {}).items():
+            if v not in (None, ""):
+                lines.append(f"  {k}: {v}")
+    events = d.get("events") or []
+    lines += ["", f"History ({len(events)})" if events else "History: no corrections or deletion recorded"]
+    for e in events:
+        who = e.get("origin") or "-"
+        lines.append(f"  {e.get('at')}  {e.get('type')}  origin={who}")
+        for k, v in e.items():
+            if k not in ("type", "at", "origin", "key") and v not in (None, ""):
+                lines.append(f"    {k}: {v}")
+    return lines
+
+
 @memory_app.command("show")
-def memory_show(fact_id: str = typer.Argument(...)) -> int:
+def memory_show(
+    fact_id: str = typer.Argument(...),
+    history: bool = typer.Option(False, "--history",
+                                 help="Where the fact came from, and every correction or deletion"),
+    as_json: bool = typer.Option(False, "--json", help="With --history: print the server's JSON as-is"),
+) -> int:
     """Show one fact (GET /admin/facts/{id})."""
+    if as_json and not history:
+        print("✗ --json only applies to --history (plain `memory show` already prints JSON)",
+              file=sys.stderr)
+        return 2
+    if history:
+        # CLI 不自己算：只调端点（批 DS2）。--json 与端点逐字相等。
+        code, data = _admin_call("GET", f"/admin/facts/{fact_id}/history")
+        if code != 200:
+            return _print_op_result(code, data)
+        if as_json:
+            print(json.dumps(data, ensure_ascii=False))
+            return 0
+        for line in _fact_history_lines(data):
+            print(line)
+        return 0
     code, data = _admin_call("GET", f"/admin/facts/{fact_id}")
     if code != 200:
         return _print_op_result(code, data)
     print(json.dumps(data, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _conflict_lines(d: dict) -> list[str]:
+    """`/admin/contradictions` 的响应 → 文本。只排版，不自己算任何东西（与端点逐字对应）。"""
+    items = d.get("items") or []
+    lines = [f"Conflicts: {d.get('total', len(items))}" + ("" if items else " (none)")]
+    for it in items:
+        lines.append(f"  {it.get('pair_id')}  [{it.get('status')}]  flagged {it.get('flagged_at')}"
+                     f"  model={it.get('judge_model')}")
+        for f in it.get("facts") or []:
+            lines.append(f"    {f.get('id')}: {f.get('content')}")
+        if it.get("reason"):
+            lines.append(f"    why: {it['reason']}")
+        if it.get("settled_at"):
+            lines.append(f"    settled {it['settled_at']} by {it.get('origin')}"
+                         + (f": {it['note']}" if it.get("note") else ""))
+    if items:
+        lines.append("Settle with `bladex memory settle <pair_id> --verdict not_same_thing|confirmed`. "
+                     "BladeX never deletes for you; use `bladex memory forget <id>` if one is wrong.")
+    return lines
+
+
+@memory_app.command("conflicts")
+def memory_conflicts(
+    status: str = typer.Option("", "--status", help="unsettled | not_same_thing | confirmed | obsolete"),
+    limit: int = typer.Option(50, "--limit"),
+    offset: int = typer.Option(0, "--offset"),
+    as_json: bool = typer.Option(False, "--json", help="Print the server's JSON as-is"),
+) -> int:
+    """List memories flagged as contradicting each other (experimental; GET /admin/contradictions)."""
+    code, data = _admin_call("GET", "/admin/contradictions",
+                             params={"status": status, "limit": limit, "offset": offset})
+    if code != 200:
+        return _print_op_result(code, data)
+    if as_json:
+        print(json.dumps(data, ensure_ascii=False))
+        return 0
+    for line in _conflict_lines(data):
+        print(line)
+    return 0
+
+
+@memory_app.command("settle")
+def memory_settle(
+    pair: str = typer.Argument(..., help="pair_id from `memory conflicts` (<fact_id>|<fact_id>)"),
+    verdict: str = typer.Option(..., "--verdict", help="not_same_thing | confirmed"),
+    note: str = typer.Option("", "--note"),
+) -> int:
+    """Record your ruling on a flagged pair (POST /admin/contradictions/{pair}/settle). Deletes nothing."""
+    from urllib.parse import quote
+
+    code, data = _admin_call("POST", f"/admin/contradictions/{quote(pair, safe='')}/settle",
+                             body={"verdict": verdict, "origin": "cli", "note": note})
+    if code != 200:
+        return _print_op_result(code, data)
+    print(f"✓ {data.get('pair_id')}: {data.get('verdict')} (origin={data.get('origin')})")
     return 0
 
 
@@ -394,3 +495,45 @@ def matter_rename(matter_id: str = typer.Argument(...),
     code, data = _admin_call("POST", f"/admin/matters/{matter_id}/rename",
                              body={"title": title})
     return _print_op_result(code, data)
+
+
+@storage_app.command("migrate-project-keys")
+def storage_migrate_project_keys(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report only; write nothing"),
+    json_output: bool = typer.Option(False, "--json", help="Print the report as JSON"),
+) -> None:
+    """One-off, re-runnable: unify project keys (derived layer only, the Hub is not rewritten).
+
+    Run it with BladeX stopped: it needs the Memory Index writable. Back up data/bladex_index first.
+    """
+    import json
+    from pathlib import Path
+
+    from bladex_proxy.config import ProxyConfig
+    from bladex_proxy.project_migration import run_migration
+    from bladex_proxy.storage.memory_hub import MemoryHub
+    from bladex_proxy.storage.memory_index import MemoryIndex
+
+    cfg = ProxyConfig()
+    hub = MemoryHub(cfg.rocksdb_path, read_only=True)
+    hub.open()
+    index = MemoryIndex(cfg.index_path, embedder=None, read_only=dry_run)
+    index.open()
+    try:
+        rep = run_migration((t for _k, t in hub.scan_prefix("")), index,
+                            Path(cfg.rocksdb_path).parent, dry_run=dry_run)
+    finally:
+        index.close()
+        hub.close()
+    if json_output:
+        typer.echo(json.dumps(rep.as_dict(), ensure_ascii=False, indent=1))
+        return
+    typer.echo(f"{'[dry-run] ' if dry_run else ''}project keys seen: {rep.projects_seen} "
+               f"(git-remote: {rep.git_remote_keys})")
+    typer.echo(f"old->new mapped: {len(rep.mapped)}; could not confirm: {len(rep.unmapped)}")
+    for pid, new in sorted(rep.mapped.items()):
+        typer.echo(f"  {pid} -> {new}")
+    for row in rep.unmapped:
+        typer.echo(f"  unconfirmed {row['project_id']} ({row['reason']})")
+    typer.echo(f"fake Projects removed: {rep.fake_projects_deleted or 'none'}")
+    typer.echo(f"Project rows written: {rep.projects_written}; Index Projects now: {rep.index_project_keys}")

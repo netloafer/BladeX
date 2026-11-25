@@ -377,7 +377,7 @@ async def router_judge(model: str, request: str, items: list[dict[str, str]], go
                 break
     except Exception as e:  # noqa: BLE001 —— 路由配置读不到就用 SDK 默认凭证
         logger.debug("assembly_review_routing_config_unavailable", error=str(e))
-    resp = await router_sdk.acompletion(**kwargs)
+    resp = await router_sdk.acompletion(purpose="assembly_review", **kwargs)
     return parse_judge_reply(resp.choices[0].message.content or "")
 
 

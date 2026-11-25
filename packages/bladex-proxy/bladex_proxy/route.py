@@ -97,7 +97,7 @@ class LLMJudge:
             kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
         t0 = time.perf_counter()
-        response = await router_sdk.acompletion(**kwargs)
+        response = await router_sdk.acompletion(purpose="route_judge", **kwargs)
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
         text = (response.choices[0].message.content or "").strip().lower()
@@ -356,17 +356,59 @@ async def resolve_route(
 
 
 def _is_failover_trigger(exc: Exception) -> bool:
-    """是否触发 failover（5xx / 超时 / 429 / 连接错误；不含 4xx）。"""
-    status = getattr(exc, "status_code", None)
-    if status is not None:
-        try:
-            code = int(status)
-        except (TypeError, ValueError):
-            code = None
-        if code is not None:
-            return code == 429 or code >= 500
-    named = router_sdk.retryable_error_types()
-    return bool(named) and isinstance(exc, named)
+    """是否触发 failover（5xx / 超时 / 429 / 连接错误；不含 4xx）。判据唯一实现在网关层。"""
+    return router_sdk.is_transient_upstream_error(exc)
+
+
+#: 批 BC（README ④）：`/v1/responses` 端点按调用传进来的私有键，值 = 配了
+#: `[[models]] reasoning = "off"` 的模型名集合。**键存在 = 这轮走推理参数透传**；
+#: 只有 Responses 端点会给 ⇒ chat / messages 路径的 `reasoning_effort` 仍归 `drop_params`（MQ-P43 另案）。
+RESPONSES_REASONING_OFF_KWARG = "bladex_responses_reasoning_off"
+#: OpenAI 兼容前缀：§1.2 矩阵只测过这条路；其它前缀 LiteLLM 会做方言映射，未测。
+_REASONING_PASSTHROUGH_PREFIX = "openai/"
+
+
+def _resolve_responses_reasoning(call_kwargs: dict[str, Any], model: str) -> str | None:
+    """按**路由后的模型**决定 `reasoning_effort` 发不发，返回实际放行的值（没放行 = None）。
+
+    放在 `_do_call` 而不是端点：failover 换模型时判的是真正要调的那个（批 BC §2.1）。
+    放行靠按调用生效的 `allowed_openai_params`，进程级 `drop_params` 不动。
+    不发的两种情况都打告警（原则 12：静默丢 = 把缺陷藏起来），**不改值、不降档**。
+    """
+    off_models = call_kwargs.pop(RESPONSES_REASONING_OFF_KWARG, None)
+    if off_models is None or "reasoning_effort" not in call_kwargs:
+        return None
+    effort = call_kwargs["reasoning_effort"]
+    reason = ""
+    if model in off_models:
+        reason = "config"
+    elif not model.startswith(_REASONING_PASSTHROUGH_PREFIX):
+        reason = "provider_prefix"
+    if reason:
+        del call_kwargs["reasoning_effort"]
+        logger.warning("reasoning_not_forwarded", model=model, effort=effort, reason=reason,
+                       hint="routing.toml [[models]] reasoning" if reason == "config"
+                       else "only openai/* models forward reasoning_effort for now")
+        return None
+    call_kwargs["allowed_openai_params"] = ["reasoning_effort"]
+    return str(effort)
+
+
+def _note_reasoning_rejected(exc: Exception, model: str, effort: str | None) -> None:
+    """上游 400 且错误点名了推理参数 ⇒ 告警指回配置（原则 9），错误本身原样往上抛。
+
+    判据 = 错误文本含 `reasoning`（BC 矩阵的 400 全是这个形态：
+    「reasoning_effort `none` is not supported by this model」）。其它 400 不归它。
+    """
+    if effort is None or _status_code(exc) != 400:
+        return
+    text = router_sdk.error_text(exc)
+    if "reasoning" not in text.lower():
+        return
+    logger.warning("responses_reasoning_rejected", model=model, effort=effort,
+                   evidence=text[:200],
+                   hint=f'set reasoning = "off" for {model} under [[models]] in routing.toml, '
+                        "or pick another effort in the agent")
 
 
 async def _do_call(
@@ -380,6 +422,7 @@ async def _do_call(
     logger.info("route_calling", model=model, stream=stream, msg_count=len(messages))
     call_kwargs: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
     call_kwargs.update(kwargs)
+    forwarded_effort = _resolve_responses_reasoning(call_kwargs, model)
     # 🔴 MQ-P23（2026-09-09 实测立）：OpenAI 兼容的**流式**响应，只有在请求带
     # `stream_options.include_usage` 时才会补发那个带 usage 的收尾 chunk。
     # 全仓此前**没有任何地方设它** ⇒ `chunk.usage` 恒 falsy ⇒ `extract_usage` 从未
@@ -399,7 +442,11 @@ async def _do_call(
             call_kwargs["api_base"] = route.api_base
         if route.api_key:
             call_kwargs["api_key"] = route.api_key
-    return await router_sdk.acompletion(**call_kwargs)
+    try:
+        return await router_sdk.acompletion(purpose=router_sdk.PURPOSE_AGENT, **call_kwargs)
+    except Exception as e:
+        _note_reasoning_rejected(e, model, forwarded_effort)
+        raise
 
 
 def _status_code(exc: Exception) -> int | None:

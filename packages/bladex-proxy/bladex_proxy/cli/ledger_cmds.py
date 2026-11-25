@@ -7,8 +7,21 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+from typing import Annotated
 
 import typer
+from bladex_core.ledger import (
+    ENTRY_SOURCE_USER,
+    Ledger,
+    LedgerEntry,
+    LedgerError,
+    merge_md_edit,
+)
 
 from bladex_proxy.cli import (  # noqa: E402
     _admin_call,
@@ -18,9 +31,8 @@ from bladex_proxy.cli import (  # noqa: E402
     _require_server_contract,
 )
 
-ledger_app = typer.Typer(help="Task ledgers (five-section working state; read-only except "
-                              "`close` / `reopen` / `supersede`, "
-                              "`doctor --bind-legacy-matters --yes` and `tombstone`)",
+ledger_app = typer.Typer(help="Task ledgers (five-section working state): list, read, create, edit, "
+                              "hand off, close, reopen, supersede, tombstone",
                          no_args_is_help=True)
 
 
@@ -483,6 +495,311 @@ def ledger_supersede(
         print(f"{ledger_id} is already superseded by {by}.")
         return 0
     print(f"✓ {ledger_id} superseded by {by}")
+    return 0
+
+
+# ── 交接包（批 CB）──────────────────────────────────────────────────────────
+#: 等服务端组包：要扫 Hub 的 key 并取 Matter 成员（快照实测约 3–5 s）。
+_HANDOFF_TIMEOUT_S = 60.0
+
+
+def _write_private(path: str, text: str) -> None:
+    """写文件，权限 0600：包里可能有不想给别人看的内容（已存在的文件也收紧）。"""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, text.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def _handoff_export(ledger_id: str, out: str, exposure: str, fmt: str) -> int:
+    if fmt not in ("md", "json"):
+        print(f"✗ unknown format {fmt!r} (use md or json)", file=sys.stderr)
+        return 2
+    code, data = _admin_call("GET", f"/admin/ledgers/{ledger_id}/handoff",
+                             params={"exposure": exposure}, timeout=_HANDOFF_TIMEOUT_S)
+    if code != 200:
+        detail = data.get("detail", "") or (data.get("error") or {}).get("message", "")
+        if detail:
+            print(f"✗ {detail}", file=sys.stderr)
+            return 1
+        return _print_op_result(code, data)
+    text = (json.dumps(data["package"], ensure_ascii=False, indent=2) + "\n"
+            if fmt == "json" else data["markdown"])
+    if out:
+        _write_private(out, text)
+        print(f"✓ wrote {out}", file=sys.stderr)
+    else:
+        sys.stdout.write(text)
+    print("Review it before sending: the five sections are not filtered for personal "
+          "information.", file=sys.stderr)
+    return 0
+
+
+def _handoff_import(path: str, dry_run: bool) -> int:
+    from bladex_core.flags import flag_number
+    max_bytes = int(flag_number("BLADEX_HANDOFF_IMPORT_MAX_BYTES"))
+    try:
+        if os.path.getsize(path) > max_bytes:
+            print(f"✗ {path} is larger than {max_bytes} bytes; nothing was imported", file=sys.stderr)
+            return 1
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+    except OSError as e:
+        print(f"✗ cannot read {path}: {e}", file=sys.stderr)
+        return 1
+    try:
+        package = json.loads(raw)
+    except ValueError:
+        print(f"✗ {path} is not JSON. Only the JSON form can be imported: export it with "
+              "`bladex ledger handoff <id> --format json`.", file=sys.stderr)
+        return 1
+    code, data = _admin_call("POST", "/admin/ledgers/import",
+                             body={"package": package, "dry_run": dry_run},
+                             timeout=_HANDOFF_TIMEOUT_S)
+    if code != 200:
+        detail = (data.get("error") or {}).get("message", "")
+        if detail:
+            print(f"✗ {detail}", file=sys.stderr)
+            return 1
+        return _print_op_result(code, data)
+    if dry_run:
+        _require_dry_run_ack(data, f"import {path}")
+        print("DRY RUN -- nothing written. Would create "
+              + ("a new ledger (the original id is already taken here)" if data.get("id_conflict")
+                 else data["ledger_id"]))
+        print(f"  title: {data.get('title', '')}")
+        print("  goal:")
+        for line in (data.get("goal") or "").split("\n"):
+            print(f"    {line}")
+        print(f"  entries: {json.dumps(data.get('entry_counts') or {}, ensure_ascii=False)}")
+        return 0
+    print(f"✓ imported as {data['ledger_id']}"
+          + (" (new id: the original id is already taken here)" if data.get("id_conflict") else ""))
+    print("  It is not active yet. An agent sees it among its ledger candidates and switches to it.")
+    return 0
+
+
+@ledger_app.command("handoff")
+def ledger_handoff(
+    ledger_id: str = typer.Argument("", help="Ledger ID to export (ldg-...)"),
+    out: str = typer.Option("", "--out", help="Write to this file (mode 0600) instead of stdout"),
+    exposure: str = typer.Option(
+        "public", "--exposure",
+        help="Where the package is going: local, private or public. Matters and rounds above "
+             "this level are left out and counted"),
+    fmt: str = typer.Option(
+        "md", "--format", help="md = one page to read or paste; json = importable elsewhere"),
+    import_file: str = typer.Option(
+        "", "--import", help="Import a package file (the JSON form) instead of exporting"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="With --import: show the Goal and entry counts, write nothing"),
+) -> int:
+    """Export a one-page portable handoff of a ledger, or import one.
+
+    Contains the five sections, the anchored Matter's summary and the last few rounds.
+    Local paths and credentials are replaced with placeholders.
+
+    The five sections are NOT filtered for personal information or by exposure: review the
+    package before you send it.
+
+    Importing: the Goal becomes yours and is shown to your agents on every turn, so only import
+    packages you trust, and use --dry-run to read the Goal first. The content hash catches damage,
+    not forgery. An existing ledger is never overwritten: a taken id gets a new one. The imported
+    ledger is not activated. The Matter summary and recent rounds are kept in Memory Hub only.
+    """
+    if bool(ledger_id) == bool(import_file):
+        print("✗ give either a ledger id to export or --import <file>", file=sys.stderr)
+        return 2
+    if import_file:
+        return _handoff_import(import_file, dry_run)
+    if dry_run:
+        print("✗ --dry-run only applies to --import", file=sys.stderr)
+        return 2
+    return _handoff_export(ledger_id, out, exposure, fmt)
+
+
+@ledger_app.command("create")
+def ledger_create(
+    goal: str = typer.Option("", "--goal", help="What done looks like (required unless --goal-file)"),
+    goal_file: str = typer.Option("", "--goal-file", help="Read the Goal from this file"),
+    title: str = typer.Option("", "--title", help="Short title (default: first line of the Goal)"),
+    core: Annotated[list[str] | None, typer.Option("--core", help="Initial Core entry (repeatable)")] = None,
+    verified: Annotated[list[str] | None, typer.Option("--verified", help="Initial Verified entry (repeatable)")] = None,
+    open_: Annotated[list[str] | None, typer.Option("--open", help="Initial Open entry (repeatable)")] = None,
+    next_: Annotated[list[str] | None, typer.Option("--next", help="Initial Next entry (repeatable)")] = None,
+) -> int:
+    """Create a ledger yourself: set the Goal first, then let an agent work.
+
+    It is not activated. Your agents see it among their ledger candidates and switch to it.
+    """
+    if bool(goal) == bool(goal_file):
+        print("✗ give exactly one of --goal or --goal-file", file=sys.stderr)
+        return 2
+    if goal_file:
+        try:
+            with open(goal_file, encoding="utf-8") as f:
+                goal = f.read().strip()
+        except OSError as e:
+            print(f"✗ cannot read {goal_file}: {e}", file=sys.stderr)
+            return 1
+    code, data = _admin_call("POST", "/admin/ledgers/create", body={
+        "goal": goal, "title": title, "core": list(core or []), "verified": list(verified or []),
+        "open": list(open_ or []), "next": list(next_ or []), "origin": "cli"})
+    if code != 200:
+        detail = (data.get("error") or {}).get("message", "")
+        if detail:
+            print(f"✗ {detail}", file=sys.stderr)
+            return 1
+        return _print_op_result(code, data)
+    print(f"✓ created {data['ledger_id']} (not active yet: an agent switches to it when it picks up the task)")
+    return 0
+
+
+def _edit_from_markdown(current: Ledger, text: str) -> dict | None:
+    """用户编辑过的 Markdown → 编辑请求。只带真正改过的部分（`merge_md_edit`）。"""
+    edit = merge_md_edit(current, text)
+    if edit.empty and not edit.new_sections:
+        return None
+    body: dict = {}
+    if edit.title is not None:
+        body["title"] = edit.title
+    if edit.goal is not None:
+        body["goal"] = edit.goal
+    if edit.sections:
+        body["sections"] = {k: [e.model_dump() for e in v] for k, v in edit.sections.items()}
+    if edit.new_sections:
+        body["new_sections"] = edit.new_sections
+    return body
+
+
+def _run_editor(markdown: str) -> str | None:
+    """拉起 `$EDITOR`。退出码非 0 ⇒ None（视为放弃）。"""
+    with tempfile.TemporaryDirectory(prefix="bladex-ledger-") as tmp:
+        path = os.path.join(tmp, "ledger.md")
+        _write_private(path, markdown)
+        rc = subprocess.run([*shlex.split(os.environ["EDITOR"]), path], check=False).returncode
+        if rc != 0:
+            return None
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+
+def _edit_from_flags(current: Ledger, goal: str | None, title: str | None,
+                     add: list[str], remove: list[str]) -> dict:
+    """`--goal` / `--title` / `--add` / `--remove` → 编辑请求。
+
+    :raises LedgerError: 参数写法不对，或序号越界。
+    """
+    body: dict = {}
+    if goal is not None:
+        body["goal"] = goal
+    if title is not None:
+        body["title"] = title
+    sections: dict[str, list[LedgerEntry]] = {}
+
+    def _section(key: str) -> list[LedgerEntry]:
+        return sections.setdefault(key, list(current.entries(key)))
+
+    drops: dict[str, list[int]] = {}
+    for spec in remove:
+        key, sep, idx = spec.partition(":")
+        if not sep or not idx.isdigit():
+            raise LedgerError(f"--remove expects SECTION:INDEX, got {spec!r}")
+        drops.setdefault(key.strip().lower(), []).append(int(idx))
+    for key, idxs in drops.items():
+        items = _section(key)
+        for i in sorted(set(idxs), reverse=True):
+            if i >= len(items):
+                raise LedgerError(f"no entry #{i} in section {key!r} ({len(items)} entries; "
+                                  "the first is #0)")
+            del items[i]
+    for spec in add:
+        key, sep, text = spec.partition("=")
+        if not sep or not text.strip():
+            raise LedgerError(f"--add expects SECTION=TEXT, got {spec!r}")
+        _section(key.strip().lower()).append(LedgerEntry(text=text, source=ENTRY_SOURCE_USER))
+    if sections:
+        body["sections"] = {k: [e.model_dump() for e in v] for k, v in sections.items()}
+    return body
+
+
+@ledger_app.command("edit")
+def ledger_edit(
+    ledger_id: str = typer.Argument(..., help="Ledger ID (ldg-...)"),
+    goal: str = typer.Option(None, "--goal", help="New Goal"),
+    title: str = typer.Option(None, "--title", help="New title"),
+    add: Annotated[list[str] | None, typer.Option(
+        "--add", help="Add an entry: SECTION=TEXT (repeatable)")] = None,
+    remove: Annotated[list[str] | None, typer.Option(
+        "--remove", help="Remove an entry: SECTION:INDEX, first is 0 (repeatable)")] = None,
+    from_file: str = typer.Option(
+        "", "--from-file", help="Apply an edited copy of `bladex ledger show <id>` (only lines "
+                                "you changed are applied)"),
+    expected_rev: int = typer.Option(
+        None, "--expected-rev", help="Refuse if the ledger is no longer at this rev (default: "
+                                     "the rev this command reads when it starts)"),
+) -> int:
+    """Edit a ledger. With no options it opens $EDITOR (needs a terminal).
+
+    If the ledger changed since it was read, nothing is written and you get a conflict.
+    """
+    add, remove = list(add or []), list(remove or [])
+    has_flags = goal is not None or title is not None or bool(add) or bool(remove)
+    if has_flags and from_file:
+        print("✗ --from-file cannot be combined with --goal / --title / --add / --remove",
+              file=sys.stderr)
+        return 2
+    use_editor = not has_flags and not from_file
+    if use_editor and not (sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("EDITOR")):
+        print("✗ nothing to do: give --goal / --title / --add / --remove / --from-file "
+              "(opening an editor needs a terminal and $EDITOR)", file=sys.stderr)
+        return 2
+    code, data = _admin_call("GET", f"/admin/ledgers/{ledger_id}")
+    if code != 200:
+        detail = data.get("detail", "")
+        if detail:
+            print(f"✗ {detail}", file=sys.stderr)
+            return 1
+        return _print_op_result(code, data)
+    current = Ledger.model_validate(data["ledger"])
+    try:
+        if from_file:
+            with open(from_file, encoding="utf-8") as f:
+                body = _edit_from_markdown(current, f.read())
+        elif use_editor:
+            edited = _run_editor(data["markdown"])
+            if edited is None:
+                print("Editor exited with an error; nothing was changed.", file=sys.stderr)
+                return 1
+            body = _edit_from_markdown(current, edited)
+        else:
+            body = _edit_from_flags(current, goal, title, add, remove)
+    except (OSError, LedgerError) as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 1
+    if body is None:
+        print("Nothing changed.")
+        return 0
+    code, data = _admin_call("POST", f"/admin/ledgers/{ledger_id}/edit", body={
+        **body, "origin": "cli",
+        "expected_rev": current.rev if expected_rev is None else expected_rev})
+    if code == 409:
+        print(f"✗ {ledger_id} is now at rev {data.get('current_rev')} "
+              f"(you had {data.get('expected_rev')}); nothing was written. "
+              "Read it again and redo the edit.", file=sys.stderr)
+        return 1
+    if code != 200:
+        detail = (data.get("error") or {}).get("message", "") or data.get("detail", "")
+        if detail:
+            print(f"✗ {detail}", file=sys.stderr)
+            return 1
+        return _print_op_result(code, data)
+    if data.get("status") == "noop":
+        print("Nothing changed.")
+        return 0
+    print(f"✓ edited {ledger_id} (rev {data.get('rev')})")
     return 0
 
 

@@ -71,13 +71,17 @@ def test_the_admin_face_goes_through_read_behavior_card():
     收成一个。再长出读者时把它加进这里——**加之前先问它是不是经 `read_behavior_card()`**。
     """
     srcs = _py_sources()
-    callers = {rel for rel, src in srcs.items() if "read_behavior_card(" in src
+    callers = {rel for rel, src in srcs.items()
+               if ("read_behavior_card(" in src or "run_blocking(read_behavior_card)" in src)
                and os.path.basename(rel) != "behavior_read.py"}
     assert {os.path.basename(c) for c in callers} == {"admin_read.py"}, (
         f"read_behavior_card 的调用方不是预期的读者面: {sorted(callers)}")
     for rel in callers:
-        # 调用形态（`read_behavior_card()`）恰一处；import 行不带括号，不计入。
-        assert srcs[rel].count("read_behavior_card()") == 1, f"{rel}: 不止一个读取点"
+        # 调用形态恰一处；import 行不带括号，不计入。批 DS1a 起 admin 面经单一出口进线程调
+        # （`run_blocking(read_behavior_card)`），两种形态合计仍须恰一处。
+        n = (srcs[rel].count("read_behavior_card()")
+             + srcs[rel].count("run_blocking(read_behavior_card)"))
+        assert n == 1, f"{rel}: 不止一个读取点"
 
 
 def test_the_admin_face_uses_dashboard_view_and_the_agency_reads_nothing():

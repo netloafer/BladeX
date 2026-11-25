@@ -29,8 +29,12 @@ from bladex_core.consolidation_proxy import embed_passage_compat
 from bladex_core.fact import Fact
 from bladex_core.matter import EdgeProvenance, Matter, MatterEdge, MatterOrigin
 
-from bladex_proxy.models import AdminEvent, AdminEventType
-from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.models import KNOWN_ADMIN_EVENT_TYPES, AdminEvent, AdminEventType
+from bladex_proxy.storage.memory_hub import (
+    MUST_UNDERSTAND_KEY,
+    HubRequiresNewerVersion,
+    MemoryHub,
+)
 from bladex_proxy.storage.memory_index import MemoryIndex
 
 logger = structlog.get_logger()
@@ -98,6 +102,12 @@ def export_snapshot(
                 _line(f, {"type": "admin_event", "schema": SNAPSHOT_SCHEMA,
                           **event.model_dump(mode="json")})
                 counts["admin_event"] += 1
+            # 批 UE：本版本不认识的类型（新版写的）原样导出，不丢——往返不许吞事件
+            for _key, raw in ledger.scan_admin_event_dicts(include_unknown=True):
+                if raw.get("event_type") in KNOWN_ADMIN_EVENT_TYPES:
+                    continue
+                _line(f, {"type": "admin_event", "schema": SNAPSHOT_SCHEMA, **raw})
+                counts["admin_event"] += 1
             if include_turns:
                 for key, turn in ledger.scan_prefix(""):
                     _line(f, {"type": "turn", "schema": SNAPSHOT_SCHEMA, "key": key,
@@ -106,6 +116,35 @@ def export_snapshot(
 
     logger.info("snapshot_exported", path=str(out_path), **counts)
     return counts
+
+
+def _reject_must_understand_events(in_path: Path) -> None:
+    """批 UE 步骤 2：写任何东西之前，先把快照整份过一遍。
+
+    有本版本不认识的管理事件类型、且 `payload.must_understand` 为真 ⇒ 直接拒绝，
+    报错点名行号与类型；此时 Hub / Index 一条都还没写。坏行（非 JSON）留给主循环照旧告警跳过。
+    """
+    with in_path.open("r", encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, 1):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict) or rec.get("type") != "admin_event":
+                continue
+            etype = rec.get("event_type")
+            if etype in KNOWN_ADMIN_EVENT_TYPES:
+                continue
+            payload = rec.get("payload")
+            if isinstance(payload, dict) and payload.get(MUST_UNDERSTAND_KEY) is True:
+                raise ValueError(
+                    f"Snapshot line {lineno} is an admin event of type {etype!r} "
+                    "that this version does not understand and that requires it. "
+                    "The snapshot was written by a newer version; please upgrade "
+                    "before importing. Nothing was imported.")
 
 
 def import_snapshot(
@@ -125,16 +164,25 @@ def import_snapshot(
              "skipped_existing": 0, "conflicts": 0, "journal_events": 0}
     embedder = getattr(index, "_embedder", None)
 
+    _reject_must_understand_events(in_path)  # 先检查再写：拒绝时库里一条都没动
+
     # 幂等防线：已有管理事件指纹集合——重复 import 不重复 journal
     existing_events: set[tuple] = set()
     if ledger is not None:
         try:
+            for _k, raw in ledger.scan_admin_event_dicts(include_unknown=True):
+                existing_events.add((
+                    str(raw.get("event_type")), raw.get("matter_id", ""), raw.get("target_key", ""),
+                    json.dumps(raw.get("payload") or {}, sort_keys=True, ensure_ascii=False),
+                ))
             for _k, ev in ledger.scan_admin_events():
                 existing_events.add((
                     str(getattr(ev.event_type, "value", ev.event_type)),
                     ev.matter_id, ev.target_key,
                     json.dumps(ev.payload, sort_keys=True, ensure_ascii=False),
                 ))
+        except HubRequiresNewerVersion:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.warning("snapshot_import_event_scan_failed", error=str(e))
 
@@ -241,6 +289,27 @@ def import_snapshot(
             elif rtype == "admin_event":
                 # 历史管理事件：re-journal（重放语义幂等），指纹去重防重复导入膨胀
                 if ledger is not None:
+                    # MQ-V41：未知类型跳过并计数（快照可能来自更新的版本）
+                    # 批 UE：未知类型原样保留、不校验内容、照写进新 Hub（新版写的事件不能在导入里丢）
+                    if rec.get("event_type") not in KNOWN_ADMIN_EVENT_TYPES:
+                        payload = rec.get("payload") or {}
+                        if isinstance(payload, dict) and payload.get("must_understand") is True:
+                            raise ValueError(
+                                f"Snapshot line {lineno} is an admin event of type "
+                                f"{rec.get('event_type')!r} that this version does not understand "
+                                "and that requires it. The snapshot was written by a newer "
+                                "version; please upgrade before importing.")
+                        fp = (str(rec.get("event_type")), rec.get("matter_id", ""),
+                              rec.get("target_key", ""),
+                              json.dumps(payload, sort_keys=True, ensure_ascii=False))
+                        stats["admin_events_unknown"] = stats.get("admin_events_unknown", 0) + 1
+                        logger.warning("snapshot_import_unknown_admin_event",
+                                       lineno=lineno, event_type=rec.get("event_type"))
+                        if fp not in existing_events:
+                            ledger.append_admin_event_raw(rec)
+                            existing_events.add(fp)
+                            stats["journal_events"] += 1
+                        continue
                     ev = AdminEvent.model_validate(rec)
                     before = stats["journal_events"]
                     _journal(ev.event_type, ev.matter_id, ev.target_key, ev.payload)

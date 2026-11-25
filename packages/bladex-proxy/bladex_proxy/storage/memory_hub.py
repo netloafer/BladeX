@@ -12,6 +12,7 @@ import hashlib
 import threading
 from collections import deque
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from rocksdict import Rdict
 
 from bladex_proxy.models import (
     INNER_LOOP_AUX_SOURCE,
+    KNOWN_ADMIN_EVENT_TYPES,
     AdminEvent,
     AdminEventType,
     DistillRecord,
@@ -32,6 +34,7 @@ from bladex_proxy.models import (
     TombstoneTargetType,
     Turn,
 )
+from bladex_proxy.usage import UsageRow, usage_row
 
 logger = structlog.get_logger()
 
@@ -46,6 +49,19 @@ _ADMIN_EVENT_PREFIX = "admin_event/"
 _DISTILL_PREFIX = "distill/"
 _JUDGMENT_PREFIX = "judgment/"
 _ANNOTATION_PREFIX = "annotation/"
+
+
+class HubRequiresNewerVersion(RuntimeError):
+    """Hub 里有「本版本不认识、且声明必须理解」的管理事件（批 UE，拍板 (107)-b）。
+
+    事件载荷保留键 `must_understand: true` = 写它的版本声明「读的人不理解它就不许继续」
+    （凡带删除 / 墓碑 / 覆盖语义的新事件类型都应写）。旧版读到 ⇒ 拒绝启动，而不是跳过后
+    把本该被删的东西读成还在。没有该键或为假 ⇒ 照旧跳过并告警（MQ-V41）。
+    """
+
+
+#: 管理事件载荷里的保留键（只在读侧认；0.4.0 自己不写）。
+MUST_UNDERSTAND_KEY = "must_understand"
 
 
 class HubMetaSnapshot:
@@ -89,6 +105,11 @@ class _RecentTurnIndex:
     Turn key 只由 `put()` 写入、只由 `compact_tombstoned()` 删除（2026-09-29 全仓核对），
     两处都挂了钩子。`put()` 跑在执行器线程里（`pipeline_worker`），故全部状态受锁保护；
     建索引期间的写入先记进 pending，建完合并（RocksDB 迭代器是创建时刻的快照，看不到之后的写）。
+
+    批 AC2（MQ-P34 展示面）：**同一趟全扫顺带切出每轮的用量行**（`usage.usage_row`）存在
+    `_usage_of`，供 `MemoryHub.usage_rows` / `GET /admin/usage`——不另起第二个进程内索引：
+    建、增量、pending、墓碑读侧过滤、`compact_tombstoned()` 删除，全部与 (ts, key) 同一套。
+    没有 ts 的轮次 `usage_row` 给 None：照旧进 (ts, key) 索引，只是不计用量（与全扫重切同口径）。
     """
 
     _NONE, _BUILDING, _BUILT = 0, 1, 2
@@ -97,22 +118,25 @@ class _RecentTurnIndex:
         self._lock = threading.Lock()
         self._build_lock = threading.Lock()
         self._state = self._NONE
-        self._pending: list[tuple[str, str]] = []
+        self._pending: list[tuple[str, str, UsageRow | None]] = []
         self._ts_of: dict[str, str] = {}
+        self._usage_of: dict[str, UsageRow | None] = {}
         self._order: list[tuple[str, str]] = []  # (ts, key) 升序
         self._keys: list[str] = []  # key 升序（prefix 区间用 bisect 定位）
 
-    def note(self, key: str, ts: str) -> None:
+    def note(self, key: str, ts: str, row: UsageRow | None = None) -> None:
         with self._lock:
             if self._state == self._BUILT:
                 self._insert(key, ts)
+                self._usage_of[key] = row
             elif self._state == self._BUILDING:
-                self._pending.append((key, ts))
+                self._pending.append((key, ts, row))
             # _NONE：尚未建，建时的全扫自然看得到这条
 
     def drop(self, key: str) -> None:
         with self._lock:
             ts = self._ts_of.pop(key, None)
+            self._usage_of.pop(key, None)
             if ts is not None:
                 i = bisect.bisect_left(self._order, (ts, key))
                 if i < len(self._order) and self._order[i] == (ts, key):
@@ -143,12 +167,18 @@ class _RecentTurnIndex:
             with self._lock:
                 self._state = self._BUILDING
                 self._pending = []
-            ts_of = dict(source())
+            ts_of: dict[str, str] = {}
+            usage_of: dict[str, UsageRow | None] = {}
+            for k, ts, row in source():
+                ts_of[k] = ts
+                usage_of[k] = row
             with self._lock:
-                for k, ts in self._pending:
+                for k, ts, row in self._pending:
                     ts_of[k] = ts
+                    usage_of[k] = row
                 self._pending = []
                 self._ts_of = ts_of
+                self._usage_of = usage_of
                 self._order = sorted((ts, k) for k, ts in ts_of.items())
                 self._keys = sorted(ts_of)
                 self._state = self._BUILT
@@ -166,6 +196,12 @@ class _RecentTurnIndex:
                     out.append((k, self._ts_of[k]))
                 i += 1
         return out
+
+    def usage_rows(self, tombstoned: set[str]) -> list[UsageRow]:
+        """未被墓碑、有用量行的轮次，key 升序——即 `usage.iter_hub_turns` + `usage_row` 的产出顺序。"""
+        with self._lock:
+            return [row for k in self._keys
+                    if k not in tombstoned and (row := self._usage_of.get(k)) is not None]
 
     def visible_count(self, tombstoned: set[str]) -> int:
         """未被墓碑的索引项数 = `scan_meta()` 产出条数（批 Q3C，`MemoryHub.count` 用）。"""
@@ -218,8 +254,17 @@ class MemoryHub:
         # N 的默认值与理由在 `bladex_core.flags`（`BLADEX_PREFIX_SLOTS`）。
         self._prefix_slots: int = max(1, int(flag_number("BLADEX_PREFIX_SLOTS")))
         self._session_last: dict[str, deque[tuple[str, int]]] = {}
-        # ADR-0012: 墓碑缓存（target_key 集合），scan_prefix 用，写墓碑时失效
-        self._tombstone_cache: set[str] | None = None
+        # ADR-0012: 墓碑缓存（target_key 集合），scan_prefix 用，写墓碑时失效。
+        # 批 DS1a：缓存 = (建它时的代次令牌, 集合)；写墓碑换一个新令牌，令牌对不上就当没缓存。
+        # 不能用"写时置 None"：读线程正在重建时被置 None，随后它会把不含新墓碑的旧集合装回去，
+        # 被删的轮次在本进程里重新可见（`scripts/probe_ds1a_hub_race.py`）。令牌每次都是新对象，
+        # 不会与旧令牌相等，所以不需要锁，读线程之间也不互相等。
+        self._tombstone_gen: object = object()
+        self._tombstone_cache: tuple[object, set[str]] | None = None
+        # MQ-V41：读到过的未知类型管理事件（key 集合，同一条多次扫描只算一次）
+        self._unknown_admin_event_keys: set[str] = set()
+        self._unknown_type_counts: dict[str, int] = {}
+        self._unknown_type_warned: set[str] = set()
         # MQ-A91：「最近 N 轮」内存索引（见 `_RecentTurnIndex`）。首次 `recent_turns` 时建，
         # 之后由 `put()` 增量维护；墓碑在读侧按 `_tombstoned_keys()` 过滤。
         self._recent = _RecentTurnIndex()
@@ -256,6 +301,11 @@ class MemoryHub:
             self._recover_session_cache()
         logger.info("hub_rocksdb_opened", path=str(self._path),
                      read_only=self._read_only, secondary=self._secondary)
+        try:
+            self._check_admin_event_compat()
+        except HubRequiresNewerVersion:
+            self.close()
+            raise
 
     def catch_up(self) -> None:
         """secondary 模式追新主进程写入（ADR-0020 T1）。
@@ -369,7 +419,7 @@ class MemoryHub:
         data = deduped_turn.model_dump(mode="json")
         value = msgpack.packb(data, use_bin_type=True)
         self.db[key.encode()] = value
-        self._recent.note(key, str(data.get("ts", "") or ""))
+        self._recent.note(key, str(data.get("ts", "") or ""), _usage_row_of(key, data))
         if _self_made:
             logger.debug("hub_put", key=key, status=turn.status.value,
                          msg_count=len(turn.request_messages), inner_loop=True)
@@ -436,6 +486,50 @@ class MemoryHub:
                 continue
             yield key_str, str(data.get("ts", "") or "")
 
+    def scan_turn_keys_after(self, cursors: dict[str, str]) -> list[tuple[str, str]]:
+        """批 AB · MQ-W17 ②：只取每个 session 里排在游标之后的 Turn，返回 `(key, ts)`（key 序）。
+
+        `cursors` = `{session 前缀（不含尾斜杠）: 已见的最大 key}`。session 内 key 字典序 = 时间序，
+        所以从游标 seek 一次就够，中间的 value 一条都不读（793 个 session 实测 13 ms，`scan_meta`
+        5 s）。内部键段（`__msg__/` 等）整段跳过。
+
+        ⚠️ 假设「新 key 只排在已见 key 之后」。overflow 回灌可能写入 entry_id 更小的旧轮次，这里看不见，
+        由调用方定期全扫对账兜底（`MemoryIndex._scan_cursor_reconcile_due`）。
+        """
+        tombstoned = self._tombstoned_keys()
+        out: list[tuple[str, str]] = []
+        it = self.db.iter()
+        it.seek_to_first()
+        while it.valid():
+            raw = it.key()
+            key = raw.decode() if isinstance(raw, bytes) else str(raw)
+            if _is_internal_key(key):
+                it.seek(f"{key.split('/', 1)[0]}0".encode())     # '0' = '/' 的后继
+                continue
+            session = key.rsplit("/", 1)[0]
+            cursor = cursors.get(session)
+            if cursor is not None and cursor >= key:   # 只往前跳，保证迭代单调前进
+                it.seek(cursor.encode())
+                if it.valid():
+                    at = it.key()
+                    if (at.decode() if isinstance(at, bytes) else str(at)) == cursor:
+                        it.next()
+            head = f"{session}/"
+            while it.valid():
+                raw = it.key()
+                key = raw.decode() if isinstance(raw, bytes) else str(raw)
+                if not key.startswith(head) or "/" in key[len(head):]:
+                    break
+                if key not in tombstoned:
+                    try:
+                        data = msgpack.unpackb(it.value(), raw=False)
+                    except Exception as e:  # noqa: BLE001 -- 与 scan_meta 同一处置
+                        logger.warning("hub_scan_meta_decode_failed", key=key, error=str(e))
+                    else:
+                        out.append((key, str(data.get("ts", "") or "")))
+                it.next()
+        return out
+
     def recent_turns(self, prefix: str = "", *, limit: int, offset: int = 0,
                      ) -> tuple[list[tuple[str, str]], int]:
         """按 ts 降序取第 ``offset`` 起的 ``limit`` 条 (key, ts)，外加可见总数（MQ-A91）。
@@ -463,8 +557,22 @@ class MemoryHub:
         items.sort(key=lambda x: x[1], reverse=True)
         return items[offset:offset + limit], len(items)
 
-    def _iter_turn_ts(self) -> Iterator[tuple[str, str]]:
-        """全部 Turn 的 (key, ts)，**不过滤墓碑**（墓碑在读侧过滤）；供 `_RecentTurnIndex` 建索引。"""
+    def usage_rows(self) -> list[UsageRow]:
+        """全部现行 Turn 的用量行（批 AC2），key 升序。
+
+        **逐条等于** ``[usage_row(k, d) for k, d in usage.iter_hub_turns(self)]`` 去掉 None——同一套跳过
+        规则（内部 key / 墓碑 / 解码失败 / 没有 ts）。primary 读 `_RecentTurnIndex` 里随 (ts, key)
+        一起维护的行缓存（首次一趟全扫建成，之后 `put()` 增量）；secondary / read_only 会看到别的
+        进程写入（或是静态快照），索引跟不上 ⇒ 全扫重切，同一口径。
+        """
+        if self._secondary or self._read_only:
+            from bladex_proxy.usage import iter_hub_turns
+            return [r for k, d in iter_hub_turns(self) if (r := _usage_row_of(k, d)) is not None]
+        self._recent.ensure_built(self._iter_turn_ts)
+        return self._recent.usage_rows(self._tombstoned_keys())
+
+    def _iter_turn_ts(self) -> Iterator[tuple[str, str, UsageRow | None]]:
+        """全部 Turn 的 (key, ts, 用量行)，**不过滤墓碑**（墓碑在读侧过滤）；供 `_RecentTurnIndex` 建索引。"""
         for key_raw, value_raw in self.db.items():
             key_str = key_raw.decode() if isinstance(key_raw, bytes) else str(key_raw)
             if _is_internal_key(key_str):
@@ -474,7 +582,7 @@ class MemoryHub:
             except Exception as e:  # noqa: BLE001 -- 与 scan_meta 同一处理：跳过脏值
                 logger.warning("hub_scan_meta_decode_failed", key=key_str, error=str(e))
                 continue
-            yield key_str, str(data.get("ts", "") or "")
+            yield key_str, str(data.get("ts", "") or ""), _usage_row_of(key_str, data)
 
     def scan_meta_snapshot(self) -> HubMetaSnapshot:
         """一趟扫描：全部 Turn 的元数据切片 + **新鲜的**墓碑 + 管理事件（F2 行为画像的数据档）。
@@ -495,6 +603,7 @@ class MemoryHub:
         rows: list[tuple[str, dict[str, Any]]] = []
         tombstones: list[tuple[str, Tombstone]] = []
         events: list[tuple[str, AdminEvent]] = []
+        gen = self._tombstone_gen  # 先取令牌再开迭代器（见 `_tombstoned_keys`）
         for key_raw, value_raw in self.db.items():
             key_str = key_raw.decode() if isinstance(key_raw, bytes) else str(key_raw)
             try:
@@ -503,12 +612,15 @@ class MemoryHub:
                         msgpack.unpackb(value_raw, raw=False))))
                     continue
                 if key_str.startswith(_ADMIN_EVENT_PREFIX):
-                    events.append((key_str, AdminEvent.model_validate(
-                        msgpack.unpackb(value_raw, raw=False))))
+                    ev = self._admin_event_or_none(key_str, msgpack.unpackb(value_raw, raw=False))
+                    if ev is not None:
+                        events.append((key_str, ev))
                     continue
                 if _is_internal_key(key_str):
                     continue
                 data = msgpack.unpackb(value_raw, raw=False)
+            except HubRequiresNewerVersion:  # 批 UE 步骤 2：运行中的拒绝不许被吞
+                raise
             except Exception as e:  # noqa: BLE001 —— 脏值不该中断整轮扫描
                 logger.warning("hub_scan_meta_decode_failed", key=key_str, error=str(e))
                 continue
@@ -522,7 +634,7 @@ class MemoryHub:
                 "subagent": bool(ident.get("subagent", False)),
             }))
         tombstoned = frozenset(t.target_key for _k, t in tombstones)
-        self._tombstone_cache = set(tombstoned)
+        self._tombstone_cache = (gen, set(tombstoned))
         return HubMetaSnapshot(
             rows=[r for r in rows if r[0] not in tombstoned],
             tombstoned=tombstoned, tombstones=tombstones, admin_events=events,
@@ -903,8 +1015,9 @@ class MemoryHub:
         self.db[key.encode()] = msgpack.packb(
             tombstone.model_dump(mode="json"), use_bin_type=True,
         )
-        # 失效墓碑缓存
-        self._tombstone_cache = None
+        # 失效墓碑缓存：写入之后换令牌（顺序不能反——先换令牌再写，读线程可能在两者之间
+        # 取到新令牌、却扫不到这条墓碑）
+        self._tombstone_gen = object()
         logger.info(
             "hub_tombstone_appended", key=key,
             target_type=target_type.value, target_key=target_key,
@@ -958,13 +1071,92 @@ class MemoryHub:
             data = msgpack.unpackb(value_raw, raw=False)
             yield key_str, Tombstone.model_validate(data)
 
-    def scan_admin_events(self) -> Iterator[tuple[str, AdminEvent]]:
-        """扫描所有管理事件（按 entry_id 有序，ADR-0012 §3.5）。"""
-        for key_raw, value_raw in self.db.items():
+    def scan_admin_event_dicts(
+        self, *, include_unknown: bool = False,
+    ) -> Iterator[tuple[str, dict[str, Any]]]:
+        """按 key 序扫描管理事件的**原始载荷 dict**（批 UE：未知类型的单一判断点）。
+
+        读取点要自己看原始字段（先看类型再解载荷、快照原样导出 / 导入）时用本方法，
+        不要自己 `db.items(from_key="admin_event/")`。未知类型：默认跳过并汇总告警；
+        `must_understand` 为真 ⇒ 抛 `HubRequiresNewerVersion`；`include_unknown=True`
+        时（仅快照导出 / 导入用）未知类型原样吐出，仍先过 `must_understand` 检查。
+        """
+        # 批 AB · MQ-W17 ①：按前缀 seek。修前每次遍历全库（3 s，空载轮两次），只为这一千多条。
+        for key_raw, value_raw in self.db.items(from_key=_ADMIN_EVENT_PREFIX.encode()):
             key_str = key_raw.decode() if isinstance(key_raw, bytes) else str(key_raw)
-            if key_str.startswith(_ADMIN_EVENT_PREFIX):
-                data = msgpack.unpackb(value_raw, raw=False)
-                yield key_str, AdminEvent.model_validate(data)
+            if not key_str.startswith(_ADMIN_EVENT_PREFIX):
+                break
+            data = msgpack.unpackb(value_raw, raw=False)
+            if self._admin_event_unknown(key_str, data):
+                if include_unknown:
+                    yield key_str, data
+                continue
+            yield key_str, data
+
+    def scan_admin_events(self) -> Iterator[tuple[str, AdminEvent]]:
+        """扫描所有管理事件（按 entry_id 有序，ADR-0012 §3.5）。未知类型见 `scan_admin_event_dicts`。"""
+        for key_str, data in self.scan_admin_event_dicts():
+            yield key_str, AdminEvent.model_validate(data)
+
+    def _admin_event_unknown(self, key_str: str, data: Any) -> bool:  # noqa: ANN401
+        """本版本不认识这条事件的类型吗？（唯一判断点；所有读取点最终都走这里。）
+
+        是 ⇒ ① `must_understand` 为真则抛 `HubRequiresNewerVersion`；② 否则按 key 记账，
+        每个进程每种类型只在**第一次**见到时告警一条（带当时的计数；启动自检已扫全量，
+        所以通常那一条就是总数）。脏值（非 dict / 无类型串）不算未知，交给校验去抛。
+        """
+        etype = data.get("event_type") if isinstance(data, dict) else None
+        if not isinstance(etype, str) or etype in KNOWN_ADMIN_EVENT_TYPES:
+            return False
+        payload = data.get("payload")
+        if isinstance(payload, dict) and payload.get(MUST_UNDERSTAND_KEY) is True:
+            raise HubRequiresNewerVersion(
+                f"The Hub holds an admin event this version does not understand and that "
+                f"requires it: type {etype!r}, key {key_str}. "
+                "This data was written by a newer version; please upgrade before starting."
+            )
+        self._unknown_admin_event_keys.add(key_str)
+        self._unknown_type_counts[etype] = self._unknown_type_counts.get(etype, 0) + 1
+        if etype not in self._unknown_type_warned:
+            self._unknown_type_warned.add(etype)
+            logger.warning("hub_admin_event_unknown_type_skipped", event_type=etype,
+                           count=self._unknown_type_counts[etype],
+                           first_key=key_str, total=len(self._unknown_admin_event_keys))
+        return True
+
+    def _check_admin_event_compat(self) -> None:
+        """启动自检：整段 `admin_event/` 过一遍，未知且 `must_understand` 的事件 ⇒ 拒绝启动。
+
+        同时让「未知类型」的汇总告警在启动时就带上全量计数。~1.4k 条 ≈ 0.02 s。
+        """
+        for _ in self.scan_admin_event_dicts():
+            pass
+
+    def _admin_event_or_none(self, key_str: str, data: dict[str, Any]) -> AdminEvent | None:
+        """MQ-V41：不认识的事件类型跳过并计数；其余校验错误照旧抛（脏值不许静默）。
+
+        修前一条未知类型就让 `scan_admin_events` 抛错，其后的事件全部读不到：回滚到旧版、或读到
+        新版写的事件时，账本池变空、锚层关闭、增量每轮重复应用。
+        """
+        if self._admin_event_unknown(key_str, data):
+            return None
+        return AdminEvent.model_validate(data)
+
+    def append_admin_event_raw(self, record: dict[str, Any]) -> str:
+        """原样追加一条管理事件（快照导入保留未知类型用：不校验类型与载荷内容）。
+
+        只补 `ts` 缺省；其余字段原样写。新 entry_id，journal 序 = 导入序。
+        """
+        key = f"{_ADMIN_EVENT_PREFIX}{_generate_entry_id()}"
+        rec = {k: v for k, v in record.items() if k not in ("type", "schema")}
+        rec.setdefault("ts", datetime.now(UTC).isoformat())
+        self.db[key.encode()] = msgpack.packb(rec, use_bin_type=True)
+        return key
+
+    @property
+    def unknown_admin_event_count(self) -> int:
+        """本进程读到过的未知类型管理事件条数（按 key 去重；`/metrics` 暴露）。"""
+        return len(self._unknown_admin_event_keys)
 
     def latest_admin_event(self, event_type: AdminEventType) -> tuple[str, AdminEvent] | None:
         """最近一条指定类型的管理事件（反向 seek，只走 `admin_event/` 段、不扫全库）。
@@ -981,7 +1173,7 @@ class MemoryHub:
                 break
             data = msgpack.unpackb(value_raw, raw=False)
             if data.get("event_type") == want:
-                return key_str, AdminEvent.model_validate(data)
+                return key_str, self._admin_event_or_none(key_str, data)
         return None
 
     # ── ADR-0018 §4.1: 派生台账（distill / judgment）──
@@ -1088,12 +1280,18 @@ class MemoryHub:
         """所有被墓碑覆盖的 Memory Hub key 集合（turn / fact / matter / edge / 台账，惰性缓存）。
 
         写墓碑时失效。scan_prefix 跳过被墓碑的 turn；台账 scan 跳过被墓碑的台账 key。
+
+        线程安全（批 DS1a）：先取令牌、再开扫描迭代器（RocksDB 迭代器 = 创建时刻的快照）。
+        取令牌之前完成的墓碑写入一定在快照里；之后的写入会换令牌，这份缓存下次读就作废。
+        本次调用返回的是扫描时刻的集合，与修前语义相同。
         """
-        if self._tombstone_cache is None:
-            self._tombstone_cache = {
-                t.target_key for _, t in self.scan_tombstones()
-            }
-        return self._tombstone_cache
+        cached = self._tombstone_cache
+        if cached is not None and cached[0] is self._tombstone_gen:
+            return cached[1]
+        gen = self._tombstone_gen
+        keys = {t.target_key for _, t in self.scan_tombstones()}
+        self._tombstone_cache = (gen, keys)
+        return keys
 
     # ── 物理擦除 stub（ADR-0012 §3.6，compaction 周期留实测）──
 
@@ -1187,6 +1385,17 @@ def _generate_entry_id() -> str:
     _entry_seq += 1
     ts_ms = int(time.time() * 1000)
     return f"{ts_ms:013d}-{_entry_seq:08d}"
+
+
+def _usage_row_of(key: str, data: Any) -> UsageRow | None:  # noqa: ANN401  msgpack 解出的任意值
+    """行缓存的切行入口（批 AC2）：`usage.usage_row` + 防御——用量只是附件，切不出不阻断写入 / 建索引。"""
+    if not isinstance(data, dict):
+        return None
+    try:
+        return usage_row(key, data)
+    except Exception as e:  # noqa: BLE001 —— 形状异常的旧值：不计用量，照旧进 (ts, key) 索引
+        logger.warning("hub_usage_row_failed", key=key, error=str(e))
+        return None
 
 
 def _is_internal_key(key_raw: bytes | str) -> bool:

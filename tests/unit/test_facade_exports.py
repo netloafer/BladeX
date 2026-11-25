@@ -139,4 +139,5 @@ def test_cli_subcommand_groups_registered_in_pre_split_order() -> None:
     from bladex_proxy import cli
 
     assert [g.name for g in cli.app.registered_groups] == [
-        "sync", "config", "storage", "memory", "matter", "queue", "sticky", "inspect", "ledger", "connector"]
+        "sync", "config", "storage", "memory", "matter", "queue", "sticky", "inspect", "ledger", "connector",
+        "project"]

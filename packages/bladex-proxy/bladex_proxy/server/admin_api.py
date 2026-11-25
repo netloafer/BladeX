@@ -8,9 +8,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import structlog
@@ -18,12 +19,15 @@ from bladex_core.fact import Fact
 from bladex_core.matter import EdgeTargetType, Matter, MatterOrigin, MatterStatus
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from bladex_proxy.admin_read import register_admin_read_routes
 from bladex_proxy.config import ProxyConfig
 from bladex_proxy.identity import _SYSTEM_ROLES, LOCAL_USER_ID
 from bladex_proxy.models import (
     BACKFLOW_ORIGINS,
+    FACT_CORRECT_ORIGIN_DASHBOARD,
+    FACT_CORRECT_ORIGINS,
     LEDGER_LIFECYCLE_ADMIN_ORIGINS,
     AdminEventType,
     AgentClaimBody,
@@ -43,8 +47,9 @@ from bladex_proxy.models import (
     TombstoneTargetType,
 )
 from bladex_proxy.modules import module_enabled
+from bladex_proxy.server.blocking import run_blocking
 from bladex_proxy.server.orchestration import _extract_bearer
-from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_hub import HubRequiresNewerVersion, MemoryHub
 from bladex_proxy.storage.memory_index import MemoryIndex, build_agent_claim_map
 
 logger = structlog.get_logger()
@@ -193,6 +198,67 @@ def _strict_query(*allowed: str) -> Callable[[Request], None]:
     return _check
 
 
+def _strict_body(*allowed: str | type[BaseModel]) -> Callable[[Request], Awaitable[None]]:
+    """🔴 未知 **body** 键 ⇒ **400 并点名**（MQ-R16，批 DS1b）——`_strict_query` 的 body 版。
+
+    pydantic 默认 `extra="ignore"`：`expected_rev` 拼成 `expectedRev` 会被静默丢掉，
+    user-edit 于是不加锁、整本覆盖——新加的保护恰在拼错时失效。merge / split / detach /
+    assign 拼错则落一条垃圾管理事件（会被重放）。与 MQ-I24 同族：静默丢弃比丢弃更糟。
+
+    **全部 admin 写端点只走这一个机制**（守卫 `tests/test_ds1b_body_strict.py`）：
+    - 有 `*Body` 模型的端点：`_strict_body(XxxBody)`，允许名单 = 模型字段（守卫对账，不许漂移）；
+    - 直接读原始 JSON 的端点：`_strict_body("ledger", "expected_rev")`，显式列名；
+    - 没有 body 的端点：`_strict_body()`（空集）——今天的调用方发 `{}` 或不发，都过。
+
+    只看顶层键；body 为空 / 不是 JSON 对象时不判（交给端点或 FastAPI 的既有校验，行为不变）。
+    （不改 `models.py` 的 `*Body`：那是批 AC 的文件；拒未知键放在端点侧一处做。）
+    """
+    names: set[str] = set()
+    for a in allowed:
+        if isinstance(a, str):
+            names.add(a)
+        else:
+            for fname, finfo in a.model_fields.items():
+                names.add(finfo.alias or fname)
+    allowed_set = frozenset(names)
+
+    async def _check(request: Request) -> None:
+        raw = await request.body()
+        if not raw.strip():
+            return
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return
+        if not isinstance(data, dict):
+            return
+        unknown = sorted(k for k in data if k not in allowed_set)
+        if unknown:
+            raise HTTPException(status_code=400, detail=(
+                f"unknown body key(s): {', '.join(unknown)}. "
+                f"This endpoint accepts {', '.join(sorted(allowed_set)) or '(none)'}. "
+                f"Refusing rather than silently ignoring them -- a misspelled key here "
+                f"silently changes what the request does (MQ-R16 / MQ-I24). If you expected "
+                f"it to be known, the running proxy is probably older than your client: "
+                f"restart it."))
+
+    _check.strict_body_allowed = allowed_set  # type: ignore[attr-defined]  # 守卫读它
+    return _check
+
+
+class TombstoneByProjectBody(BaseModel):
+    """`POST /admin/turns/tombstone-by-project` 的 body（批 DS1a，MQ-R15）。
+
+    两个字段刻意是 `Any`：取值语义与修前逐字相同（`project_ids` 由端点自己校验成 list，
+    `dry_run` 照旧按真值判）。拒未知键不在这里做——批 DS1b 起统一走 `_strict_body`，
+    不留第二套（DS1a 时这里是 `extra="forbid"` + 端点里手拆 ValidationError）。
+    （放在这里而不是 `models.py`：`models.py` 划给并行的批 AC。）
+    """
+
+    project_ids: Any = None
+    dry_run: Any = True
+
+
 def _origin_payload(body: Any) -> dict[str, str]:
     """Z4：回流来源进管理事件 payload；dashboard / CLI 调用（origin 为空）载荷逐字不变。"""
     if not getattr(body, "origin", ""):
@@ -248,6 +314,50 @@ _AGENT_DETAIL_SAMPLE = 8
 _AGENT_DETAIL_TEXT_CHARS = 400
 
 
+def _read_agents_hub(hub: MemoryHub, live_bucket_ids: frozenset[str]) -> dict[str, Any]:
+    """`GET /admin/agents` 的 Hub 读部分（同步，经 `run_blocking` 在工作线程跑；批 DS1a）。
+
+    只读 Hub、只返回原始数据，不碰 `_agent_registry`（非线程安全）也不拼响应——
+    合并在路由里做，与修前同序。异常处理与修前逐条相同：journal 扫描失败保留已得部分，
+    key 扫描失败整段跳过，单条代表 turn 取不到只丢那一条。
+    """
+    out: dict[str, Any] = {"claimed_map": {}, "claim_events": [], "agent_ids": {}, "rep": {}}
+    try:
+        # 🔴 **复用重建侧的同一份实现**，不另写一遍。
+        # 曾经在这里手搓过一份"逐事件 src→to"的映射，**没有链式解析**：
+        # 用户把 `Pi` 改名成 `Pi-old` 之后，重建侧算出
+        # `unknown-3b5f685d → Pi-old`（对），列表页却仍算成 `→ Pi`，
+        # 于是界面显示 Pi 7 轮 / Pi-old 0 轮，而真实归属是 3 / 4。
+        # 同一个映射两份实现、一份带链一份不带 —— 正是 MS-17 那类漂移。
+        out["claimed_map"] = build_agent_claim_map(hub)
+        for _k, ev in hub.scan_admin_events():
+            if ev.event_type == AdminEventType.AGENT_CLAIM:
+                out["claim_events"].append(ev)
+    except HubRequiresNewerVersion:  # 批 UE 步骤 2：运行中的拒绝不许被吞
+        raise
+    except Exception as e:  # noqa: BLE001 —— 列表页不因 journal 异常整页失败
+        logger.warning("admin_agents_claims_scan_failed", error=str(e))
+    try:
+        agent_ids = hub.scan_agent_ids()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("admin_agents_ledger_scan_failed", error=str(e))
+        return out
+    out["agent_ids"] = agent_ids
+    for agent_id, (rep_key, _count) in agent_ids.items():
+        if not agent_id.startswith("unknown") or agent_id in live_bucket_ids:
+            continue
+        basis, headers = "", {}
+        try:
+            turn = hub.get(rep_key)
+            if turn is not None:
+                basis = getattr(turn.identity, "agent_bucket_basis", "") or ""
+                headers = dict(getattr(turn.identity, "request_headers", {}) or {})
+        except Exception as e:  # noqa: BLE001 —— 单条取不到不该毁掉整页
+            logger.debug("admin_agents_rep_turn_failed", key=rep_key, error=str(e))
+        out["rep"][agent_id] = (basis, headers)
+    return out
+
+
 def register_admin_routes(app: FastAPI) -> None:
     """挂 `/admin/*` 写端点、只读 admin API 与 `/dashboard`（登记顺序与拆前逐字相同）。"""
     # ── ADR-0012 §3.6: 带外管理端点（删除 = 写墓碑）──
@@ -257,10 +367,15 @@ def register_admin_routes(app: FastAPI) -> None:
         request: Request,
         turn_key: str,
         cfg: ProxyConfig = _admin_key_dep,
+        _strict: None = Depends(_strict_query()),
+        _body_keys: None = Depends(_strict_body()),
     ) -> JSONResponse:
         """删除一个 turn：只写墓碑 + 触发 Memory Index 级联清除（ADR-0012 §3.6）。
 
         不同步物理擦除（compaction 周期留实测）。
+
+        🔴 批 DS1b（MQ-R16）：挂 `_strict_query()`（空集）。今天它没有 query 参数，但这是一条
+        不可逆的墓碑端点——以后加 `dry_run` 时，旧 proxy 必须拒绝而不是静默忽略（MQ-I24）。
         """
         hub: MemoryHub | None = request.app.state.hub
         if hub is None:
@@ -270,40 +385,46 @@ def register_admin_routes(app: FastAPI) -> None:
                         "type": "storage_error"}},
             )
 
-        turn = hub.get(turn_key)
-        if turn is None:
-            return JSONResponse(
-                status_code=404,
-                content={"error": {"message": "Turn not found",
-                        "type": "not_found"}},
+        index: MemoryIndex | None = request.app.state.index
+
+        def _write() -> JSONResponse:
+            # 批 DS1b（MQ-W25）：Hub 读写 + Index 级联进工作线程
+            turn = hub.get(turn_key)
+            if turn is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": {"message": "Turn not found",
+                            "type": "not_found"}},
+                )
+
+            tombstone_key = hub.append_tombstone(
+                target_type=TombstoneTargetType.TURN,
+                target_key=turn_key,
+                source=TombstoneSource.USER,
             )
 
-        tombstone_key = hub.append_tombstone(
-            target_type=TombstoneTargetType.TURN,
-            target_key=turn_key,
-            source=TombstoneSource.USER,
-        )
+            if index is not None:
+                try:
+                    index.cascade_delete_turn(turn_key)
+                except Exception as e:
+                    logger.warning("index_cascade_delete_failed", error=str(e),
+                                   turn_key=turn_key, hint="tombstone written, Memory Index cleanup deferred")
 
-        index: MemoryIndex | None = request.app.state.index
-        if index is not None:
-            try:
-                index.cascade_delete_turn(turn_key)
-            except Exception as e:
-                logger.warning("index_cascade_delete_failed", error=str(e),
-                               turn_key=turn_key, hint="tombstone written, Memory Index cleanup deferred")
+            logger.info("admin_turn_deleted", turn_key=turn_key, tombstone_key=tombstone_key)
+            return JSONResponse(content={
+                "status": "deleted",
+                "turn_key": turn_key,
+                "tombstone_key": tombstone_key,
+            })
 
-        logger.info("admin_turn_deleted", turn_key=turn_key, tombstone_key=tombstone_key)
-        return JSONResponse(content={
-            "status": "deleted",
-            "turn_key": turn_key,
-            "tombstone_key": tombstone_key,
-        })
+        return await run_blocking(_write)
 
     @app.post("/admin/facts")
     async def remember_fact(
         body: RememberFactBody,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body(RememberFactBody)),
     ) -> JSONResponse:
         """落一条 manual fact（Beta T17 MCP `remember`）。
 
@@ -341,44 +462,49 @@ def register_admin_routes(app: FastAPI) -> None:
         if hub is None:
             return _hub_unavailable()
 
-        from bladex_core.consolidation_proxy import (
-            _deterministic_fact_id,
-            embed_passage_compat,
-        )
-        fact_id = _deterministic_fact_id("manual", content)
-        fact = Fact(
-            id=fact_id, content=content, trust=1.0, tags="origin:manual",
-            kind="general", source_user_id=(body.user_id or "manual"),
-            scope=scope,
-        )
         embedder = getattr(request.app.state, "embedder", None)
-        if embedder is not None:
-            try:
-                fact.embedding = embed_passage_compat(embedder, [content])[0]
-            except Exception as e:  # noqa: BLE001 —— 无向量仍入 meta
-                logger.debug("remember_embed_skip", error=str(e))
-
-        # 幂等：同文本重复 remember 不重复 journal
         p2r: MemoryIndex | None = request.app.state.index
-        already = False
-        if p2r is not None:
-            try:
-                already = p2r.get_fact(fact_id) is not None
-            except Exception:  # noqa: BLE001
-                already = False
-        if not already:
-            hub.append_admin_event(
-                AdminEventType.FACT_IMPORT, "", fact_id,
-                entity=fact.model_dump(mode="json", exclude={"embedding"}))
 
-        applied, _ = _apply_to_index(cfg, lambda p2w: p2w.add_fact(fact) or True)
-        logger.info("admin_fact_remembered", fact_id=fact_id, scope=scope,
-                    index_applied=applied, already_existed=already)
-        return _admin_response(
-            200 if applied else 202,
-            ("exists" if already else "remembered") if applied else "deferred",
-            fact_id=fact_id,
-        )
+        def _write() -> JSONResponse:
+            # 批 DS1b（MQ-W25）：嵌入 + Index 查重 + Hub 追加 + 开可写 Index 进工作线程
+            from bladex_core.consolidation_proxy import (
+                _deterministic_fact_id,
+                embed_passage_compat,
+            )
+            fact_id = _deterministic_fact_id("manual", content)
+            fact = Fact(
+                id=fact_id, content=content, trust=1.0, tags="origin:manual",
+                kind="general", source_user_id=(body.user_id or "manual"),
+                scope=scope,
+            )
+            if embedder is not None:
+                try:
+                    fact.embedding = embed_passage_compat(embedder, [content])[0]
+                except Exception as e:  # noqa: BLE001 —— 无向量仍入 meta
+                    logger.debug("remember_embed_skip", error=str(e))
+
+            # 幂等：同文本重复 remember 不重复 journal
+            already = False
+            if p2r is not None:
+                try:
+                    already = p2r.get_fact(fact_id) is not None
+                except Exception:  # noqa: BLE001
+                    already = False
+            if not already:
+                hub.append_admin_event(
+                    AdminEventType.FACT_IMPORT, "", fact_id,
+                    entity=fact.model_dump(mode="json", exclude={"embedding"}))
+
+            applied, _ = _apply_to_index(cfg, lambda p2w: p2w.add_fact(fact) or True)
+            logger.info("admin_fact_remembered", fact_id=fact_id, scope=scope,
+                        index_applied=applied, already_existed=already)
+            return _admin_response(
+                200 if applied else 202,
+                ("exists" if already else "remembered") if applied else "deferred",
+                fact_id=fact_id,
+            )
+
+        return await run_blocking(_write)
 
     @app.delete("/admin/facts/{fact_id}")
     async def delete_fact(
@@ -387,6 +513,7 @@ def register_admin_routes(app: FastAPI) -> None:
         origin: str = "",
         cfg: ProxyConfig = _admin_key_dep,
         _strict: None = Depends(_strict_query("origin")),
+        _body_keys: None = Depends(_strict_body()),
     ) -> JSONResponse:
         """删除单条 Fact（Beta T11 `bladex memory forget`）：先写 Memory Hub FACT 墓碑，
         再 Memory Index 级联（meta + 向量 + 归属边）。rebuild 侧按墓碑过滤不复活。
@@ -401,34 +528,38 @@ def register_admin_routes(app: FastAPI) -> None:
         if hub is None:
             return _hub_unavailable()
 
-        # 存在性检查走进程内 Memory Index 读句柄（可用时）；不可用不阻断——墓碑语义幂等
-        p2r: MemoryIndex | None = request.app.state.index
-        if p2r is not None:
-            try:
-                if p2r.get_fact(fact_id) is None:
-                    return JSONResponse(
-                        status_code=404,
-                        content={"error": {"message": "Fact not found",
-                                "type": "not_found"}},
-                    )
-            except Exception as e:  # noqa: BLE001
-                logger.debug("admin_fact_exist_check_failed", error=str(e))
+        def _write() -> JSONResponse:
+            # 批 DS1b（MQ-W25）：Index 存在性检查 + Hub 墓碑 + 开可写 Index 进工作线程
+            # 存在性检查走进程内 Memory Index 读句柄（可用时）；不可用不阻断——墓碑语义幂等
+            p2r: MemoryIndex | None = request.app.state.index
+            if p2r is not None:
+                try:
+                    if p2r.get_fact(fact_id) is None:
+                        return JSONResponse(
+                            status_code=404,
+                            content={"error": {"message": "Fact not found",
+                                    "type": "not_found"}},
+                        )
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("admin_fact_exist_check_failed", error=str(e))
 
-        tombstone_key = hub.append_tombstone(
-            target_type=TombstoneTargetType.FACT,
-            target_key=fact_id,
-            source=TombstoneSource.USER,
-            origin=origin,
-        )
-        applied, existed = _apply_to_index(cfg, lambda p2w: p2w.delete_fact(fact_id))
-        logger.info("admin_fact_deleted", fact_id=fact_id,
-                    tombstone_key=tombstone_key, index_applied=applied,
-                    existed=bool(existed), origin=origin or None)
-        return _admin_response(
-            200 if applied else 202,
-            "deleted" if applied else "deferred",
-            fact_id=fact_id, tombstone_key=tombstone_key,
-        )
+            tombstone_key = hub.append_tombstone(
+                target_type=TombstoneTargetType.FACT,
+                target_key=fact_id,
+                source=TombstoneSource.USER,
+                origin=origin,
+            )
+            applied, existed = _apply_to_index(cfg, lambda p2w: p2w.delete_fact(fact_id))
+            logger.info("admin_fact_deleted", fact_id=fact_id,
+                        tombstone_key=tombstone_key, index_applied=applied,
+                        existed=bool(existed), origin=origin or None)
+            return _admin_response(
+                200 if applied else 202,
+                "deleted" if applied else "deferred",
+                fact_id=fact_id, tombstone_key=tombstone_key,
+            )
+
+        return await run_blocking(_write)
 
     # ── Z4（MQ-P33）：外部工具回流 —— 正门在这里，Hub 唯一写者仍是 proxy ──
 
@@ -438,8 +569,9 @@ def register_admin_routes(app: FastAPI) -> None:
         fact_id: str,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body(CorrectFactBody)),
     ) -> JSONResponse:
-        """外部工具更正一条 fact 的文字：先落 FACT_CORRECT 管理事件，再应用到 Index。
+        """外部工具或 dashboard 更正一条 fact 的文字：先落 FACT_CORRECT 管理事件，再应用到 Index。
 
         - 状态式完整载荷（更正后的 Fact dump），重放 = 覆盖；full rebuild 后仍在。
         - 与现存文字一致 ⇒ 200 `unchanged`、**不落事件**（回声不算编辑）。
@@ -449,63 +581,73 @@ def register_admin_routes(app: FastAPI) -> None:
         if not content:
             return JSONResponse(status_code=400, content={"error": {
                 "message": "content: field required", "type": "validation_error"}})
-        if body.origin not in BACKFLOW_ORIGINS:
+        if body.origin not in FACT_CORRECT_ORIGINS:
             return JSONResponse(status_code=400, content={"error": {
-                "message": f"origin {body.origin!r} not in {sorted(BACKFLOW_ORIGINS)}",
+                "message": f"origin {body.origin!r} not in {sorted(FACT_CORRECT_ORIGINS)}",
+                "type": "validation_error"}})
+        if body.origin == FACT_CORRECT_ORIGIN_DASHBOARD and body.submitter:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": "submitter must be empty when origin is dashboard",
                 "type": "validation_error"}})
         hub: MemoryHub | None = request.app.state.hub
         if hub is None:
             return _hub_unavailable()
-        p2r: MemoryIndex | None = request.app.state.index
-        current = None
-        if p2r is not None:
-            try:
-                current = p2r.get_fact(fact_id)
-            except Exception as e:  # noqa: BLE001
-                logger.debug("admin_fact_correct_lookup_failed", error=str(e))
-        if current is None:
-            return JSONResponse(status_code=404, content={"error": {
-                "message": "Fact not found", "type": "not_found"}})
-        if current.content == content:
-            return _admin_response(200, "unchanged", fact_id=fact_id)
-
-        from datetime import UTC, datetime
-
-        from bladex_core.consolidation_proxy import embed_passage_compat
-        corrected = current.model_copy(update={
-            "content": content, "updated_at": datetime.now(UTC), "embedding": None})
-        event_key = hub.append_admin_event(
-            AdminEventType.FACT_CORRECT, "", fact_id,
-            fact_id=fact_id,
-            entity=corrected.model_dump(mode="json", exclude={"embedding"}),
-            previous_content=current.content,
-            origin=body.origin, submitter=body.submitter)
         embedder = getattr(request.app.state, "embedder", None)
-        if embedder is not None:
+
+        def _write() -> JSONResponse:
+            # 批 DS1b（MQ-W25）：Index 读 + Hub 追加 + 嵌入 + 开可写 Index 进工作线程
+            p2r: MemoryIndex | None = request.app.state.index
+            current = None
+            if p2r is not None:
+                try:
+                    current = p2r.get_fact(fact_id)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("admin_fact_correct_lookup_failed", error=str(e))
+            if current is None:
+                return JSONResponse(status_code=404, content={"error": {
+                    "message": "Fact not found", "type": "not_found"}})
+            if current.content == content:
+                return _admin_response(200, "unchanged", fact_id=fact_id)
+
+            from datetime import UTC, datetime
+
+            from bladex_core.consolidation_proxy import embed_passage_compat
+            corrected = current.model_copy(update={
+                "content": content, "updated_at": datetime.now(UTC), "embedding": None})
+            event_key = hub.append_admin_event(
+                AdminEventType.FACT_CORRECT, "", fact_id,
+                fact_id=fact_id,
+                entity=corrected.model_dump(mode="json", exclude={"embedding"}),
+                previous_content=current.content,
+                origin=body.origin, submitter=body.submitter)
+            if embedder is not None:
+                try:
+                    corrected.embedding = embed_passage_compat(embedder, [content])[0]
+                except Exception as e:  # noqa: BLE001 —— 无向量仍入 meta；重放会重嵌
+                    logger.debug("admin_fact_correct_embed_skip", error=str(e))
+            # 事件已在 Hub：即时应用失败（写锁 / 向量表维度等）一律降为 202 deferred，
+            # 交给 consolidator 的增量重放——绝不回 5xx 让调用方重试而重复落账。
             try:
-                corrected.embedding = embed_passage_compat(embedder, [content])[0]
-            except Exception as e:  # noqa: BLE001 —— 无向量仍入 meta；重放会重嵌
-                logger.debug("admin_fact_correct_embed_skip", error=str(e))
-        # 事件已在 Hub：即时应用失败（写锁 / 向量表维度等）一律降为 202 deferred，
-        # 交给 consolidator 的增量重放——绝不回 5xx 让调用方重试而重复落账。
-        try:
-            applied, _ = _apply_to_index(cfg, lambda p2w: p2w.correct_fact(corrected) or True)
-        except Exception as e:  # noqa: BLE001
-            applied = False
-            logger.warning("admin_fact_correct_index_apply_failed", fact_id=fact_id,
-                           error=str(e), hint="Hub event recorded; Index catches up on "
-                                              "the consolidator's next pass")
-        logger.info("admin_fact_corrected", fact_id=fact_id, origin=body.origin,
-                    event_key=event_key, index_applied=applied)
-        return _admin_response(200 if applied else 202,
-                               "corrected" if applied else "deferred",
-                               fact_id=fact_id, event_key=event_key)
+                applied, _ = _apply_to_index(cfg, lambda p2w: p2w.correct_fact(corrected) or True)
+            except Exception as e:  # noqa: BLE001
+                applied = False
+                logger.warning("admin_fact_correct_index_apply_failed", fact_id=fact_id,
+                               error=str(e), hint="Hub event recorded; Index catches up on "
+                                                  "the consolidator's next pass")
+            logger.info("admin_fact_corrected", fact_id=fact_id, origin=body.origin,
+                        event_key=event_key, index_applied=applied)
+            return _admin_response(200 if applied else 202,
+                                   "corrected" if applied else "deferred",
+                                   fact_id=fact_id, event_key=event_key)
+
+        return await run_blocking(_write)
 
     @app.post("/admin/hard-rules/set")
     async def set_hard_rules(
         body: HardRulesSetBody,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body(HardRulesSetBody)),
     ) -> JSONResponse:
         """Obsidian `Hard Rules.md` 回流：落 HARD_RULES_SET 管理事件（状态式整表）。
 
@@ -526,14 +668,18 @@ def register_admin_routes(app: FastAPI) -> None:
         hub: MemoryHub | None = request.app.state.hub
         if hub is None:
             return _hub_unavailable()
-        event_key = hub.append_admin_event(
-            AdminEventType.HARD_RULES_SET, "", "",
-            rules=rules, previous=list(body.previous),
-            origin=body.origin, submitter=body.submitter)
-        logger.info("admin_hard_rules_set", count=len(rules),
-                    previous=len(body.previous), origin=body.origin,
-                    event_key=event_key)
-        return _admin_response(200, "recorded", event_key=event_key, count=len(rules))
+        def _write() -> JSONResponse:
+            # 批 DS1b（MQ-W25）：Hub 追加进工作线程
+            event_key = hub.append_admin_event(
+                AdminEventType.HARD_RULES_SET, "", "",
+                rules=rules, previous=list(body.previous),
+                origin=body.origin, submitter=body.submitter)
+            logger.info("admin_hard_rules_set", count=len(rules),
+                        previous=len(body.previous), origin=body.origin,
+                        event_key=event_key)
+            return _admin_response(200, "recorded", event_key=event_key, count=len(rules))
+
+        return await run_blocking(_write)
 
     # ── ADR-0012 §3.5: Matter 手动映射操作 ──
 
@@ -542,6 +688,7 @@ def register_admin_routes(app: FastAPI) -> None:
         body: CreateMatterBody,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body(CreateMatterBody)),
     ) -> JSONResponse:
         """手动创建 Matter（先写管理事件到 Memory Hub，再应用到 Memory Index）。"""
         title = body.title
@@ -552,23 +699,27 @@ def register_admin_routes(app: FastAPI) -> None:
         if hub is None:
             return _hub_unavailable()
 
-        hub.append_admin_event(
-            AdminEventType.MATTER_CREATE, matter_id,
-            title=title, summary=summary,
-        )
+        def _write() -> JSONResponse:
+            # 批 DS1b（MQ-W25）：Hub 追加 + 开可写 Index 进工作线程
+            hub.append_admin_event(
+                AdminEventType.MATTER_CREATE, matter_id,
+                title=title, summary=summary,
+            )
 
-        matter = Matter(
-            matter_id=matter_id, title=title, summary=summary,
-            status=MatterStatus.ACTIVE, origin=MatterOrigin.MANUAL,
-        )
-        applied, _ = _apply_to_index(cfg, lambda p2w: p2w.add_matter(matter))
+            matter = Matter(
+                matter_id=matter_id, title=title, summary=summary,
+                status=MatterStatus.ACTIVE, origin=MatterOrigin.MANUAL,
+            )
+            applied, _ = _apply_to_index(cfg, lambda p2w: p2w.add_matter(matter))
 
-        logger.info("admin_matter_created", matter_id=matter_id, title=title, index_applied=applied)
-        return _admin_response(
-            200 if applied else 202,
-            "created" if applied else "deferred",
-            matter_id=matter_id, title=title,
-        )
+            logger.info("admin_matter_created", matter_id=matter_id, title=title, index_applied=applied)
+            return _admin_response(
+                200 if applied else 202,
+                "created" if applied else "deferred",
+                matter_id=matter_id, title=title,
+            )
+
+        return await run_blocking(_write)
 
     @app.post("/admin/matters/{matter_id}/assign")
     async def assign_to_matter(
@@ -576,6 +727,7 @@ def register_admin_routes(app: FastAPI) -> None:
         matter_id: str,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body(AssignMatterBody)),
     ) -> JSONResponse:
         """手动指定归属（manual 压过 auto）。"""
         hub: MemoryHub | None = request.app.state.hub
@@ -586,21 +738,25 @@ def register_admin_routes(app: FastAPI) -> None:
             return JSONResponse(status_code=400, content={"error": {
                 "message": f"origin {body.origin!r} not in {sorted(BACKFLOW_ORIGINS)}",
                 "type": "validation_error"}})
-        hub.append_admin_event(
-            AdminEventType.MATTER_ASSIGN, matter_id, body.target_key,
-            target_type=body.target_type, **_origin_payload(body),
-        )
+        def _write() -> JSONResponse:
+            # 批 DS1b（MQ-W25）：Hub 追加 + 开可写 Index 进工作线程
+            hub.append_admin_event(
+                AdminEventType.MATTER_ASSIGN, matter_id, body.target_key,
+                target_type=body.target_type, **_origin_payload(body),
+            )
 
-        et = EdgeTargetType.SESSION if body.target_type == "session" else EdgeTargetType.FACT
-        applied, _ = _apply_to_index(cfg, lambda p2w: p2w.assign_manual(matter_id, et, body.target_key))
+            et = EdgeTargetType.SESSION if body.target_type == "session" else EdgeTargetType.FACT
+            applied, _ = _apply_to_index(cfg, lambda p2w: p2w.assign_manual(matter_id, et, body.target_key))
 
-        logger.info("admin_matter_assigned", matter_id=matter_id,
-                     target_key=body.target_key, index_applied=applied)
-        return _admin_response(
-            200 if applied else 202,
-            "assigned" if applied else "deferred",
-            matter_id=matter_id, target_key=body.target_key,
-        )
+            logger.info("admin_matter_assigned", matter_id=matter_id,
+                         target_key=body.target_key, index_applied=applied)
+            return _admin_response(
+                200 if applied else 202,
+                "assigned" if applied else "deferred",
+                matter_id=matter_id, target_key=body.target_key,
+            )
+
+        return await run_blocking(_write)
 
     @app.post("/admin/matters/{matter_id}/merge")
     async def merge_matters(
@@ -608,6 +764,7 @@ def register_admin_routes(app: FastAPI) -> None:
         matter_id: str,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body(MergeMattersBody)),
     ) -> JSONResponse:
         """合并 Matter（source 合入 target=matter_id，保留 manual 边）。"""
         source_id = body.source_matter_id
@@ -616,21 +773,25 @@ def register_admin_routes(app: FastAPI) -> None:
         if hub is None:
             return _hub_unavailable()
 
-        hub.append_admin_event(
-            AdminEventType.MATTER_MERGE, matter_id, source_id,
-            source_matter_id=source_id,
-        )
+        def _write() -> JSONResponse:
+            # 批 DS1b（MQ-W25）：Hub 追加 + 开可写 Index 进工作线程
+            hub.append_admin_event(
+                AdminEventType.MATTER_MERGE, matter_id, source_id,
+                source_matter_id=source_id,
+            )
 
-        applied, moved = _apply_to_index(cfg, lambda p2w: p2w.merge_matters(source_id, matter_id))
-        moved = moved or 0
+            applied, moved = _apply_to_index(cfg, lambda p2w: p2w.merge_matters(source_id, matter_id))
+            moved = moved or 0
 
-        logger.info("admin_matter_merged", source=source_id, target=matter_id,
-                     moved=moved, index_applied=applied)
-        return _admin_response(
-            200 if applied else 202,
-            "merged" if applied else "deferred",
-            source_matter_id=source_id, target_matter_id=matter_id, moved_edges=moved,
-        )
+            logger.info("admin_matter_merged", source=source_id, target=matter_id,
+                         moved=moved, index_applied=applied)
+            return _admin_response(
+                200 if applied else 202,
+                "merged" if applied else "deferred",
+                source_matter_id=source_id, target_matter_id=matter_id, moved_edges=moved,
+            )
+
+        return await run_blocking(_write)
 
     @app.get("/admin/agents")
     async def list_agents(
@@ -709,87 +870,70 @@ def register_admin_routes(app: FastAPI) -> None:
         claimed_map: dict[str, str] = {}
         hub = getattr(request.app.state, "hub", None)
         if hub is not None:
-            try:
-                # 🔴 **复用重建侧的同一份实现**，不另写一遍。
-                # 曾经在这里手搓过一份"逐事件 src→to"的映射，**没有链式解析**：
-                # 用户把 `Pi` 改名成 `Pi-old` 之后，重建侧算出
-                # `unknown-3b5f685d → Pi-old`（对），列表页却仍算成 `→ Pi`，
-                # 于是界面显示 Pi 7 轮 / Pi-old 0 轮，而真实归属是 3 / 4。
-                # 同一个映射两份实现、一份带链一份不带 —— 正是 MS-17 那类漂移。
-                claimed_map = build_agent_claim_map(hub)
-                for _k, ev in hub.scan_admin_events():
-                    if ev.event_type == AdminEventType.AGENT_CLAIM:
-                        to_id = str(ev.payload.get("to_agent_id", "") or "")
-                        if to_id:
-                            _meta(to_id)["claimed"] = True
-                        claims.append({
-                            "from": ev.payload.get("from_agent_ids", []),
-                            "to": to_id,
-                            "merge": bool(ev.payload.get("merge", False)),
-                            "ts": ev.ts.isoformat() if ev.ts else "",
-                        })
-            except Exception as e:  # noqa: BLE001 —— 列表页不因 journal 异常整页失败
-                logger.warning("admin_agents_claims_scan_failed", error=str(e))
+            # 🔴 批 DS1a：读 Hub 的部分（全扫 journal + 全 key 扫 + 代表 turn）进工作线程；
+            # `_agent_registry` 不是线程安全的（dict 迭代中会被热路径改），它的读留在上面、
+            # 留在事件循环上。线程里只读 Hub、只返回原始数据，合并仍在这里做——与修前逐字同序。
+            hub_view = await run_blocking(_read_agents_hub, hub, frozenset(buckets))
+            claimed_map = hub_view["claimed_map"]
+            for ev in hub_view["claim_events"]:
+                to_id = str(ev.payload.get("to_agent_id", "") or "")
+                if to_id:
+                    _meta(to_id)["claimed"] = True
+                claims.append({
+                    "from": ev.payload.get("from_agent_ids", []),
+                    "to": to_id,
+                    "merge": bool(ev.payload.get("merge", False)),
+                    "ts": ev.ts.isoformat() if ev.ts else "",
+                })
 
             # ② Memory Hub 派生（持久，重启可存活）。只解 key，不碰 value。
-            try:
-                for agent_id, (rep_key, count) in hub.scan_agent_ids().items():
-                    if not agent_id.startswith("unknown"):
-                        if agent_id not in seen:
-                            seen.append(agent_id)   # 历史上出现过的具名 agent，供改名
-                        # 🔴 profile 变体归并到 base agent。
-                        # `hermes:default` / `hermes:accept` / `hermes:c7047465`
-                        # 是**同一个 agent 的不同配置文件**（ADR-0010 §3.3），
-                        # 规则也只挂在 base 上。摊平成六行只会让列表乱，
-                        # 而"改 hermes 的规则"本来就该在 base 这一层做。
-                        base = agent_id.split(":")[0] or agent_id
-                        entry = _meta(base)
-                        entry["turns"] += count
-                        # 🔴 **子代理不进 profiles 列表**（Jason 2026-08-26）：
-                        # `codex:guardian` 与 `hermes:accept` 都是 `base:suffix`，
-                        # 但语义不同——后者是**用户选的配置文件**（要看见、要能改规则），
-                        # 前者是 **agent 的内部角色**，名字随 agent 版本随时变，
-                        # 列出来只是噪声。轮次仍计入 base（它确实是那个 agent 的流量）。
-                        #
-                        # 判据来自**配置**不是猜：声明了 `subagent_headers` 的 agent
-                        # （codex）其 `base:*` 变体是子代理；`profile_aware` 的
-                        # （hermes）是配置文件。实测两个标志零重叠，判得干净。
-                        if agent_id != base and base not in _subagent_bases:
-                            entry["profiles"].append(agent_id)
-                        continue
-                    # 裸 `unknown`（G11.9 之前的共用桶）也算未识别侧，
-                    # 让它进待认领列表而不是混进已知 agent。
+            for agent_id, (_rep_key, count) in hub_view["agent_ids"].items():
+                if not agent_id.startswith("unknown"):
+                    if agent_id not in seen:
+                        seen.append(agent_id)   # 历史上出现过的具名 agent，供改名
+                    # 🔴 profile 变体归并到 base agent。
+                    # `hermes:default` / `hermes:accept` / `hermes:c7047465`
+                    # 是**同一个 agent 的不同配置文件**（ADR-0010 §3.3），
+                    # 规则也只挂在 base 上。摊平成六行只会让列表乱，
+                    # 而"改 hermes 的规则"本来就该在 base 这一层做。
+                    base = agent_id.split(":")[0] or agent_id
+                    entry = _meta(base)
+                    entry["turns"] += count
+                    # 🔴 **子代理不进 profiles 列表**（Jason 2026-08-26）：
+                    # `codex:guardian` 与 `hermes:accept` 都是 `base:suffix`，
+                    # 但语义不同——后者是**用户选的配置文件**（要看见、要能改规则），
+                    # 前者是 **agent 的内部角色**，名字随 agent 版本随时变，
+                    # 列出来只是噪声。轮次仍计入 base（它确实是那个 agent 的流量）。
                     #
-                    # 🔴 已认领的桶：轮次要算到**认领目标**头上。
-                    # Memory Hub key 里仍写着 `unknown-xxxx`（认领是读侧映射，
-                    # 不重写总账），所以认领目标的 key 数天然是 0。照实显示 0 会
-                    # 误导——那 4 轮记忆下次重建就归 `Pi` 了，说它"0 轮"等于告诉
-                    # 用户认领没生效。
-                    if agent_id in claimed_map:
-                        _meta(claimed_map[agent_id])["turns"] += count
-                    entry = buckets.get(agent_id)
-                    if entry is not None:
-                        entry["hub_turns"] = count
-                        continue
-                    # 判据串与 header 快照只在这一条代表 turn 上取（列表页不付全量代价）
-                    basis, headers = "", {}
-                    try:
-                        turn = hub.get(rep_key)
-                        if turn is not None:
-                            basis = getattr(turn.identity, "agent_bucket_basis", "") or ""
-                            headers = dict(getattr(turn.identity, "request_headers", {}) or {})
-                    except Exception as e:  # noqa: BLE001 —— 单条取不到不该毁掉整页
-                        logger.debug("admin_agents_rep_turn_failed",
-                                     key=rep_key, error=str(e))
-                    buckets[agent_id] = {
-                        "bucket_id": agent_id, "basis": basis, "headers": headers,
-                        "count": 0, "hub_turns": count, "source": "hub",
-                        # Memory Hub 这一路没有证据（证据是进程内检测的产物）；
-                        # 形状仍要一致——前端不许对可选字段分支。
-                        "drift": {},
-                    }
-            except Exception as e:  # noqa: BLE001
-                logger.warning("admin_agents_ledger_scan_failed", error=str(e))
+                    # 判据来自**配置**不是猜：声明了 `subagent_headers` 的 agent
+                    # （codex）其 `base:*` 变体是子代理；`profile_aware` 的
+                    # （hermes）是配置文件。实测两个标志零重叠，判得干净。
+                    if agent_id != base and base not in _subagent_bases:
+                        entry["profiles"].append(agent_id)
+                    continue
+                # 裸 `unknown`（G11.9 之前的共用桶）也算未识别侧，
+                # 让它进待认领列表而不是混进已知 agent。
+                #
+                # 🔴 已认领的桶：轮次要算到**认领目标**头上。
+                # Memory Hub key 里仍写着 `unknown-xxxx`（认领是读侧映射，
+                # 不重写总账），所以认领目标的 key 数天然是 0。照实显示 0 会
+                # 误导——那 4 轮记忆下次重建就归 `Pi` 了，说它"0 轮"等于告诉
+                # 用户认领没生效。
+                if agent_id in claimed_map:
+                    _meta(claimed_map[agent_id])["turns"] += count
+                entry = buckets.get(agent_id)
+                if entry is not None:
+                    entry["hub_turns"] = count
+                    continue
+                # 判据串与 header 快照只在这一条代表 turn 上取（列表页不付全量代价）
+                basis, headers = hub_view["rep"].get(agent_id, ("", {}))
+                buckets[agent_id] = {
+                    "bucket_id": agent_id, "basis": basis, "headers": headers,
+                    "count": 0, "hub_turns": count, "source": "hub",
+                    # Memory Hub 这一路没有证据（证据是进程内检测的产物）；
+                    # 形状仍要一致——前端不许对可选字段分支。
+                    "drift": {},
+                }
 
         # 已认领的不再挂在待认领里——认领是 journal 里的事实，
         # 不依赖进程内状态是否还记得（重启后尤其如此）。
@@ -816,6 +960,7 @@ def register_admin_routes(app: FastAPI) -> None:
     async def reattribute_agents(
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body()),
     ) -> JSONResponse:
         """⑤ 按 AGENT_CLAIM 把**存量**记忆的归属改过来（2026-08-26）。
 
@@ -884,104 +1029,109 @@ def register_admin_routes(app: FastAPI) -> None:
         if hub is None:
             return _hub_unavailable()
 
-        try:
-            keys = hub.keys_for_agent(agent_id)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("admin_agent_detail_scan_failed", agent_id=agent_id, error=str(e))
-            keys = []
-
-        sample_keys = keys[-_AGENT_DETAIL_SAMPLE:] if keys else []
-        sessions = {k.split("/")[2] for k in keys if len(k.split("/")) >= 4}
-
-        tools: set[str] = set()
-        models: set[str] = set()
-        system_excerpt, headers, basis = "", {}, ""
-        recent: list[dict[str, str]] = []
-        first_ts, last_ts = "", ""
-
-        for key in sample_keys:
+        def _read() -> JSONResponse:
+            # 批 DS1a：全 key 扫 + 取样 get 进工作线程（live 2.4 s）；本段不碰 `_agent_registry`
             try:
-                turn = hub.get(key)
-            except Exception as e:  # noqa: BLE001 —— 单条坏了不该毁掉整页
-                logger.debug("admin_agent_detail_turn_failed", key=key, error=str(e))
-                continue
-            if turn is None:
-                continue
-            ts = turn.ts.isoformat() if turn.ts else ""
-            first_ts = first_ts or ts
-            last_ts = ts or last_ts
-            if turn.model:
-                models.add(turn.model)
-            headers = dict(getattr(turn.identity, "request_headers", {}) or {}) or headers
-            basis = getattr(turn.identity, "agent_bucket_basis", "") or basis
-            for ev in turn.tool_events or []:
-                name = getattr(ev, "name", "") or ""
-                if name:
-                    tools.add(name)
-            last_user = ""
-            for msg in turn.request_messages or []:
-                role = msg.get("role", "")
-                text = _message_text(msg.get("content"))
-                # 🔴 `developer` 与 `system` 同属系统指令角色（Pi 用的是前者）。
-                # 只认 system 的话，辨识度最高的那段自我介绍一个字都取不到。
-                if role in _SYSTEM_ROLES and not system_excerpt:
-                    system_excerpt = text[:_AGENT_DETAIL_TEXT_CHARS]
-                elif role == "user" and text:
-                    last_user = text
-                for tc in msg.get("tool_calls", []) or []:
-                    fn = (tc or {}).get("function", {}).get("name", "")
-                    if fn:
-                        tools.add(fn)
-            rp = turn.request_params
-            if rp is not None and getattr(rp, "requested_model", ""):
-                models.add(rp.requested_model)
-            # tools schema 只存 hash，全文在 `__msg__` 内容池里 —— 不取回来，
-            # 详情页就看不到工具名（辨识度仅次于 system prompt 的信号）。
-            if rp is not None and getattr(rp, "tools_hash", ""):
-                try:
-                    for tdef in hub.get_tools(rp.tools_hash) or []:
-                        name = ((tdef or {}).get("function", {}) or {}).get("name", "")
-                        if name:
-                            tools.add(name)
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("admin_agent_detail_tools_failed", error=str(e))
-            if last_user:
-                recent.append({"ts": ts, "text": last_user[:_AGENT_DETAIL_TEXT_CHARS]})
+                keys = hub.keys_for_agent(agent_id)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("admin_agent_detail_scan_failed", agent_id=agent_id, error=str(e))
+                keys = []
 
-        return _admin_response(
-            200, "ok",
-            agent_id=agent_id,
-            recognized=not agent_id.startswith("unknown-"),
-            basis=basis,
-            headers=headers,
-            turns=len(keys),
-            sessions=len(sessions),
-            first_seen=first_ts,
-            last_seen=last_ts,
-            models=sorted(models),
-            tools=sorted(tools),
-            system_excerpt=system_excerpt,
-            recent_user_messages=list(reversed(recent)),
-            # 认领对话直接预填这条：规则该由系统提议、用户改，不该让用户手写
-            # （会话内容我们本来就抓到了）。
-            # 已有规则：改名/编辑时预填它（而不是从流量重新推），
-            # 否则用户一改就丢掉原规则里手工调过的部分。
-            current_rules=[rule_as_dict(r) for r in effective_rules_for(agent_id)],
-            # 未识别桶不拿 hash 后缀当 agent 名（`3b5f685d` 不是名字）——
-            # 留空让用户填，其余维度照常建议。
-            suggested_rule=suggest_rule(
-                "" if agent_id.startswith("unknown") else agent_id,
-                system_excerpt=system_excerpt,
-                tools=sorted(tools),
+            sample_keys = keys[-_AGENT_DETAIL_SAMPLE:] if keys else []
+            sessions = {k.split("/")[2] for k in keys if len(k.split("/")) >= 4}
+
+            tools: set[str] = set()
+            models: set[str] = set()
+            system_excerpt, headers, basis = "", {}, ""
+            recent: list[dict[str, str]] = []
+            first_ts, last_ts = "", ""
+
+            for key in sample_keys:
+                try:
+                    turn = hub.get(key)
+                except Exception as e:  # noqa: BLE001 —— 单条坏了不该毁掉整页
+                    logger.debug("admin_agent_detail_turn_failed", key=key, error=str(e))
+                    continue
+                if turn is None:
+                    continue
+                ts = turn.ts.isoformat() if turn.ts else ""
+                first_ts = first_ts or ts
+                last_ts = ts or last_ts
+                if turn.model:
+                    models.add(turn.model)
+                headers = dict(getattr(turn.identity, "request_headers", {}) or {}) or headers
+                basis = getattr(turn.identity, "agent_bucket_basis", "") or basis
+                for ev in turn.tool_events or []:
+                    name = getattr(ev, "name", "") or ""
+                    if name:
+                        tools.add(name)
+                last_user = ""
+                for msg in turn.request_messages or []:
+                    role = msg.get("role", "")
+                    text = _message_text(msg.get("content"))
+                    # 🔴 `developer` 与 `system` 同属系统指令角色（Pi 用的是前者）。
+                    # 只认 system 的话，辨识度最高的那段自我介绍一个字都取不到。
+                    if role in _SYSTEM_ROLES and not system_excerpt:
+                        system_excerpt = text[:_AGENT_DETAIL_TEXT_CHARS]
+                    elif role == "user" and text:
+                        last_user = text
+                    for tc in msg.get("tool_calls", []) or []:
+                        fn = (tc or {}).get("function", {}).get("name", "")
+                        if fn:
+                            tools.add(fn)
+                rp = turn.request_params
+                if rp is not None and getattr(rp, "requested_model", ""):
+                    models.add(rp.requested_model)
+                # tools schema 只存 hash，全文在 `__msg__` 内容池里 —— 不取回来，
+                # 详情页就看不到工具名（辨识度仅次于 system prompt 的信号）。
+                if rp is not None and getattr(rp, "tools_hash", ""):
+                    try:
+                        for tdef in hub.get_tools(rp.tools_hash) or []:
+                            name = ((tdef or {}).get("function", {}) or {}).get("name", "")
+                            if name:
+                                tools.add(name)
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("admin_agent_detail_tools_failed", error=str(e))
+                if last_user:
+                    recent.append({"ts": ts, "text": last_user[:_AGENT_DETAIL_TEXT_CHARS]})
+
+            return _admin_response(
+                200, "ok",
+                agent_id=agent_id,
+                recognized=not agent_id.startswith("unknown-"),
+                basis=basis,
                 headers=headers,
-            ),
-        )
+                turns=len(keys),
+                sessions=len(sessions),
+                first_seen=first_ts,
+                last_seen=last_ts,
+                models=sorted(models),
+                tools=sorted(tools),
+                system_excerpt=system_excerpt,
+                recent_user_messages=list(reversed(recent)),
+                # 认领对话直接预填这条：规则该由系统提议、用户改，不该让用户手写
+                # （会话内容我们本来就抓到了）。
+                # 已有规则：改名/编辑时预填它（而不是从流量重新推），
+                # 否则用户一改就丢掉原规则里手工调过的部分。
+                current_rules=[rule_as_dict(r) for r in effective_rules_for(agent_id)],
+                # 未识别桶不拿 hash 后缀当 agent 名（`3b5f685d` 不是名字）——
+                # 留空让用户填，其余维度照常建议。
+                suggested_rule=suggest_rule(
+                    "" if agent_id.startswith("unknown") else agent_id,
+                    system_excerpt=system_excerpt,
+                    tools=sorted(tools),
+                    headers=headers,
+                ),
+            )
+
+        return await run_blocking(_read)
 
     @app.post("/admin/agents/rules")
     async def save_agent_rule(
         body: AgentRuleBody,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body(AgentRuleBody)),
     ) -> JSONResponse:
         """新增 / 修改一条识别规则（写用户规则文件，立即生效）。
 
@@ -1020,6 +1170,7 @@ def register_admin_routes(app: FastAPI) -> None:
         body: AgentClaimBody,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body(AgentClaimBody)),
     ) -> JSONResponse:
         """认领 / 改名 / 合并 agent —— 一套语义三种用法（G11.11，台账接入域）。
 
@@ -1054,7 +1205,10 @@ def register_admin_routes(app: FastAPI) -> None:
         # 结果本身没错（Pi 只有一行、轮次累加），但门的判据不该依赖无关因素。
         if hub_for_check is not None:
             try:
-                claim_map = build_agent_claim_map(hub_for_check)
+                # 批 DS1b（MQ-W25）：全扫 journal 进工作线程。`_agent_registry` 与规则文件留在
+                # 事件循环上（前者非线程安全；后者的 `_cache` 是"为空就算、算完赋值"，无代次令牌，
+                # 与 `save_agent_rule` 的写盘并发会丢失效——MQ-I40 同形，不往线程里搬）。
+                claim_map = await run_blocking(build_agent_claim_map, hub_for_check)
                 existing.update(claim_map.values())
                 # 🔴 但**被改名走的名字要还回去**：`Pi → Pi-old` 之后，`Pi` 这个名字
                 # 就空出来了，再把别的桶认领成 `Pi` 不是合并、不该要二次确认。
@@ -1078,7 +1232,8 @@ def register_admin_routes(app: FastAPI) -> None:
             return _hub_unavailable()
 
         # 🔴 matter_id 留空走 payload —— 该字段只在目标真是 Matter 时使用（MQ-A7）。
-        hub.append_admin_event(
+        await run_blocking(
+            hub.append_admin_event,
             AdminEventType.AGENT_CLAIM, "", "",
             from_agent_ids=sources, to_agent_id=target, merge=is_merge,
             rule=body.rule or None,
@@ -1124,6 +1279,7 @@ def register_admin_routes(app: FastAPI) -> None:
         matter_id: str,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body(DetachEdgeBody)),
     ) -> JSONResponse:
         """手动摘除归属边（by edge_id 或 by target_key + target_type）。"""
         if not body.edge_id and not body.target_key:
@@ -1141,26 +1297,30 @@ def register_admin_routes(app: FastAPI) -> None:
             return JSONResponse(status_code=400, content={"error": {
                 "message": f"origin {body.origin!r} not in {sorted(BACKFLOW_ORIGINS)}",
                 "type": "validation_error"}})
-        hub.append_admin_event(
-            AdminEventType.MATTER_DETACH, matter_id,
-            edge_id=body.edge_id, target_key=body.target_key,
-            target_type=body.target_type, **_origin_payload(body),
-        )
+        def _write() -> JSONResponse:
+            # 批 DS1b（MQ-W25）：Hub 追加 + 开可写 Index 进工作线程
+            hub.append_admin_event(
+                AdminEventType.MATTER_DETACH, matter_id,
+                edge_id=body.edge_id, target_key=body.target_key,
+                target_type=body.target_type, **_origin_payload(body),
+            )
 
-        if body.edge_id:
-            applied, removed = _apply_to_index(cfg, lambda p2w: p2w.detach_edge(body.edge_id))
-        else:
-            et = EdgeTargetType.SESSION if body.target_type == "session" else EdgeTargetType.FACT
-            applied, removed = _apply_to_index(cfg, lambda p2w: p2w.detach_edges_for_target(body.target_key, et))
-        removed = removed or 0
+            if body.edge_id:
+                applied, removed = _apply_to_index(cfg, lambda p2w: p2w.detach_edge(body.edge_id))
+            else:
+                et = EdgeTargetType.SESSION if body.target_type == "session" else EdgeTargetType.FACT
+                applied, removed = _apply_to_index(cfg, lambda p2w: p2w.detach_edges_for_target(body.target_key, et))
+            removed = removed or 0
 
-        logger.info("admin_matter_detached", matter_id=matter_id,
-                     edge_id=body.edge_id, removed=removed, index_applied=applied)
-        return _admin_response(
-            200 if applied else 202,
-            "detached" if applied else "deferred",
-            matter_id=matter_id, removed=removed,
-        )
+            logger.info("admin_matter_detached", matter_id=matter_id,
+                         edge_id=body.edge_id, removed=removed, index_applied=applied)
+            return _admin_response(
+                200 if applied else 202,
+                "detached" if applied else "deferred",
+                matter_id=matter_id, removed=removed,
+            )
+
+        return await run_blocking(_write)
 
     @app.post("/admin/matters/{matter_id}/split")
     async def split_matter_endpoint(
@@ -1168,55 +1328,65 @@ def register_admin_routes(app: FastAPI) -> None:
         matter_id: str,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body(SplitMatterBody)),
     ) -> JSONResponse:
         """拆分 Matter：创建新 Matter 并把指定归属边转移过去。"""
         hub: MemoryHub | None = request.app.state.hub
         if hub is None:
             return _hub_unavailable()
 
-        new_matter_id = f"m-{uuid.uuid4().hex[:10]}"
+        def _write() -> JSONResponse:
+            # 批 DS1b（MQ-W25）：Hub 追加 + 开可写 Index 进工作线程
+            new_matter_id = f"m-{uuid.uuid4().hex[:10]}"
 
-        hub.append_admin_event(
-            AdminEventType.MATTER_SPLIT, matter_id,
-            new_matter_id=new_matter_id, new_title=body.new_title,
-            edge_ids=body.edge_ids,
-        )
+            hub.append_admin_event(
+                AdminEventType.MATTER_SPLIT, matter_id,
+                new_matter_id=new_matter_id, new_title=body.new_title,
+                edge_ids=body.edge_ids,
+            )
 
-        applied, result = _apply_to_index(cfg, lambda p2w: p2w.split_matter(
-            matter_id, new_matter_id, body.new_title, body.edge_ids,
-        ))
-        moved = result[1] if result is not None else 0
+            applied, result = _apply_to_index(cfg, lambda p2w: p2w.split_matter(
+                matter_id, new_matter_id, body.new_title, body.edge_ids,
+            ))
+            moved = result[1] if result is not None else 0
 
-        logger.info("admin_matter_split", source=matter_id,
-                     new_matter_id=new_matter_id, moved=moved, index_applied=applied)
-        return _admin_response(
-            200 if applied else 202,
-            "split" if applied else "deferred",
-            source_matter_id=matter_id, new_matter_id=new_matter_id, moved_edges=moved,
-        )
+            logger.info("admin_matter_split", source=matter_id,
+                         new_matter_id=new_matter_id, moved=moved, index_applied=applied)
+            return _admin_response(
+                200 if applied else 202,
+                "split" if applied else "deferred",
+                source_matter_id=matter_id, new_matter_id=new_matter_id, moved_edges=moved,
+            )
+
+        return await run_blocking(_write)
 
     @app.post("/admin/matters/{matter_id}/close")
     async def close_matter(
         matter_id: str,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body()),
     ) -> JSONResponse:
         """关闭 Matter。"""
         hub: MemoryHub | None = request.app.state.hub
         if hub is None:
             return _hub_unavailable()
 
-        hub.append_admin_event(AdminEventType.MATTER_CLOSE, matter_id)
+        def _write() -> JSONResponse:
+            # 批 DS1b（MQ-W25）：Hub 追加 + 开可写 Index 进工作线程
+            hub.append_admin_event(AdminEventType.MATTER_CLOSE, matter_id)
 
-        applied, success = _apply_to_index(cfg, lambda p2w: p2w.close_matter(matter_id))
-        success = success or False
+            applied, success = _apply_to_index(cfg, lambda p2w: p2w.close_matter(matter_id))
+            success = success or False
 
-        logger.info("admin_matter_closed", matter_id=matter_id, success=success, index_applied=applied)
-        return _admin_response(
-            200 if applied else 202,
-            "closed" if applied else "deferred",
-            matter_id=matter_id, success=success,
-        )
+            logger.info("admin_matter_closed", matter_id=matter_id, success=success, index_applied=applied)
+            return _admin_response(
+                200 if applied else 202,
+                "closed" if applied else "deferred",
+                matter_id=matter_id, success=success,
+            )
+
+        return await run_blocking(_write)
 
     @app.post("/admin/matters/{matter_id}/rename")
     async def rename_matter(
@@ -1224,30 +1394,39 @@ def register_admin_routes(app: FastAPI) -> None:
         matter_id: str,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body(RenameMatterBody)),
     ) -> JSONResponse:
         """重命名 Matter。"""
         hub: MemoryHub | None = request.app.state.hub
         if hub is None:
             return _hub_unavailable()
 
-        hub.append_admin_event(AdminEventType.MATTER_RENAME, matter_id, title=body.title)
+        def _write() -> JSONResponse:
+            # 批 DS1b（MQ-W25）：Hub 追加 + 开可写 Index 进工作线程
+            hub.append_admin_event(AdminEventType.MATTER_RENAME, matter_id, title=body.title)
 
-        applied, success = _apply_to_index(cfg, lambda p2w: p2w.rename_matter(matter_id, body.title))
-        success = success or False
+            applied, success = _apply_to_index(cfg, lambda p2w: p2w.rename_matter(matter_id, body.title))
+            success = success or False
 
-        logger.info("admin_matter_renamed", matter_id=matter_id, title=body.title, index_applied=applied)
-        return _admin_response(
-            200 if applied else 202,
-            "renamed" if applied else "deferred",
-            matter_id=matter_id, title=body.title, success=success,
-        )
+            logger.info("admin_matter_renamed", matter_id=matter_id, title=body.title, index_applied=applied)
+            return _admin_response(
+                200 if applied else 202,
+                "renamed" if applied else "deferred",
+                matter_id=matter_id, title=body.title, success=success,
+            )
+
+        return await run_blocking(_write)
 
     @app.post("/admin/ledgers/user-edit")
     async def admin_ledger_user_edit(
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body("ledger", "expected_rev")),
     ) -> JSONResponse:
         """V-F2b（2026-08-29 语义修订，Jason 拍板）：用户直编账本 = **采纳本地版本**。
+
+        body：`{"ledger": {...}, "expected_rev": <int, 可选>}`。`expected_rev`（批 DS1a）
+        与池里当前 rev 不符 ⇒ 409、不写；不带 ⇒ 下文语义逐字不变。
 
         采纳 = 用户版进 agency 内存池（注入块/工具面立刻可见）**+ 落 Hub 一条
         `LEDGER_USER_EDIT` 事件**（MQ-L51，2026-09-06）。事件走 `AgencyRuntime._emit`——
@@ -1277,9 +1456,35 @@ def register_admin_routes(app: FastAPI) -> None:
             return JSONResponse(status_code=400, content={
                 "error": {"message": f"invalid ledger payload: {e}",
                           "type": "validation_error"}})
+        expected_rev = (body or {}).get("expected_rev")
+        if expected_rev is not None and (isinstance(expected_rev, bool)
+                                         or not isinstance(expected_rev, int)):
+            return JSONResponse(status_code=400, content={
+                "error": {"message": f"expected_rev must be an integer, got {expected_rev!r}",
+                          "type": "validation_error"}})
         agency = getattr(request.app.state, "agency", None)
         if agency is not None:
             prev = agency.pool.get(led.ledger_id)
+            # 批 DS1a（DS-04 前置）：可选乐观锁。dashboard 编辑时带上它读到的 rev；池里已经
+            # 不是那个 rev（agent 或别的窗口在这期间写过）⇒ 409 + 当前 rev 与当前池版，
+            # **池与 Hub 一字不动**——没有发生的编辑不记成发生过（ADR-0032 §12 rev 乐观锁的
+            # admin 面：工具面落后拒写同样不落事件、返回最新正文，合并交给作者）。
+            # 不带 expected_rev（flash daemon 今天就不带）⇒ 下面逐字是修前行为。
+            if expected_rev is not None:
+                current_rev = prev.rev if prev is not None else None
+                if current_rev != expected_rev:
+                    logger.warning("admin_ledger_user_edit_rev_conflict",
+                                   ledger=led.ledger_id, expected_rev=expected_rev,
+                                   current_rev=current_rev,
+                                   last_writer=getattr(prev, "last_writer", None))
+                    return JSONResponse(status_code=409, content={
+                        "status": "conflict", "ledger_id": led.ledger_id,
+                        "expected_rev": expected_rev, "current_rev": current_rev,
+                        "ledger": (prev.model_dump(mode="json") if prev is not None
+                                   else None),
+                        "detail": ("ledger changed since you read it; nothing was written. "
+                                   "Merge onto `ledger` and resend with "
+                                   "expected_rev=current_rev.")})
             # 上次采纳的用户版（去掉 rev/last_writer——那两项是采纳时 proxy 改写的，
             # 不属于用户提交的内容）；按 ledger_id 记，进程内存即可（只为区分形态）。
             _last_adoptions: dict = getattr(agency, "_last_user_edit_dump", None) or {}
@@ -1290,6 +1495,12 @@ def register_admin_routes(app: FastAPI) -> None:
                     pass
             submitted = led.model_dump(mode="json", exclude={"rev", "last_writer"})
             same_as_last = _last_adoptions.get(led.ledger_id) == submitted
+            if prev is not None and led.goal != prev.goal:
+                # MQ-L107（批 CB）：Goal 变化只经 `update_goal`。修前整本采纳，live 2 次改 Goal
+                # 修订计数都没进位、1 次来源仍写 `model`（md 里带回的旧来源）。
+                from bladex_core.ledger import ACTOR_USER, update_goal
+                led = update_goal(led.model_copy(update={"goal_revisions": prev.goal_revisions}),
+                                  led.goal, actor=ACTOR_USER, updated_at=led.updated_at)
             if prev is not None:
                 # 直编采纳=整本覆盖（用户主权），但 rev 必须前进、写者记 user；
                 # 若并发 agent 在窗口内写过，盖掉的是它的新条目——响亮告警
@@ -1334,6 +1545,7 @@ def register_admin_routes(app: FastAPI) -> None:
     async def admin_audience_set(
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body("fact_id", "audience")),
     ) -> JSONResponse:
         """MQ-L27 修法③：人设事实 audience 补标（管理事件，重建可重放）。
 
@@ -1358,17 +1570,120 @@ def register_admin_routes(app: FastAPI) -> None:
                 "error": {"message": "fact_id and audience "
                           "(all | agent:<base>) required",
                           "type": "validation_error"}})
-        hub.append_admin_event(AdminEventType.AUDIENCE_SET, "",
-                               fact_id=fact_id, audience=audience)
-        logger.info("admin_audience_set", fact_id=fact_id, audience=audience)
-        return JSONResponse(content={"status": "ok", "fact_id": fact_id,
-                                     "audience": audience})
+        def _write() -> JSONResponse:
+            # 批 DS1b（MQ-W25）：Hub 追加进工作线程
+            hub.append_admin_event(AdminEventType.AUDIENCE_SET, "",
+                                   fact_id=fact_id, audience=audience)
+            logger.info("admin_audience_set", fact_id=fact_id, audience=audience)
+            return JSONResponse(content={"status": "ok", "fact_id": fact_id,
+                                         "audience": audience})
+
+        return await run_blocking(_write)
+
+    @app.post("/admin/contradictions")
+    async def admin_contradiction_flag(
+        request: Request,
+        cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body("pair_key", "payload")),
+    ) -> JSONResponse:
+        """批 BB · 2b：落一条矛盾**标记**（consolidator 经此写 Hub，它自己对 Hub 只读）。
+
+        只收 flag 载荷，且必须过 `consistency.parse_payload`（唯一解析点）：带 `fact_id` / `audience`、
+        `kind` 不对、`pair` 没排序、`pair_key` 与载荷不符 ⇒ 400，什么都不写。**只追加事件，不碰 fact**；
+        Index 的物化由 consolidator 下一 pass 增量重放完成。开关关着时本端点照常可用（读写与开关无关，
+        开关只管 consolidator 要不要去判）。
+        """
+        from bladex_core import consistency as cs
+
+        hub: MemoryHub | None = request.app.state.hub
+        if hub is None:
+            return _hub_unavailable()
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse(status_code=400, content={
+                "error": {"message": "invalid JSON body", "type": "validation_error"}})
+        pair_key = str((body or {}).get("pair_key", "")).strip()
+        payload = (body or {}).get("payload")
+        rec = cs.parse_payload(payload) if isinstance(payload, dict) else None
+        if not isinstance(rec, cs.FlagRecord) or rec.key != pair_key:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": "pair_key and a valid contradiction_flag payload required "
+                           "(no fact_id / audience; pair sorted and equal to pair_key)",
+                "type": "validation_error"}})
+
+        def _write() -> JSONResponse:
+            key = hub.append_admin_event(AdminEventType.AUDIENCE_SET, "", pair_key, **payload)
+            logger.info("admin_contradiction_flagged", pair=pair_key, judge_model=rec.judge_model)
+            return JSONResponse(content={"status": "ok", "event_key": key, "pair_id": pair_key})
+
+        return await run_blocking(_write)
+
+    @app.post("/admin/contradictions/{pair_id}/settle")
+    async def admin_contradiction_settle(
+        pair_id: str,
+        request: Request,
+        cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body("verdict", "origin", "note")),
+    ) -> JSONResponse:
+        """批 BB · 2b：用户裁定一对矛盾（`not_same_thing` / `confirmed`）。只追加事件，重复裁定以最新一条为准。
+
+        - `origin` 闭集 `cli` / `dashboard`；`model` 一律 400（模型不能替用户裁定）。
+        - 对没被标记过的对 ⇒ 404；任一侧已不存在 ⇒ 409。裁定绑**当前**内容 sha：之后改了文字就不再覆盖。
+        - 不删、不改任何 fact——要删仍走 `memory forget`。
+        """
+        from bladex_core import consistency as cs
+
+        hub: MemoryHub | None = request.app.state.hub
+        if hub is None:
+            return _hub_unavailable()
+        index: MemoryIndex | None = request.app.state.index
+        if index is None:
+            return JSONResponse(status_code=503, content={"error": {
+                "message": "Memory Index derived layer unavailable", "type": "storage_error"}})
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse(status_code=400, content={
+                "error": {"message": "invalid JSON body", "type": "validation_error"}})
+        verdict = str((body or {}).get("verdict", "")).strip()
+        origin = str((body or {}).get("origin", "")).strip()
+        note = str((body or {}).get("note", "") or "")
+        if verdict not in cs.USER_VERDICTS or origin not in cs.VERDICT_ORIGINS:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": f"verdict must be one of {sorted(cs.USER_VERDICTS)}; "
+                           f"origin must be one of {sorted(cs.VERDICT_ORIGINS)}",
+                "type": "validation_error"}})
+        ids = pair_id.split("|")
+        if len(ids) != 2 or not all(ids):
+            return JSONResponse(status_code=400, content={"error": {
+                "message": "pair_id must look like <fact_id>|<fact_id>", "type": "validation_error"}})
+        lo, hi = sorted(ids)
+
+        def _write() -> JSONResponse:
+            if index.contradiction_kv_get(f"contradiction/{lo}|{hi}") is None:
+                return JSONResponse(status_code=404, content={"error": {
+                    "message": "no contradiction flagged for this pair", "type": "not_found"}})
+            facts = [index.get_fact(lo), index.get_fact(hi)]
+            if any(f is None for f in facts):
+                return JSONResponse(status_code=409, content={"error": {
+                    "message": "one side of this pair no longer exists", "type": "conflict"}})
+            payload = cs.build_verdict_payload(
+                (lo, hi), (cs.content_sha(facts[0]), cs.content_sha(facts[1])),  # type: ignore[arg-type]
+                verdict=verdict, origin=origin, note=note)
+            key = hub.append_admin_event(AdminEventType.AUDIENCE_SET, "", f"{lo}|{hi}", **payload)
+            logger.info("admin_contradiction_settled", pair=f"{lo}|{hi}", verdict=verdict, origin=origin)
+            return JSONResponse(content={"status": "ok", "event_key": key, "pair_id": f"{lo}|{hi}",
+                                         "verdict": verdict, "origin": origin})
+
+        return await run_blocking(_write)
 
     @app.post("/admin/scope/promote")
     async def promote_scope(
         body: PromoteScopeBody,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body(PromoteScopeBody)),
     ) -> JSONResponse:
         """ADR-0021 section 2.4: scope 提升（personal->team/org）--显式管理操作。
 
@@ -1386,36 +1701,40 @@ def register_admin_routes(app: FastAPI) -> None:
         if hub is None:
             return _hub_unavailable()
 
-        hub.append_admin_event(
-            AdminEventType.SCOPE_PROMOTE, body.target_key,
-            target_type=body.target_type, new_scope=body.new_scope,
-        )
+        def _write() -> JSONResponse:
+            # 批 DS1b（MQ-W25）：Hub 追加 + 开可写 Index 进工作线程
+            hub.append_admin_event(
+                AdminEventType.SCOPE_PROMOTE, body.target_key,
+                target_type=body.target_type, new_scope=body.new_scope,
+            )
 
-        def _apply(p2w: MemoryIndex) -> bool:
-            if body.target_type == "matter":
-                m = p2w.get_matter(body.target_key)
-                if m is None:
+            def _apply(p2w: MemoryIndex) -> bool:
+                if body.target_type == "matter":
+                    m = p2w.get_matter(body.target_key)
+                    if m is None:
+                        return False
+                    m.scope = body.new_scope
+                    p2w.update_matter(m)
+                    return True
+                f = p2w.get_fact(body.target_key)
+                if f is None:
                     return False
-                m.scope = body.new_scope
-                p2w.update_matter(m)
+                f.scope = body.new_scope
+                p2w.add_fact(f)  # re-store metadata
                 return True
-            f = p2w.get_fact(body.target_key)
-            if f is None:
-                return False
-            f.scope = body.new_scope
-            p2w.add_fact(f)  # re-store metadata
-            return True
 
-        applied, success = _apply_to_index(cfg, _apply)
-        success = success or False
-        logger.info("admin_scope_promoted", target_type=body.target_type,
-                     target_key=body.target_key, new_scope=body.new_scope, index_applied=applied)
-        return _admin_response(
-            200 if applied else 202,
-            "promoted" if applied else "deferred",
-            target_type=body.target_type, target_key=body.target_key,
-            new_scope=body.new_scope, success=success,
-        )
+            applied, success = _apply_to_index(cfg, _apply)
+            success = success or False
+            logger.info("admin_scope_promoted", target_type=body.target_type,
+                         target_key=body.target_key, new_scope=body.new_scope, index_applied=applied)
+            return _admin_response(
+                200 if applied else 202,
+                "promoted" if applied else "deferred",
+                target_type=body.target_type, target_key=body.target_key,
+                new_scope=body.new_scope, success=success,
+            )
+
+        return await run_blocking(_write)
 
     @app.post("/admin/queue/flush")
     async def flush_queue(
@@ -1424,6 +1743,8 @@ def register_admin_routes(app: FastAPI) -> None:
         max_batches: int = 200,
         sample: int = 0,
         cfg: ProxyConfig = _admin_key_dep,
+        _strict: None = Depends(_strict_query("apply", "max_batches", "sample")),
+        _body_keys: None = Depends(_strict_body()),
     ) -> JSONResponse:
         """强制排空 Pipeline 队列（2026-08-06 事故驱动，供 `bladex queue flush`）。
 
@@ -1458,6 +1779,8 @@ def register_admin_routes(app: FastAPI) -> None:
         request: Request,
         agent_id: str = "",
         cfg: ProxyConfig = _admin_key_dep,
+        _strict: None = Depends(_strict_query("agent_id")),
+        _body_keys: None = Depends(_strict_body()),
     ) -> JSONResponse:
         """强制释放会话粘性（G14/MQ-RT1，供 `bladex sticky flush`）。
 
@@ -1469,6 +1792,9 @@ def register_admin_routes(app: FastAPI) -> None:
 
         自动释放（cache 冷 / 超 max_hold）覆盖不到的场景才需要它：比如刚修好上游、
         不想等 TTL；或 `failover_max_hold_s=0` 显式关了自动释放。
+
+        🔴 批 DS1a（MQ-R15）：挂 `_strict_query`。修前 `agent_id` 拼错（如 `?agent=hermes`）
+        会被静默丢掉 ⇒ 退化成**全局**释放并回 200。
         """
         router = request.app.state.router
         if router is None:
@@ -1610,10 +1936,15 @@ def register_admin_routes(app: FastAPI) -> None:
                                  if lg.superseded_by == ledger_id),
         })
 
+    # 交接包与用户建本 / 改本（批 CB）。放在单独模块：本文件已到行数上限（F0.5 守卫）。
+    from bladex_proxy.server.admin_ledger_user import register_ledger_user_routes
+    register_ledger_user_routes(app)
+
     @app.post("/admin/ledgers/bind-legacy-matters")
     async def admin_ledger_bind_legacy_matters(
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body("dry_run")),
     ) -> JSONResponse:
         """旧账本 `matter_id` 反向指针回填（`task-ledger-switch-candidates-20260904.md` §2）。
 
@@ -1704,6 +2035,7 @@ def register_admin_routes(app: FastAPI) -> None:
         ledger_id: str,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body(LedgerLifecycleBody)),
     ) -> JSONResponse:
         """关本：`status=closed`；它是某些 scope 的激活账本 ⇒ 这些 scope 的激活随之解除
         （之后的轮次不锚到它）。已关 ⇒ 200 `noop`、不落事件。Goal 一字不动。"""
@@ -1715,6 +2047,7 @@ def register_admin_routes(app: FastAPI) -> None:
         ledger_id: str,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body(LedgerLifecycleBody)),
     ) -> JSONResponse:
         """取代：关本 + 记下 `superseded_by`（`bladex ledger show` 沿链读）。"""
         return await _close_or_supersede(request, ledger_id, body, supersede=True)
@@ -1725,6 +2058,7 @@ def register_admin_routes(app: FastAPI) -> None:
         ledger_id: str,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
+        _body_keys: None = Depends(_strict_body(LedgerLifecycleBody)),
     ) -> JSONResponse:
         """重开：只恢复状态（清取代指针），**不激活**——激活只有 switch 一条路。"""
         agency, err = _lifecycle_guard(request, ledger_id, body)
@@ -1742,6 +2076,7 @@ def register_admin_routes(app: FastAPI) -> None:
         with_memory: bool = False,
         dry_run: bool = False,
         _strict: None = Depends(_strict_query("with_memory", "dry_run")),
+        _body_keys: None = Depends(_strict_body()),
     ) -> JSONResponse:
         """给账本打墓碑（`task-ledger-tombstone-cleanup-20260901.md`）。
 
@@ -1795,13 +2130,17 @@ def register_admin_routes(app: FastAPI) -> None:
 
         index: MemoryIndex | None = getattr(request.app.state, "index", None)
         title = getattr(agency.pool.get(ledger_id), "title", "")
-        backup_age = _newest_backup_age_days(hub)
+        backup_age = await run_blocking(_newest_backup_age_days, hub)
 
         if dry_run:
             # 只算不写。窗口此时**尚无**账本墓碑，末端按 `now` 截止；真跑时末端 =
             # 墓碑时刻（≈ now），故两者读数相等——判据 ③ 就是钉这一点。
-            window = ledger_window_turn_keys(hub, ledger_id)
-            retained = count_window_facts(index, window["turn_keys"])
+            # 批 DS1b（MQ-W25）：窗口 = `scan_meta_snapshot` 全扫（live ≈4 s）⇒ 进工作线程。
+            def _preview() -> tuple[dict[str, Any], int | None]:
+                w = ledger_window_turn_keys(hub, ledger_id)
+                return w, count_window_facts(index, w["turn_keys"])
+
+            window, retained = await run_blocking(_preview)
             n_txt = "NO-DATA (Memory Index unavailable)" if retained is None else str(retained)
             logger.info("admin_ledger_tombstone_dry_run", ledger_id=ledger_id, title=title,
                         with_memory=with_memory, window_turns=len(window["turn_keys"]),
@@ -1816,6 +2155,9 @@ def register_admin_routes(app: FastAPI) -> None:
                          f"(derived facts affected: {n_txt})" if with_memory
                          else f"; {n_txt} derived facts would be kept")))
 
+        # 🔴 账本墓碑这一次写（单条 put，亚毫秒）**刻意留在事件循环上**：它与下面摘池 / 解激活
+        # 必须中间不让出——让出一次 await，热路径就可能在"Hub 已墓碑、池里还在"的窗口里
+        # 往这本账本写 `ledger_update`。全扫（窗口 / 级联墓碑 / 计数）在后面，进工作线程。
         tombstone_key = hub.append_tombstone(
             target_type=TombstoneTargetType.LEDGER,
             target_key=ledger_id,
@@ -1824,19 +2166,27 @@ def register_admin_routes(app: FastAPI) -> None:
         # 立刻从活着的池与激活表里摘掉，不必等重启（投影即时收敛）。
         agency.pool.pop(ledger_id, None)
         freed = agency.activation.forget_ledger(ledger_id)
-        # 窗口在账本墓碑**之后**算：墓碑时刻已合成"切到空"，窗口在这里自然闭合。
-        window = ledger_window_turn_keys(hub, ledger_id)
-        extra: dict[str, Any] = {"window_turns": len(window["turn_keys"]),
-                                 "window_scopes": window["scopes"]}
-        if with_memory:
-            extra["memory"] = tombstone_ledger_memory(hub, index, window["turn_keys"])
-            extra["derived_facts_retained"] = 0
-        else:
-            retained = count_window_facts(index, window["turn_keys"])
-            extra["derived_facts_retained"] = retained
-            n_txt = "N=NO-DATA (Memory Index unavailable)" if retained is None else str(retained)
-            extra["hint"] = (f"derived memory kept: {n_txt} facts from {len(window['turn_keys'])} "
-                             f"turns; re-run with --with-memory to tombstone them too")
+
+        def _window_and_memory() -> dict[str, Any]:
+            # 批 DS1b（MQ-W25）：`scan_meta_snapshot` 全扫 + 逐轮墓碑 + Index 计数进工作线程。
+            # 窗口在账本墓碑**之后**算：墓碑时刻已合成"切到空"，窗口在这里自然闭合。
+            window = ledger_window_turn_keys(hub, ledger_id)
+            extra: dict[str, Any] = {"window_turns": len(window["turn_keys"]),
+                                     "window_scopes": window["scopes"]}
+            if with_memory:
+                extra["memory"] = tombstone_ledger_memory(hub, index, window["turn_keys"])
+                extra["derived_facts_retained"] = 0
+            else:
+                retained = count_window_facts(index, window["turn_keys"])
+                extra["derived_facts_retained"] = retained
+                n_txt = ("N=NO-DATA (Memory Index unavailable)" if retained is None
+                         else str(retained))
+                extra["hint"] = (f"derived memory kept: {n_txt} facts from "
+                                 f"{len(window['turn_keys'])} turns; re-run with "
+                                 f"--with-memory to tombstone them too")
+            return extra
+
+        extra = await run_blocking(_window_and_memory)
         logger.info("admin_ledger_tombstoned", ledger_id=ledger_id, title=title,
                     tombstone_key=tombstone_key, freed_scopes=freed,
                     with_memory=with_memory, backup_age_days=backup_age,
@@ -1852,6 +2202,7 @@ def register_admin_routes(app: FastAPI) -> None:
         cfg: ProxyConfig = _admin_key_dep,
         dry_run: bool = False,
         _strict: None = Depends(_strict_query("dry_run")),
+        _body_keys: None = Depends(_strict_body()),
     ) -> JSONResponse:
         """只清**派生记忆**那一半：对该账本激活窗口内的源轮次打 TURN 墓碑（批 T0b 路径①，MQ-I23）。
 
@@ -1888,8 +2239,12 @@ def register_admin_routes(app: FastAPI) -> None:
         )
 
         index: MemoryIndex | None = getattr(request.app.state, "index", None)
-        backup_age = _newest_backup_age_days(hub)
-        window = ledger_window_turn_keys(hub, ledger_id)
+
+        def _read_window() -> tuple[float | None, dict[str, Any]]:
+            # 批 DS1b（MQ-W25）：`scan_meta_snapshot` 全扫进工作线程
+            return _newest_backup_age_days(hub), ledger_window_turn_keys(hub, ledger_id)
+
+        backup_age, window = await run_blocking(_read_window)
         if not window["known"]:
             return JSONResponse(status_code=404, content={
                 "status": "not_found",
@@ -1899,7 +2254,7 @@ def register_admin_routes(app: FastAPI) -> None:
         in_pool = agency is not None and ledger_id in agency.pool
         n_turns = len(window["turn_keys"])
         if dry_run:
-            retained = count_window_facts(index, window["turn_keys"])
+            retained = await run_blocking(count_window_facts, index, window["turn_keys"])
             n_txt = "NO-DATA (Memory Index unavailable)" if retained is None else str(retained)
             logger.info("admin_ledger_memory_tombstone_dry_run", ledger_id=ledger_id,
                         title=window["title"], window_turns=n_turns,
@@ -1913,7 +2268,7 @@ def register_admin_routes(app: FastAPI) -> None:
                       f"(derived facts affected: {n_txt}). The ledger object itself is NOT "
                       f"touched by this endpoint."))
 
-        memory = tombstone_ledger_memory(hub, index, window["turn_keys"])
+        memory = await run_blocking(tombstone_ledger_memory, hub, index, window["turn_keys"])
         logger.info("admin_ledger_memory_tombstoned", ledger_id=ledger_id,
                     title=window["title"], window_turns=n_turns,
                     window_scopes=window["scopes"], ledger_in_pool=in_pool,
@@ -1925,10 +2280,11 @@ def register_admin_routes(app: FastAPI) -> None:
 
     @app.post("/admin/turns/tombstone-by-project")
     async def tombstone_turns_by_project(
-        body: dict[str, Any],
+        body: TombstoneByProjectBody,
         request: Request,
         cfg: ProxyConfig = _admin_key_dep,
         _strict: None = Depends(_strict_query()),
+        _body_keys: None = Depends(_strict_body(TombstoneByProjectBody)),
     ) -> JSONResponse:
         """按 **project 作用域**给轮次打墓碑（批 T0b 路径②，拍板 (3) 的"整体清"那条线）。
 
@@ -1970,18 +2326,18 @@ def register_admin_routes(app: FastAPI) -> None:
         from bladex_proxy.ledger_memory import tombstone_ledger_memory
         from bladex_proxy.project_purge import EmptyProjectRefused, project_scope_preview
 
-        raw = (body or {}).get("project_ids") or []
+        raw = body.project_ids or []
         if not isinstance(raw, list):
             raise HTTPException(status_code=400, detail="project_ids must be a list of strings")
-        dry_run = bool((body or {}).get("dry_run", True))
+        dry_run = bool(body.dry_run)
         try:
-            preview = await asyncio.to_thread(project_scope_preview, hub, [str(x) for x in raw])
+            preview = await run_blocking(project_scope_preview, hub, [str(x) for x in raw])
         except EmptyProjectRefused as e:
             logger.warning("admin_project_tombstone_refused", reason=str(e), count=len(raw))
             raise HTTPException(status_code=400, detail=str(e)) from e
 
         index: MemoryIndex | None = getattr(request.app.state, "index", None)
-        backup_age = _newest_backup_age_days(hub)
+        backup_age = await run_blocking(_newest_backup_age_days, hub)
         rows: list[dict[str, Any]] = []
         total = 0
         for pid, row in preview.items():
@@ -2031,7 +2387,9 @@ def register_admin_routes(app: FastAPI) -> None:
 
         jobs = _admin_jobs(request.app)
         jobs[job_id] = job
-        job["_task"] = asyncio.get_running_loop().create_task(asyncio.to_thread(_run))
+        # 批 DS1a：后台 job 也走同一出口——lifespan 关 Hub 前 `drain_blocking()` 会等它写完，
+        # 不再在已关闭的 RocksDB 上写墓碑
+        job["_task"] = asyncio.get_running_loop().create_task(run_blocking(_run))
         logger.info("admin_project_tombstone_submitted", job_id=job_id, projects=len(rows),
                     total_turns=total, project_ids=[r["project_id"] for r in rows])
         return _admin_response(

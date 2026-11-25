@@ -39,6 +39,7 @@ from bladex_proxy.server.orchestration import (
     _extract_tool_events_from_response,
     _loop_reply,
     _message_as_dict,
+    _note_nonstream_cache_reading,
     _prepare_round,
 )
 
@@ -193,10 +194,16 @@ def register_embeddings_routes(app: FastAPI) -> None:
             for i in range(len(inputs))
         ]
         model_name = getattr(embedder, "model_name", "bladex-embed")
+        identity = getattr(embedder, "model_identity", f"local:{model_name}")
+        # MQ-I46：算这批向量的 embedder 指纹，供 ProxyEmbedAdapter 分 `embedcache/` 桶。
+        # 没有这个属性的后端（api）版本在供应商那边，能知道的只有模型身份，就回报身份。
+        # 放在 embed 之后：IPC 档的指纹由这次往返带回，不会另起一次握手。
+        fingerprint = getattr(embedder, "vector_fingerprint", identity)
         return JSONResponse(content={
             "object": "list", "data": data, "model": model_name,
             # 方案 D：向量空间身份透传（ProxyEmbedAdapter 用它对齐 Memory Index model_id 不变量）
-            "bladex_model_identity": getattr(embedder, "model_identity", f"local:{model_name}"),
+            "bladex_model_identity": identity,
+            "bladex_vector_fingerprint": fingerprint if isinstance(fingerprint, str) else "",
             "usage": {"prompt_tokens": 0, "total_tokens": 0},
         })
 
@@ -330,6 +337,7 @@ async def _handle_non_stream(
             status_code=502,
             content={"error": {"message": f"Upstream error: {router_sdk.error_text(e)}", "type": "upstream_error"}},
         )
+    _note_nonstream_cache_reading(identity, response)
 
     try:
         message = response.choices[0].message

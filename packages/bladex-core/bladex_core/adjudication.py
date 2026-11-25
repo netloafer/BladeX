@@ -140,8 +140,21 @@ class AdjudicatorProtocol(Protocol):
         ...
 
     def adjudicate(self, items: list[AdjudicationInput]) -> list[AdjudicationVerdict]:
-        """批量裁决。失败/超时/解析失败 → 全部降级 ADD（宁多勿丢），不抛。"""
+        """批量裁决。本块输入的问题（解析失败 / 4xx）→ 降级 ADD（宁多勿丢），不抛。
+
+        唯一例外：上游**持续不可达**超过等待上限 → 抛 `AdjudicationUpstreamUnavailable`
+        （批 AA · MQ-I35）。网络错误不是判决，不许落成 ADD。
+        """
         ...
+
+
+class AdjudicationUpstreamUnavailable(RuntimeError):
+    """裁决上游持续不可达、退避等待超过上限（批 AA · MQ-I35）。
+
+    🔴 这不是"判不出"，是"没人可问"：调用方必须**中止本轮**（不写、不消费），
+    绝不能像解析失败那样兜成一整块 ADD——2026-09-26/27 两次夜间断网各把
+    2,650 / 3,876 条候选（30% / 43%）判成 blanket ADD，就是把它当成了判决。
+    """
 
 
 # ── 快路径：精确取代键命中，不必调 LLM ────────────────────────────────────

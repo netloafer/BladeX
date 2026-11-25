@@ -18,12 +18,14 @@ from __future__ import annotations
 import hashlib
 import re
 import time
+from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
 from bladex_core.envelope import ENVELOPE_MAX_OFFSET
-from bladex_core.flags import flag_enabled
+from bladex_core.flags import flag_enabled, flag_number
 
 from bladex_proxy.agent_bucket import (
     BARE_SESSION_HEADERS,
@@ -38,6 +40,7 @@ from bladex_proxy.agent_rules import load_agent_rules
 from bladex_proxy.innerloop import INNER_LOOP_AUX_SOURCE as _INNER_LOOP_AUX_SOURCE
 from bladex_proxy.innerloop import INNER_LOOP_MARKER as _INNER_LOOP_MARKER
 from bladex_proxy.models import AgentSource, ChatCompletionRequest, Identity, SessionIdSource
+from bladex_proxy.toolface import is_bladex_tool
 
 # Agent 自带的 profile 标记（从 system prompt 中提取，无需用户配置）
 # Hermes 在 system prompt 中写 "Active Hermes profile: accept/default/..."
@@ -773,7 +776,8 @@ def _fingerprint_agent(
                     return _resolve_profile(rule, system_text), f"system_prompt:{kw}", rule.auxiliary
 
     # ── 2. tool 签名匹配 ──
-    tool_names = _extract_tool_names(messages, tools)
+    # MQ-A110：BladeX 自己注入的 bladex_* 不参与签名匹配（它标识 BladeX，不标识 agent）
+    tool_names = {t for t in _extract_tool_names(messages, tools) if not is_bladex_tool(t)}
     if tool_names:
         for rule in _rules():
             if not rule.tool_signatures:
@@ -1032,18 +1036,41 @@ class _SessionEntry:
     session_id: str
     # 前 N 条非 system 消息的 (role, content_hash) 列表
     prefix_fingerprint: list[tuple[str, str]]
-    # 该会话上次见到时的非 system 消息总数
-    msg_count: int
+
+
+@dataclass
+class _SessionState:
+    """一个活会话的延续状态（批 BA1；与 `_SessionEntry` 一对多：会话压缩后前缀变了会多一条条目）。
+
+    「活」= 还有 `_SessionEntry` 指向它；最后一条条目被挤出时本状态一并删除。
+    """
+
+    is_sub: bool = False
+    # BladeX 在本会话上最近 `BLADEX_SESSION_OUTPUT_RING` 份产出：
+    # (非 bladex_* 的 tool_call id 集合, 规范化后的回复文本, 是否压缩引擎轮)
+    outputs: deque[tuple[frozenset[str], str, bool]] = field(default_factory=deque)
+    n_outputs: int = 0
+    # 由首轮形态请求建立时 = 该请求的整表签名（判重试）；否则为空
+    first_sig: str = ""
+    last_seen: float = 0.0
 
 
 @dataclass
 class SessionCache:
-    """进程内会话缓存：记录最近见过的会话前缀，供尾部接续判断。
+    """进程内会话缓存：会话前缀（尾部接续）+ 延续状态（凭证 ②、首轮另立、别名）。
 
-    不持久化——proxy 进程重启后重建。对单用户本地场景足够。
+    不另开存储：进程重启后由 `rebuild_session_state` 从 Memory Hub 最近一个纪元窗重放
+    （批 BA1 · D6 甲）；重放完成前 `cold` 为真，凭证 ③ 不生效。
     """
 
     _entries: dict[str, list[_SessionEntry]] = field(default_factory=dict)
+    _states: dict[str, dict[str, _SessionState]] = field(default_factory=dict)
+    # (user/agent) -> {前缀指纹基名（不含纪元后缀）: 经凭证 ② 并入的会话}
+    _aliases: dict[str, dict[str, str]] = field(default_factory=dict)
+    # 状态未热（D6）：进程刚起、Hub 重放未完成。`cold_until` 是兜底——重放失败时
+    # 跑满一个纪元窗后，窗内活着的会话都已在本进程见过，状态与重放所得同样完整。
+    cold: bool = False
+    cold_until: float = 0.0
 
     def _key(self, user_id: str, agent_id: str) -> str:
         return f"{user_id}/{agent_id}"
@@ -1053,12 +1080,16 @@ class SessionCache:
         user_id: str,
         agent_id: str,
         non_sys_msgs: list[dict],
+        is_sub: bool = False,
+        commit: bool = True,
     ) -> str | None:
-        """查找尾部接续匹配：新消息的前缀是否与某已知会话一致。
+        """凭证 ①（尾部超集）：新请求的前缀是否接着某已知会话。
 
-        判断逻辑：取新请求前 _PREFIX_MATCH_COUNT 条非 system 消息的
-        (role, content_hash)，与缓存中会话的前缀比对。
-        若完全一致，且新请求消息数 >= 缓存中的消息数（尾部超集），判为同会话。
+        取新请求前 _PREFIX_MATCH_COUNT 条非 system 消息的 (role, content_hash)，
+        与条目的前缀**互为前缀**即判同会话：相等 / 条目是请求的前缀（链在请求前，
+        正常接续轮）/ 请求是条目的前缀（请求比链短——压缩后首轮的消息数必然少于
+        被压缩前的链条目，「条数不减」对它结构性不可达，BA1b 步骤 2 放宽）。
+        子代理请求只接子会话、母会话请求只接母会话（§2.3）。`commit=False` 只查不改。
         """
         k = self._key(user_id, agent_id)
         entries = self._entries.get(k, [])
@@ -1066,14 +1097,17 @@ class SessionCache:
             return None
 
         new_prefix = _fingerprint_msgs(non_sys_msgs[:_PREFIX_MATCH_COUNT])
+        states = self._states.get(k, {})
 
         for entry in reversed(entries):  # 最近匹配优先
-            if (
-                entry.prefix_fingerprint == new_prefix
-                and len(non_sys_msgs) >= entry.msg_count
-            ):
-                # 尾部接续：前缀一致且消息数只增不减
-                entry.msg_count = len(non_sys_msgs)
+            st = states.get(entry.session_id)
+            if st is not None and st.is_sub != is_sub:
+                continue
+            m = min(len(entry.prefix_fingerprint), len(new_prefix))
+            if entry.prefix_fingerprint[:m] == new_prefix[:m]:
+                if commit:
+                    if st is not None:
+                        st.last_seen = time.time()
                 return entry.session_id
 
         return None
@@ -1084,22 +1118,119 @@ class SessionCache:
         agent_id: str,
         session_id: str,
         non_sys_msgs: list[dict],
+        is_sub: bool = False,
+        first_sig: str = "",
     ) -> None:
-        """记住一个新会话的前缀指纹。"""
+        """记住一个会话的前缀指纹（会话已活着时只加条目、续 last_seen）。"""
         k = self._key(user_id, agent_id)
         entries = self._entries.setdefault(k, [])
         prefix = _fingerprint_msgs(non_sys_msgs[:_PREFIX_MATCH_COUNT])
         entries.append(_SessionEntry(
             session_id=session_id,
             prefix_fingerprint=prefix,
-            msg_count=len(non_sys_msgs),
         ))
+        states = self._states.setdefault(k, {})
+        st = states.get(session_id)
+        if st is None:
+            states[session_id] = _SessionState(is_sub=is_sub, first_sig=first_sig,
+                                               last_seen=time.time())
+        else:
+            st.last_seen = time.time()
         # 防止无限增长
         if len(entries) > _MAX_CACHED_SESSIONS_PER_KEY:
-            entries.pop(0)
+            dropped = entries.pop(0)
+            if all(e.session_id != dropped.session_id for e in entries):
+                states.pop(dropped.session_id, None)
+
+    def state(self, user_id: str, agent_id: str, session_id: str) -> _SessionState | None:
+        return self._states.get(self._key(user_id, agent_id), {}).get(session_id)
+
+    def is_live(self, user_id: str, agent_id: str, session_id: str) -> bool:
+        return self.state(user_id, agent_id, session_id) is not None
+
+    def is_cold(self) -> bool:
+        if self.cold and time.time() >= self.cold_until:
+            self.cold = False
+            logger.warning("session_state_warm_by_window",
+                           hint="Hub 重放未完成，按纪元窗跑满转热")
+        return self.cold
+
+    def note_output(self, user_id: str, agent_id: str, session_id: str,
+                    text: str, tool_call_ids: frozenset[str], compaction: bool,
+                    now: float | None = None) -> None:
+        """登记 BladeX 在本会话上的一份产出（回复结束后，`note_session_output`）。"""
+        st = self.state(user_id, agent_id, session_id)
+        if st is None:
+            return
+        ring = max(1, int(flag_number("BLADEX_SESSION_OUTPUT_RING")))
+        st.outputs.append((tool_call_ids, text, compaction))
+        while len(st.outputs) > ring:
+            st.outputs.popleft()
+        st.n_outputs += 1
+        st.last_seen = time.time() if now is None else now
+
+    def carriers(self, user_id: str, agent_id: str, non_sys_msgs: list[dict],
+                 sub_only: bool = False) -> list[tuple[str, int, str]]:
+        """凭证 ②（产出携带）：请求逐字带着哪些活会话的产出。返回 [(会话, 产出龄, 凭证类型)]。
+
+        普通回复只认请求的 assistant 消息（tool_call id，或 ≥ `BLADEX_SESSION_OUTPUT_MIN_CHARS`
+        字的文本）——子任务回传会把子会话的回复转进母会话的 user / tool 消息；压缩引擎轮的产出
+        认任意消息（这就是信号 ①：摘要以 user 消息落地）。会话须在纪元窗内活跃过（N5：
+        9 天前的谱系不是延续）。
+        """
+        states = self._states.get(self._key(user_id, agent_id), {})
+        if not states:
+            return []
+        window = _FpEpochWindow._window_s()
+        now = time.time()
+        live = [(sid, st) for sid, st in states.items()
+                if st.outputs and (not sub_only or st.is_sub)
+                and (window <= 0 or now - st.last_seen <= window)]
+        if not live:
+            return []
+        min_chars = int(flag_number("BLADEX_SESSION_OUTPUT_MIN_CHARS"))
+        all_texts: list[str] = []
+        asst_texts: list[str] = []
+        ids: set[str] = set()
+        for m in non_sys_msgs:
+            t = _norm_output(_msg_text(m))
+            all_texts.append(t)
+            if m.get("role") == "assistant":
+                asst_texts.append(t)
+                for tc in m.get("tool_calls") or []:
+                    if isinstance(tc, dict) and tc.get("id"):
+                        ids.add(tc["id"])
+        all_joined = "\x00".join(all_texts)
+        asst_joined = "\x00".join(asst_texts)
+        found: list[tuple[str, int, str]] = []
+        for sid, st in live:
+            for age, (out_ids, text, compaction) in enumerate(reversed(st.outputs)):
+                if out_ids and out_ids & ids:
+                    found.append((sid, age, "tool_call_id"))
+                    break
+                if len(text) >= min_chars and text in (all_joined if compaction else asst_joined):
+                    found.append((sid, age, "compaction" if compaction else "text"))
+                    break
+        return found
+
+    def alias_of(self, user_id: str, agent_id: str, fp_session: str) -> str:
+        """前缀指纹 → 经凭证 ② 并入的会话（目标仍活着才算），否则原样返回。"""
+        target = self._aliases.get(self._key(user_id, agent_id), {}).get(
+            _FpEpochWindow._base(fp_session))
+        if target and target != fp_session and self.is_live(user_id, agent_id, target):
+            return target
+        return fp_session
+
+    def set_alias(self, user_id: str, agent_id: str, fp_session: str, target: str) -> None:
+        aliases = self._aliases.setdefault(self._key(user_id, agent_id), {})
+        aliases[_FpEpochWindow._base(fp_session)] = target
+        if len(aliases) > 4 * _MAX_CACHED_SESSIONS_PER_KEY:
+            aliases.pop(next(iter(aliases)))
 
     def clear(self) -> None:
         self._entries.clear()
+        self._states.clear()
+        self._aliases.clear()
 
 
 # 进程级单例（proxy 生命周期内复用）
@@ -1413,31 +1544,21 @@ def resolve_identity(
             session_id_header = ""
 
     # T4(ADR-0018 §4.2 R7): 记录 session_id 来源，tw: 会话跳过 prefix_changed/CAP 冲突检测
-    session_id_source = SessionIdSource.TIME_WINDOW
+    # 批 BA1：子代理标记先于会话判定（§2.3）。CC 的子代理 id 只进会话 id，不进 agent_id。
+    cc_child = _cc_subagent_id(agent_id, headers)
     if explicit_session:
         session_id = explicit_session
         session_id_source = SessionIdSource.EXPLICIT
-        _session_cache.remember(user_id, agent_id, session_id, non_sys_msgs)
+        if cc_child:
+            session_id = f"{explicit_session}.sub-{cc_child}"
+            _log_continuation(user_id, agent_id, session_id, "explicit_subagent",
+                              evidence="x-claude-code-agent-id")
+        sub_session = bool(cc_child)
+        _session_cache.remember(user_id, agent_id, session_id, non_sys_msgs,
+                                is_sub=sub_session)
     else:
-        # 先试尾部接续（最皮实）
-        matched = _session_cache.find_match(user_id, agent_id, non_sys_msgs)
-        if matched:
-            session_id = matched
-            session_id_source = SessionIdSource.TAIL_CONTINUATION
-            # MQ-S9：接续轮续命时间窗（长会话全程走接续，不续命会被误判超窗）
-            _fp_epochs.touch(user_id, agent_id, session_id)
-            logger.info("session_tail_match", user_id=user_id, agent_id=agent_id,
-                       session_id=session_id)
-        else:
-            # 退到前缀指纹（跳过 system 消息）
-            session_id = _infer_session_from_prefix(non_sys_msgs, user_id, agent_id)
-            if session_id.startswith("fp:"):
-                # MQ-S9 / G12.2-pre：同指纹超窗 → 纪元后缀，终结跨天撞桶
-                session_id = _fp_epochs.apply(user_id, agent_id, session_id)
-                session_id_source = SessionIdSource.FINGERPRINT
-                _session_cache.remember(user_id, agent_id, session_id, non_sys_msgs)
-            else:
-                session_id_source = SessionIdSource.TIME_WINDOW
+        session_id, session_id_source, sub_session = _resolve_inferred_session(
+            user_id, agent_id, request.messages, non_sys_msgs)
 
     # ── turn_index（元数据，不再当 Memory Hub 主键）──
     # E0.2（MQ-L48）：单位 = 用户轮，单一实现点在 bladex_core.ledger_runtime。
@@ -1471,6 +1592,9 @@ def resolve_identity(
         auxiliary=is_auxiliary,
         aux_source=aux_source,
         session_id_source=session_id_source,
+        # 批 BA1：子会话（CC / dsh / hermes 自报标记）**只拆会话 id，不置本位**——本位是
+        # 工具面门（`_apply_agency_surfaces` 的 aux_reason=subagent 连记忆族一起挡），
+        # 改它是激活位 / 工具面的事（批 BA2），不是会话身份。
         subagent=is_subagent,
         visibility=list(resolved.visibility) if resolved is not None else [],
         principal_sensitivity=resolved.principal_sensitivity if resolved is not None else "",
@@ -1575,6 +1699,405 @@ def _hash_short(value: str) -> str:
 #
 # 而且它当时已经是**死代码**：排在会话粘性之后，而粘性在 user_id 变成常量后恒命中。
 # UA 的正确位置是 `agent_bucket.bucket_unknown_agent()` 里的分桶信号（不命名）。
+
+
+# ── 批 BA1：会话延续凭证（MQ-A80 / MQ-S9 / MQ-A72 / MQ-A73 / MQ-A98）──────────────────
+#
+# 规则（结算稿 `report-batch-BA1-20261029.md` §2.1，拍板 (30)）：**一个请求可以判成活会话 S
+# 的延续，当且仅当它携带 S 的延续凭证；前缀相同本身不是凭证。** 判定顺序：
+#   子代理标记 → 首轮形态（无 assistant 消息且不携带任何会话产出）⇒ 确定性另立
+#   → ① 尾部超集 → ② 产出携带 → ③ 前缀指纹相同且非首轮形态（状态未热时不认）。
+# 病例：N1 —— dsh 0.2.1 同目录每个新会话的前 2 条（开场白 + 运行时上下文）逐字相同，
+# 前缀指纹必撞，B 首轮被 ③ 的前身直接判进 A（52 轮共用一个会话）。
+
+#: 压缩引擎轮的 aux 规则名（既有 `_AUX_USER_PATTERNS` / 系统指纹表里的名字，不另立判据）。
+#: 它们的产出以任意角色落地（dsh 的摘要以 user 消息出现在落地请求里）。
+_COMPACTION_ENGINE_AUX: frozenset[str] = frozenset({
+    "dsh_compaction_engine", "summarization_checkpoint", "codex_context_checkpoint",
+})
+
+#: 子代理自报标记（BA0 取证 §5.1；只认解析出的那个 agent 自己的标记）。
+#: dsh：运行时上下文消息里的自报（工具结果转引的不算 ⇒ 限 role=user 且以运行时上下文开头）；
+#: hermes：委派子任务的 system。CC 走 header（`_cc_subagent_id`），codex 已由
+#: `x-openai-subagent` 记成 agent 侧面（`resolve_subagent`），本批不动。
+_DSH_RUNTIME_CONTEXT_HEAD = "Current runtime context."
+_DSH_SUBAGENT_MARK = "You are a delegated subagent"
+_HERMES_SUBAGENT_MARK = "You are a focused subagent working on a specific delegated task."
+
+_BLANK_RUN_RE = re.compile(r"\n{3,}")
+
+
+def _norm_output(text: str) -> str:
+    """产出与请求两边同一个规范化：连续空行折成一个空行、去首尾空白（§2.2）。
+
+    CC 回填历史时折叠连续空行；在 dsh / hermes 的逐字文本上它是恒等变换，不会多接。
+    """
+    return _BLANK_RUN_RE.sub("\n\n", text).strip()
+
+
+def _msg_text(msg: dict) -> str:
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(p.get("text", "") for p in content
+                       if isinstance(p, dict) and p.get("type") == "text")
+    return "" if content is None else str(content)
+
+
+def _msgs_digest(msgs: list[dict], n: int) -> str:
+    return hashlib.sha256(
+        "|".join(h for _r, h in _fingerprint_msgs(msgs)).encode()).hexdigest()[:n]
+
+
+def _cc_subagent_id(agent_id: str, headers: dict[str, str]) -> str:
+    """CC 子代理自报的 `x-claude-code-agent-id`（每个子代理一个随机 id）；不是 CC 子代理返回 ""。
+
+    🔴 只进会话 id（`<母会话>.sub-<id>`），**不进 agent_id**——每个子代理一个记忆命名空间
+    会炸出无数个（BA1 已拍边界）。
+    """
+    if agent_id.split(":")[0] != "claude-code":
+        return ""
+    raw = str(headers.get("x-claude-code-agent-id") or "").strip()
+    return re.sub(r"[^A-Za-z0-9_.-]", "-", raw)[:40] if raw else ""
+
+
+def _subagent_seed(agent_id: str, messages: list[dict], non_sys_msgs: list[dict]) -> int:
+    """dsh / hermes 子代理标记：返回子会话种子的末位（非 system 下标），不是子代理返回 -1。"""
+    base = agent_id.split(":")[0]
+    if base == "dsh":
+        for i, m in enumerate(non_sys_msgs):
+            if m.get("role") == "user":
+                t = _msg_text(m)
+                if t.startswith(_DSH_RUNTIME_CONTEXT_HEAD) and _DSH_SUBAGENT_MARK in t:
+                    return i
+        return -1
+    if base == "hermes" and _HERMES_SUBAGENT_MARK in _extract_system_text(messages):
+        return 0
+    return -1
+
+
+def is_subtask_request(identity: Any, headers: dict[str, str] | None, messages: list[dict]) -> bool:
+    """这个请求是不是子任务（批 BA2 复用，判定本身是 BA1 的三路标记，不新增信号）。"""
+    if getattr(identity, "subagent", False):
+        return True
+    agent_id = identity.agent_id
+    if _cc_subagent_id(agent_id, headers or {}):
+        return True
+    non_sys = [m for m in messages or [] if m.get("role") != "system"]
+    return _subagent_seed(agent_id, messages, non_sys) >= 0
+
+
+def _sub_session_seed_id(non_sys_msgs: list[dict], seed: int) -> str:
+    """子会话 id = 第 0 条到标记那条的逐条哈希（D2）。
+
+    种子里带着母会话的内容（spawn：回传指引里的母会话 id；fork：母会话前 k 条），
+    不同母会话派出相同 prompt 不会串号；同一子会话的首轮 / 后续轮种子不变。
+    """
+    seed_fp = _fingerprint_msgs(non_sys_msgs[:seed + 1])
+    return "fp:" + hashlib.sha256(
+        ("sub|" + "|".join(f"{r}:{h}" for r, h in seed_fp)).encode()).hexdigest()[:12]
+
+
+def _log_continuation(user_id: str, agent_id: str, session_id: str, rule: str, **evidence: Any) -> None:
+    """每个会话判定一条（批 BA1 live 复核用）：`rule` = 命中的规则名，其余是证据摘要。"""
+    logger.info("session_continuation", user_id=user_id, agent_id=agent_id,
+                session_id=session_id, rule=rule, **evidence)
+
+
+def _first_free_session(user_id: str, agent_id: str, base: str, non_sys_msgs: list[dict],
+                        sig: str) -> tuple[str, str]:
+    """确定性另立：base 不活着就用 base；活着就按 `base.x<前 4 条哈希>`、`….n2`… 找第一个空位。
+
+    `sig` 非空（首轮形态）时，某候选由同一份首轮请求建立、且还没有任何产出 ⇒ 是重试，回到它。
+    两个会话首请求逐字相同时，第一个已有产出 ⇒ 第二个落下一个候选（拍板 (30) 硬要求 1）。
+    返回 (会话, "mint" | "retry" | "split")。
+    """
+    cache = _session_cache
+    cand = base
+    for k in range(64):
+        st = cache.state(user_id, agent_id, cand)
+        if st is None:
+            return cand, ("mint" if k == 0 else "split")
+        if sig and st.first_sig == sig and st.n_outputs == 0:
+            return cand, "retry"
+        head = f"{base}.x{_msgs_digest(non_sys_msgs[:_PREFIX_MATCH_COUNT], 8)}"
+        cand = head if k == 0 else f"{head}.n{k + 1}"
+    logger.warning("session_split_exhausted", user_id=user_id, agent_id=agent_id, base=base)
+    return cand, "split"
+
+
+def _resolve_inferred_session(
+    user_id: str,
+    agent_id: str,
+    messages: list[dict],
+    non_sys_msgs: list[dict],
+) -> tuple[str, SessionIdSource, bool]:
+    """没有显式会话 header 时的会话判定（批 BA1 唯一实现点）。返回 (会话, 来源, 是否子会话)。"""
+    cache = _session_cache
+    seed = _subagent_seed(agent_id, messages, non_sys_msgs)
+    is_sub = seed >= 0
+
+    if len(non_sys_msgs) < 2 and not is_sub:
+        # 单条消息：没有可比的前缀，退到时间窗。id 带内容哈希——同一个 5 分钟桶里
+        # 不同的请求不再同桶（N4：压缩后窗口内的新会话首轮与 A 的摘要调用同桶）。
+        session_id = _infer_session_from_prefix(non_sys_msgs, user_id, agent_id)
+        if non_sys_msgs:
+            session_id += "." + _msgs_digest(non_sys_msgs, 8)
+        _log_continuation(user_id, agent_id, session_id, "tw")
+        return session_id, SessionIdSource.TIME_WINDOW, False
+
+    carried = cache.carriers(user_id, agent_id, non_sys_msgs, sub_only=is_sub)
+    carrier_ids = [c[0] for c in carried]
+    has_assistant = any(m.get("role") == "assistant" for m in non_sys_msgs)
+
+    def _fp() -> tuple[str, str]:
+        """(本请求的会话指纹, 别名解析后的指纹)。子代理请求的指纹是子会话种子 id。"""
+        if is_sub:
+            sub_id = _sub_session_seed_id(non_sys_msgs, seed)
+            return sub_id, sub_id
+        # MQ-S9 / G12.2-pre：同指纹超窗 → 纪元后缀；再按别名找到它被并入的会话
+        fp = _infer_session_from_prefix(non_sys_msgs, user_id, agent_id)
+        if fp.startswith("fp:"):
+            fp = _fp_epochs.apply(user_id, agent_id, fp)
+        return fp, cache.alias_of(user_id, agent_id, fp)
+
+    def _base(fp: str, fp_res: str) -> str:
+        return fp_res if cache.is_live(user_id, agent_id, fp_res) else fp
+
+    # ── 首轮形态 ⇒ 确定性另立（不经凭证 ① / ③）──
+    if not has_assistant and not carried:
+        fp, fp_res = _fp()
+        sig = _msgs_digest(non_sys_msgs, 16)
+        session_id, kind = _first_free_session(user_id, agent_id, _base(fp, fp_res),
+                                               non_sys_msgs, sig)
+        cache.remember(user_id, agent_id, session_id, non_sys_msgs, is_sub=is_sub, first_sig=sig)
+        _log_continuation(user_id, agent_id, session_id, f"first_turn_{kind}",
+                          fp=fp, sub=is_sub)
+        return session_id, SessionIdSource.FINGERPRINT, is_sub
+
+    # ── ① 尾部超集 ──
+    # 请求带着别的会话的产出时 ① 让位给 ②：首轮逐字相同的两个会话，条目前缀也逐字相同，
+    # 这时的「尾部超集」只是前缀相同，而带着谁的回复才说明是谁的延续（硬要求 1 用例）。
+    matched = cache.find_match(user_id, agent_id, non_sys_msgs, is_sub=is_sub, commit=False)
+    if matched and (not carried or matched in carrier_ids):
+        cache.find_match(user_id, agent_id, non_sys_msgs, is_sub=is_sub)
+        # MQ-S9：接续轮续命时间窗（长会话全程走接续，不续命会被误判超窗）
+        _fp_epochs.touch(user_id, agent_id, matched)
+        _log_continuation(user_id, agent_id, matched, "tail")
+        return matched, SessionIdSource.TAIL_CONTINUATION, is_sub
+
+    fp, fp_res = _fp()
+    st_res = cache.state(user_id, agent_id, fp_res)
+    fp_live = st_res is not None and st_res.is_sub == is_sub
+    # ③ 只在状态已热时认：进程刚重启时产出环是空的，③ 没有任何反证（拍板 (30) D6）
+    fp_ok = fp_live and has_assistant and not cache.is_cold()
+    rule = ""
+    if fp_live and fp_res in carrier_ids:
+        session_id, rule = fp_res, "output_carried"           # ② 且前缀指纹印证
+    elif not carried and fp_ok:
+        session_id, rule = fp_res, "fp"                        # ③
+    elif len(carried) == 1:
+        session_id, rule = carried[0][0], "output_carried"     # ②
+        _fp_epochs.touch(user_id, agent_id, session_id)
+        if fp.startswith("fp:"):
+            # 别名：之后尾部接续不中、退到前缀指纹时不会重新长出被并掉的旧 id
+            cache.set_alias(user_id, agent_id, fp, session_id)
+    elif carried and fp_ok:
+        session_id, rule = fp_res, "fp_over_ambiguous"         # ② 多指、③ 定
+    if rule:
+        cache.remember(user_id, agent_id, session_id, non_sys_msgs, is_sub=is_sub)
+        hit = next((c for c in carried if c[0] == session_id), None)
+        _log_continuation(user_id, agent_id, session_id, rule,
+                          evidence=hit[2] if hit else "fp", age=hit[1] if hit else -1,
+                          candidates=len(carried), alias=fp_res != fp)
+        return session_id, (SessionIdSource.TAIL_CONTINUATION if rule == "output_carried"
+                            else SessionIdSource.FINGERPRINT), is_sub
+
+    # ── 没有凭证 ⇒ 另立（宁漏接，不误接）──
+    session_id, kind = _first_free_session(user_id, agent_id, _base(fp, fp_res), non_sys_msgs, "")
+    cache.remember(user_id, agent_id, session_id, non_sys_msgs, is_sub=is_sub)
+    _log_continuation(user_id, agent_id, session_id, kind,
+                      candidates=len(carried), cold=cache.cold, sub=is_sub)
+    return session_id, SessionIdSource.FINGERPRINT, is_sub
+
+
+def note_session_output(identity: Identity, response_text: str, tool_events: Iterable[Any]) -> None:
+    """登记本轮 BladeX 返回给 agent 的产出（凭证 ② 的来源；`_enqueue_turn` 唯一调用点）。
+
+    只登记成功轮；`bladex_*` 工具调用被拦截协议剥离、agent 看不到，不登记。
+    """
+    from bladex_proxy.toolface import BLADEX_TOOL_PREFIX  # noqa: PLC0415 —— 循环导入
+    ids: set[str] = set()
+    for te in tool_events or []:
+        get = te.get if isinstance(te, dict) else (lambda k, _te=te: getattr(_te, k, ""))
+        if (get("direction") or "call") == "call" and get("tool_call_id") \
+                and not str(get("tool_name") or "").startswith(BLADEX_TOOL_PREFIX):
+            ids.add(str(get("tool_call_id")))
+    _session_cache.note_output(identity.user_id, identity.agent_id, identity.session_id,
+                               _norm_output(response_text or ""), frozenset(ids),
+                               identity.aux_source in _COMPACTION_ENGINE_AUX)
+
+
+def mark_session_state_cold() -> None:
+    """进程启动时调用：Hub 重放完成前凭证 ③ 不生效（拍板 (30) D6 甲）。"""
+    _session_cache.cold = True
+    _session_cache.cold_until = time.time() + max(0.0, _FpEpochWindow._window_s())
+
+
+@dataclass
+class SessionReplayRecord:
+    """Hub 里一轮的会话身份状态（重放用）。"""
+
+    ts: float
+    user_id: str
+    agent_id: str
+    session_id: str
+    messages: list[dict]
+    request_headers: dict[str, str]
+    response_text: str
+    tool_events: list[Any]
+    aux_source: str
+    ok: bool = True
+    # 批 BA2：`subtask_lineage.rebuild_lineage` 用（同一趟 Hub 读，不另扫）。
+    project_id: str = ""
+    project_name: str = ""
+    project_source: str = ""
+    project_root: str = ""
+    parent_ledger_id: str = ""
+    spawn_dispatches: list[dict] = field(default_factory=list)
+
+
+def rebuild_session_state(records: Iterable[SessionReplayRecord],
+                          fp_last_seen: Iterable[tuple[str, str, str, float]] = ()) -> int:
+    """按 ts 顺序把 Hub 最近一个纪元窗的轮次重放进会话状态，然后转热（D6 甲）。
+
+    不重跑判定——Hub 里存的会话 id 就是当时的判定结果（真相源），这里只恢复判定要用的
+    状态：尾部条目、产出环、纪元窗（`fp_last_seen` = 全库每个指纹基名最近一轮）。重放条目排在
+    本进程已有条目**之前**（更旧），重放期间新来的请求已经建立的状态不被覆盖。返回重放的轮数。
+    """
+    cache = _session_cache
+    for user_id, agent_id, session_id, ts in sorted(fp_last_seen, key=lambda x: x[3]):
+        key = (user_id, agent_id, _FpEpochWindow._base(session_id))
+        if key not in _fp_epochs._state:          # 本进程已见过的以本进程为准
+            _fp_epochs.touch(user_id, agent_id, session_id, now=ts)
+    live_entries = {k: list(v) for k, v in cache._entries.items()}
+    live_states = {k: dict(v) for k, v in cache._states.items()}
+    cache._entries.clear()
+    cache._states.clear()
+    n = 0
+    for r in sorted(records, key=lambda x: x.ts):
+        if r.session_id.startswith("tw:"):
+            # 实时路径从不登记时间窗会话（单条消息没有可比的前缀）；登记了它的单条前缀
+            # 会成为同会话后续每一轮的「尾部超集」（hermes 主会话首轮就落 tw:，D5）
+            continue
+        non_sys = _extract_non_system_msgs(r.messages)
+        is_sub = (_subagent_seed(r.agent_id, r.messages, non_sys) >= 0
+                  or bool(_cc_subagent_id(r.agent_id, r.request_headers)))
+        # 与实时路径同一条件加条目：尾部接续接不上本会话时才 `remember`（接上时只更新条数）。
+        # 不能按会话去重只留一条——hermes 后台复盘轮比主线短，实时路径会为它另记一条
+        # 条数更小的条目，只留最大条数那条的话，重启后短请求接不上（回放 R-HM30）。
+        if cache.find_match(r.user_id, r.agent_id, non_sys, is_sub=is_sub) != r.session_id:
+            cache.remember(r.user_id, r.agent_id, r.session_id, non_sys, is_sub=is_sub)
+        st = cache.state(r.user_id, r.agent_id, r.session_id)
+        if st is not None:
+            st.last_seen = r.ts
+        if r.ok:
+            ident = Identity(user_id=r.user_id, agent_id=r.agent_id, session_id=r.session_id,
+                             aux_source=r.aux_source)
+            note_session_output(ident, r.response_text, r.tool_events)
+            if st is not None:
+                st.last_seen = r.ts
+        prev = _fp_epochs._state.get((r.user_id, r.agent_id, _FpEpochWindow._base(r.session_id)))
+        if prev is None or prev[1] <= r.ts:
+            _fp_epochs.touch(r.user_id, r.agent_id, r.session_id, now=r.ts)
+        n += 1
+    for k, entries in live_entries.items():
+        merged = cache._entries.setdefault(k, []) + entries
+        cache._entries[k] = merged[-_MAX_CACHED_SESSIONS_PER_KEY:]
+        states = cache._states.setdefault(k, {})
+        for sid, st in live_states.get(k, {}).items():
+            old = states.get(sid)
+            if old is not None:
+                st.outputs = deque(list(old.outputs) + list(st.outputs))
+                while len(st.outputs) > max(1, int(flag_number("BLADEX_SESSION_OUTPUT_RING"))):
+                    st.outputs.popleft()
+                st.n_outputs += old.n_outputs
+            states[sid] = st
+        alive = {e.session_id for e in cache._entries[k]}
+        for sid in [s for s in states if s not in alive]:
+            del states[sid]
+    cache.cold = False
+    logger.info("session_state_rebuilt", turns=n,
+                sessions=sum(len(v) for v in cache._states.values()))
+    return n
+
+
+def load_session_records(hub: Any, now: float | None = None,
+                         ) -> tuple[list[SessionReplayRecord], list[tuple[str, str, str, float]]]:
+    """从 Memory Hub 取重放所需（同步、只读）：
+
+    - 最近一个纪元窗（`BLADEX_SESSION_FP_WINDOW_S`）的轮次原文；外加每个 (user, agent) 最近
+      `_MAX_CACHED_SESSIONS_PER_KEY` 个会话各自的最后一轮（窗外的也要——实时缓存里的尾部条目不按
+      时间过期，闲了 4 h 以上的会话回来照样靠尾部接续接上；只恢复纪元窗不恢复它们，重启会把
+      这类会话切开）；
+    - 全库每个 `fp:` 指纹基名最近一轮的 (user, agent, 会话 id, ts)——纪元窗状态。不恢复它，
+      重启后超窗的指纹会退回无后缀的原形、并进它第一纪元的会话（`_FpEpochWindow` 边界 1）。
+
+    `hub` 只需 `recent_turns(limit=, offset=)`（按 ts 降序）与 `get(key)`。内循环轮
+    （BladeX 自产、不经身份判定）跳过；失败轮也收（它们建立过会话），产出不登记。
+    """
+    from datetime import datetime
+    now = time.time() if now is None else now
+    cutoff = now - max(0.0, _FpEpochWindow._window_s())
+    records: list[SessionReplayRecord] = []
+    fp_last: dict[tuple[str, str, str], tuple[str, float]] = {}
+    recent_sessions: dict[tuple[str, str], set[str]] = {}
+    offset, page = 0, 500
+    while True:
+        rows, _total = hub.recent_turns(limit=page, offset=offset)
+        if not rows:
+            break
+        for key, ts_s in rows:
+            parts = key.split("/")
+            try:
+                ts = datetime.fromisoformat(ts_s.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            if len(parts) >= 4 and parts[2].startswith("fp:") and ts <= now:
+                base = (parts[0], parts[1], _FpEpochWindow._base(parts[2]))
+                fp_last.setdefault(base, ("/".join(parts[2:-1]), ts))   # 降序 ⇒ 第一次见到即最近
+            if ts > now:
+                continue
+            if ts < cutoff:
+                # 窗外：只取每个 (user, agent) 最近若干个会话的最后一轮（降序 ⇒ 第一次见到即最后一轮）
+                if len(parts) < 4 or parts[2].startswith("tw:"):
+                    continue
+                seen = recent_sessions.setdefault((parts[0], parts[1]), set())
+                sid = "/".join(parts[2:-1])
+                if sid in seen or len(seen) >= _MAX_CACHED_SESSIONS_PER_KEY:
+                    continue
+                seen.add(sid)
+            elif len(parts) >= 4:
+                recent_sessions.setdefault((parts[0], parts[1]), set()).add("/".join(parts[2:-1]))
+            turn = hub.get(key)
+            if turn is None or turn.aux_source == _INNER_LOOP_AUX_SOURCE:
+                continue
+            ok = getattr(turn.status, "value", turn.status) == "ok"
+            idn = turn.identity
+            records.append(SessionReplayRecord(
+                ts=ts, user_id=idn.user_id, agent_id=idn.agent_id, session_id=idn.session_id,
+                messages=list(turn.request_messages or []),
+                request_headers=dict(idn.request_headers or {}),
+                response_text=turn.response_text or "",
+                tool_events=list(turn.tool_events or []),
+                aux_source=turn.aux_source or "", ok=ok,
+                project_id=idn.project_id or "", project_name=idn.project_name or "",
+                project_source=idn.project_source or "", project_root=idn.project_root or "",
+                parent_ledger_id=idn.parent_ledger_id or "",
+                spawn_dispatches=list(turn.spawn_dispatches or [])))
+        offset += page
+    return records, [(u, a, sid, ts) for (u, a, _b), (sid, ts) in fp_last.items()]
 
 
 def _infer_session_from_prefix(

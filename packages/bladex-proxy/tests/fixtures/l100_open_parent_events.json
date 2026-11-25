@@ -149,7 +149,7 @@
        {
         "ref": "<L0>",
         "source": "model",
-        "text": "[sub-task] on completion: report status and results back to parent ledger <L0> (bladex_ledger_switch to it, then bladex_ledger_update).",
+        "text": "[sub-task] on completion: report status and results back to parent ledger <L0> with bladex_ledger_update(ledger_id=<L0>); do not switch.",
         "writer": "dsh"
        }
       ],
@@ -185,7 +185,7 @@
    "ledger_switch",
    {
     "agent_id": "dsh",
-    "evidence": "[sub-task] on completion: report status and results back to parent ledger <L0> (bladex_ledger_switch to it, then bladex_ledger_update).",
+    "evidence": "[sub-task] on completion: report status and results back to parent ledger <L0> with bladex_ledger_update(ledger_id=<L0>); do not switch.",
     "evidence_ok": true,
     "evidence_source": "child_writeback",
     "from_ledger_id": "<L1>",

@@ -127,7 +127,7 @@ and spliced back. You can see every one of them in `bladex status --traffic`.
 | **Task state, not just facts** | ✅ five-section ledger | ❌ | ❌ |
 | **You own all data** | ✅ 100% on your infrastructure | depends on the agent | cloud by default |
 
-## Quick Start (v0.3.0)
+## Quick Start (v0.4.0)
 
 ### Prerequisites
 
@@ -271,7 +271,7 @@ conversations are mostly in another language, pin a multilingual model **before*
 memory — switching later requires a full re-embed:
 
 ```toml
-# config/routing.toml
+# config/bladex.toml
 [embedding]
 model = "intfloat/multilingual-e5-large"   # 2.24 GB, the model BladeX's thresholds are calibrated on
 ```
@@ -282,7 +282,7 @@ The embedding model runs locally by default. If your machine cannot host one (sm
 spare RAM), point BladeX at a hosted embedding API instead — the setting already exists:
 
 ```toml
-# config/routing.toml
+# config/bladex.toml
 [embedding]
 backend = "api"
 model = "openai/text-embedding-3-small"   # Router format: provider/model
@@ -294,13 +294,28 @@ Two things to know before you switch:
 
 - **Privacy**: in `api` mode *every* distilled fact and *every* query is sent to the embedding
   provider. BladeX logs `EMBED_API_PRIVACY` at startup to make this visible. Keep `local` if your
-  memory must stay on-device.
+  memory must stay on-device. When the sensitivity layer is enabled, the `api` embedding backend falls back to local (`local`); in strict mode (`BLADEX_ROUTE_STRICT=true`) BladeX refuses to start instead.
 - **Changing backend or model changes the vector space.** Do it before you build up memory, or
   stop both processes and run `python scripts/reembed_index.py` first — otherwise the Memory Index
   refuses to start on a model mismatch.
 
 The `api` backend does not use the optional embedding module (`BLADEX_MODULE_EMBED`); that module
 only exists to share a *local* model between processes.
+
+### Where embedding settings live
+
+Embedding settings moved from `config/routing.toml` to `config/bladex.toml` (`bladex init` creates it,
+full options in `config/bladex.toml.example`). For each key: `BLADEX_EMBED_*` env >
+`config/bladex.toml` > `routing.toml [embedding]` > default.
+
+An existing `[embedding]` section in `routing.toml` keeps working for at least one more release. BladeX
+logs `config_embedding_section_deprecated` once per process, and `bladex doctor` lists the lines to move;
+it never edits your files.
+
+**Before rolling back to 0.3.0, keep the `[embedding]` section in `routing.toml`.** 0.3.0 only reads
+that file and silently ignores `config/bladex.toml`: without the old section `backend` falls back to
+`local` and `model` to the one stamped on your Memory Index (or the default if there is no stamp). An
+`api` setup refuses to start with an `engine changed` error.
 
 ## Where is my data stored?
 
@@ -322,7 +337,7 @@ API providers you configured, for model inference. Encryption at rest is delegat
 
 ## Features
 
-### Core (v0.3.0)
+### Core (v0.4.0)
 
 - 🧾 **Five-section task ledger** — Goal / Core / Verified / Open / Next; survives compaction,
   restarts, and cross-agent handoffs. Goal is user-owned. Finished ledgers can be **closed or
@@ -395,19 +410,33 @@ Also in 0.3.0:
   proxy and no longer stall it.
 - The idle consolidator round is about 5× cheaper.
 
-### Coming next (0.4.0)
+### Delivered in 0.4.0
+
+Everything the 0.3.0 README listed under *Coming next*:
 
 - When your agent compacts a long conversation on its own, BladeX keeps it as the same session:
   the ledger stays bound and the turn count carries on.
-- Hand a task to another agent with `bladex ledger handoff`, a one-page portable handoff of the
-  ledger; you can also create or edit a ledger yourself with `bladex ledger create | edit`.
-- Contradicting facts are flagged for you to settle; BladeX never deletes on its own judgment.
+- Handoff and import are available: `bladex ledger handoff` produces a one-page portable handoff of
+  a ledger, and you can create or edit a ledger yourself with `bladex ledger create | edit`
+  (the dashboard has a handoff page too).
+- Contradicting facts can be flagged for you to settle; BladeX never deletes on its own judgment.
+  This is experimental and off by default (see *Known Limitations*).
 - Reasoning parameters pass through `/v1/responses` unchanged; no thinking text leaks into Codex
   output.
 - Full rebuilds can be interrupted and resumed, survive upstream outages, and never leave a
   half-written index.
 
-## Known Limitations (v0.3.0)
+### Coming next (0.5.0)
+
+**Heads-up: 0.5.0 is a breaking change for Matters, fact retrieval, and the existing Obsidian export.**
+
+- Memory is rebuilt around the ledger: a session without a ledger gets a one-page task summary once it
+  stops, instead of having scattered facts extracted turn by turn.
+- `bladex_memory_search` searches ledgers and task summaries, including ledgers that have been closed.
+- A standing note you can edit directly, holding long-term preferences and environment information.
+- Ledgers, task summaries, and the standing note are visible and editable in Obsidian.
+
+## Known Limitations (v0.4.0)
 
 - Tuned for **individual self-hosting** — enterprise multi-tenant features are still in development.
 - The ledger tool face is enabled by default only for `medium` and `strong` model tiers
@@ -431,15 +460,51 @@ Also in 0.3.0:
 - The CLI reads `config/`, `data/` and `logs/` relative to the current directory (or `BLADEX_HOME`).
   Running `bladex status` from an unrelated directory shows an empty store — your data is not gone,
   you are just pointed somewhere else.
-- **No contradiction detection yet.** Two conflicting facts can coexist in memory without a flag.
+- **Contradiction flagging is experimental and off by default.** Turn it on with
+  `BLADEX_CONTRADICTION_ENABLED=1` and restart the consolidator. In our tests only about one flag in
+  four was a real contradiction (a small sample), so expect mostly false alarms. When on, it makes one
+  model call per related pair for each new fact, capped by default at 400,000 input tokens a day
+  (`BLADEX_CONTRADICTION_DAILY_INPUT_TOKENS`). It only flags: nothing is ever deleted or changed for you.
+  Review flags with `bladex memory conflicts` and rule on each with
+  `bladex memory settle <pair> --verdict not_same_thing|confirmed`. Only new memories are checked; existing
+  ones are not scanned. What this feature operates on will change in 0.5.0.
 - **Model routing does not use your memory.** Routing is configuration-driven (plus an optional
   LLM judge); memory-informed routing is not implemented.
-- **When an agent compacts its own history** (e.g. Hermes or DeepSeek Harness on long sessions),
-  BladeX currently treats the next request as a new session: the turn count restarts and the
-  ledger is no longer bound automatically. The ledger itself is kept — the model is offered it as
-  a switch candidate.
-- **Codex with a reasoning model upstream**: reasoning parameters on `/v1/responses` are not
-  forwarded yet, so thinking text can leak into the output and `apply_patch` may fail.
+- **Codex `apply_patch` needs a catalog declaration.** For Codex to call `apply_patch` through BladeX,
+  its model catalog must declare `apply_patch_tool_type`; without it Codex edits files through the shell
+  instead. Reasoning parameters on `/v1/responses` are forwarded either way.
+- **Handoff packs are not filtered for personal information.** `bladex ledger handoff` exports the five
+  ledger sections as they are (credentials are replaced, personal data is not), and an imported Goal is
+  text that the receiving model will read as an instruction — a prompt-injection surface. Read a pack
+  before importing it, and do not import one from a source you do not trust.
+- **No evidence yet that a handoff saves turns.** The first measurements exist, but there is no
+  with/without comparison, so BladeX makes no claim about how many turns a handoff saves. Three
+  constructed handoffs all went through (Goal and Core verbatim, the receiving side did not redo the
+  work), but all three were Codex to Codex and none was a real handoff between two different agents.
+- **Edits to a ledger's `.md` file take effect on the next agent request.** After you edit a ledger file
+  directly, BladeX picks the change up when the next request comes in, not immediately; on an idle
+  system nothing happens until then.
+- **Sub-task and sub-agent traffic has no live samples.** How ledgers behave for sub-tasks and post-compaction long tasks of some agents,
+  Claude Code sub-agents, and Codex collaboration sub-tasks has not been observed on real traffic.
+- **0.5.0 is a breaking change for Matters, fact retrieval, and the old Obsidian export.** Do not build
+  workflows on top of Matter pages or on fragment-level fact search.
+- **Reopening an old ledger has two blind spots.** A closed ledger is offered again only when your message
+  shares a rare Latin-script identifier with it, so a recurring task described in plain Chinese is not
+  matched after it has been closed for more than a day; and the check only applies to messages of up to
+  80 characters, so a longer message does not bring an old closed ledger back.
+- **Parallel sessions can be merged.** When one running session quotes another running session's output
+  (a Hermes background review, for example), BladeX may treat them as one session, and the ledger scope
+  can follow. It is rare and does not delete anything, but it is not zero. It is tracked as MQ-A100.
+- **Weak models get no memory fallback.** A model that cannot call tools sees only the hard rules and the
+  ledger block; BladeX does not inject a memory summary for it.
+- **The dashboard does not show session continuation.** Which requests were joined to a session, and why,
+  is only in the proxy log; there is no dashboard panel for it in 0.4.0.
+- **Truncated tool arguments with `deepseek-v4-flash`.** For some single-string-argument tools the model
+  returns unterminated JSON followed by a `</｜DSML｜invoke>` tail (3 of 13 calls in our test). Only the
+  `apply_patch` path repairs this; other tools may fail that call.
+- **Embedding API: provider-side model changes are invisible.** With `backend = "api"`, BladeX knows only
+  the model name, so if the provider changes the model behind an unchanged name the vector cache is not
+  invalidated.
 
 ## License
 

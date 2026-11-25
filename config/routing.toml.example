@@ -57,6 +57,11 @@ cache_ttl_s = 300
 # 字符 → token 换算（可选，0/不写 = 用全局 BLADEX_CHARS_PER_TOKEN=2.5）。各模型实测分布见
 # 实测：中文多的模型偏小、英文代码偏大（按你自己的流量 `route_decision` 里的 prompt_tokens_est 与上游 usage 对一次）。
 # chars_per_token = 2.5
+# 批 BC：`/v1/responses`（Codex）的 `reasoning.effort` 默认逐字发给上游顶层 `reasoning_effort`，
+# 不映射、不降档。上游不认（如 glm-5.3 拒 `none`）就把 400 原样回给 agent，日志
+# `responses_reasoning_rejected` 指回这里。不想发就写 "off"：这个模型不再收到该参数，
+# 每轮打 `reasoning_not_forwarded`。非 `openai/*` 前缀的模型目前一律按 "off" 处理并告警。
+# reasoning = "off"
 
 [[models]]
 name = "openai/glm-5.2"
@@ -229,79 +234,7 @@ code_agents = ["codex", "claude-code", "cursor"]
 # [distill]
 # model = "openai/deepseek-v4-flash"
 
-# ══ Embedding 后端（2026-07-26 可选化；可选）═══════════════════════════════════
-# 优先级：显式 env（BLADEX_EMBED_*，作回滚通道）> 本段 > 内置默认（local + e5-large）。
-# 密钥纪律同 [[models]]：只写 *_env（环境变量名），密钥不入 toml。
-# ⚠️ 切换 backend/model = 换向量空间：先停两进程跑 python scripts/reembed_index.py。
-# ⚠️ api 档 = 全部记忆内容外发；敏感层（[strategies.sensitivity]）启用时被强制回 local。
-#
-# ── local 档模型（必须在 fastembed 白名单内）─────────────────────────────────
-# 默认 BAAI/bge-small-en-v1.5（英语优先、最轻量，开箱即用）。按语言/机器选档：
-#
-#   model                                                        dim   size   langs  note
-#   BAAI/bge-small-en-v1.5                                       384   0.07GB en     默认；最轻，弱机器/小 VPS 首选
-#   BAAI/bge-base-en-v1.5                                        768   0.21GB en     英语，召回优于 small，体积 3x
-#   BAAI/bge-large-en-v1.5                                      1024   1.20GB en     英语最强档；每进程约 2GB 内存
-#   sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2  384   0.22GB 50+    最轻多语；同体积下 CJK 覆盖好
-#   jinaai/jina-embeddings-v2-base-zh                            768   0.64GB zh+en  中英双语语料调优
-#   sentence-transformers/paraphrase-multilingual-mpnet-base-v2  768   1.00GB 50+    多语强于 MiniLM-L12，体积约 5x
-#   intfloat/multilingual-e5-large                              1024   2.24GB 100+   旧默认；多语最强、最重；
-#                                                                                    唯一经真实流量标定阈值的模型
-#
-# 模型缺失时 proxy/consolidator 启动会**自动下载**（阻塞至完成）；HF 主站不可达时
-# 自动切 hf-mirror.com。显式设了 HF_ENDPOINT 则完全尊重你的设置，不做回退猜测。
-# ⚠️ 换 model = 换向量空间：先停两进程跑 python scripts/reembed_index.py。
-# 注：已有 Memory Index 库且本项留空时，沿用库内已盖章的模型（升级不会废掉现有向量空间）。
-# [embedding]
-# backend = "local"                              # local | ipc | api | proxy(已被 ipc 取代)
-# model = "BAAI/bge-small-en-v1.5"
-#
-# ipc 档 = **单机推荐**（V-A6）：嵌入跑在独立进程 `bladex embed` 里，proxy 与
-# consolidator 经 UDS 共用同一份模型（省一份内存），且服务端按角色让路——
-# proxy 侧 hot、consolidator 侧 bulk，批量重建不再堵住热路径（MQ-W8 的解）。
-# 连不上时**回落各自加载本地模型**并打 warning（`embed_ipc_fallback_local`），
-# 不拒服务。`bladex start` 会一并拉起它；`bladex stop` 也会一并停掉。
-# [embedding]
-# backend = "ipc"
-# model = "BAAI/bge-small-en-v1.5"               # 回落 local 时加载的就是它
-#
-# api 档示例：
-# [embedding]
-# backend = "api"
-# model = "openai/doubao-embedding"              # Router 格式（provider/model）
-# api_base = "https://ark.cn-beijing.volces.com/api/v3"
-# api_key_env = "ARK_EMBED_KEY"
-#
-# ⚠️ proxy 档**已被 ipc 取代**（2026-08-31），下面这段保留作历史说明。
-#    它的两个已知代价：① consolidator 的批量嵌入直接跑在 proxy 的事件循环上，
-#    实测一次 1063 条重建把 proxy 堵了 65 秒、连 Redis 读都超时（MQ-W8）；
-#    ② 全量重建的前置是"停 proxy"，而本档要 proxy 活着——两条互斥，
-#    绕过它需要临时 `BLADEX_EMBED_BACKEND=local`。ipc 档两条都没有。
-#
-# proxy 档示例 = 单机共享模型（consolidator 复用 proxy 已加载的那份，省一份内存）。
-# backend 是全局值，但**两个角色解读不同**（同一份配置，两种行为）：
-#   proxy 侧        -> 真正加载 model 指定的本地模型，经 /v1/embeddings 对外服务
-#   consolidator 侧 -> 不再自载模型，HTTP 调 proxy；向量空间身份由 proxy 透传，
-#                      自动与 Memory Index 已盖的章对齐
-# 所以 model 仍要写：它就是 proxy 侧实际加载、两边共用的那份模型。
-# [embedding]
-# backend = "proxy"
-# model = "BAAI/bge-small-en-v1.5"               # proxy 侧加载的模型（两边共用）
-# proxy_url = "http://127.0.0.1:38080"
-# proxy_key_env = "BLADEX_EMBED_PROXY_KEY_VALUE" # 仅 BLADEX_AUTH_ENABLED=true 时需要
-#
-# ⚠️ proxy_key_env 指向的环境变量必须存**纯 key 值**，不能指向 BLADEX_CLIENT_KEYS
-#    （那是 "key||label||key||label" 列表格式，不能直接当 Bearer token）。
-#    在 config/.env 里另建一个变量，值取 BLADEX_CLIENT_KEYS 里的某个 key：
-#      export BLADEX_EMBED_PROXY_KEY_VALUE="bladex-xxxxxxxxxxxx"
-# 注：run_proxy.sh 先拉 consolidator 再起 proxy，首次探测必然早于 proxy 监听 ——
-#    consolidator 会自动重试等待（默认 180s，BLADEX_EMBED_PROXY_WAIT_S 可调），
-#    覆盖 proxy 加载模型甚至首次下载的时间，无需手工调整启动顺序。
-#
-# 阈值 profile：上表七档已内置（仅 e5-large 经真实流量标定，其余用保守默认+启动告警）。
-# 任意模型（含 api 档）可在此声明/覆盖阈值；真实流量重标后写 calibrated = true 消告警：
-# [embedding.profiles."openai/doubao-embedding"]
-# novelty = 0.93
-# semantic = 0.83
-# digestion = 0.83
-# calibrated = true
+# ══ Embedding 后端 ══════════════════════════════════════════════════════════════
+# 已移到 config/bladex.toml（见 config/bladex.toml.example）。
+# 这里的 [embedding] 段已弃用：至少再读一个版本，读到时打 config_embedding_section_deprecated，
+# `bladex doctor` 会说明要搬哪几行。

@@ -41,6 +41,8 @@ class _Clock:
 @pytest.fixture
 def clock(monkeypatch):
     c = _Clock()
+    # 这些用例的 proxy_pid 是测试进程自己，不真监听；监听者核对另有用例（批 W33）
+    monkeypatch.setattr(lc, "listening_pids", lambda _port: [os.getpid()])
     import time as _real
     monkeypatch.setattr(lc, "time", types.SimpleNamespace(
         monotonic=c.monotonic, sleep=c.sleep, strftime=_real.strftime))

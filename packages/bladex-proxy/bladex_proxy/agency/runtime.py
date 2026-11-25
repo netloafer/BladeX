@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
-from bladex_core.flags import flag_enabled, flag_number
+from bladex_core.flags import bench_ledger_filler_chars, flag_enabled, flag_number
 from bladex_core.ledger import (
     SECTION_TITLES,
     STATUS_CLOSED,
@@ -25,6 +25,7 @@ from bladex_core.ledger import (
     replay_ledger_events,
 )
 from bladex_core.ledger_runtime import (
+    CLOSED_MATCH_WINDOW_S,
     ActivationTable,
     activation_scope,
     candidate_units,
@@ -32,9 +33,11 @@ from bladex_core.ledger_runtime import (
     staleness_marker,
 )
 
+from bladex_proxy.agency.bench_filler import bench_filler
 from bladex_proxy.agency.handlers import ToolFaceHandlersMixin
 from bladex_proxy.agency.notes import (
     _last_user_text,
+    _user_texts,
     load_ledger_template,
     load_system_notes,
     render_system_notes,
@@ -60,6 +63,7 @@ from bladex_proxy.splice import (
     splice_into_messages,
     strip_inbound_echoes,
 )
+from bladex_proxy.storage.memory_hub import HubRequiresNewerVersion
 from bladex_proxy.surface_budget import (
     FULL_PLAN,
     LEDGER_BLOCK_TRIM_BUCKETS,
@@ -132,10 +136,23 @@ INJECTION_MARKERS: tuple[str, ...] = (
 #: 纯内循环每轮把整段上下文再发上游，46 次里 4 次撞 6 轮上限、单次 44–78 万 tok，
 #: 六轮的四次全是 `bladex_ledger_update ×5-6`。F-B1 把批量能力做出来了，
 #: 这一句是**告诉模型该用**的那半——有器无令与有令无器一样白搭（MQ-L7 的镜像）。
+#:
+#: 🔴 批 SW · 步骤 3（2026-11-12，拍板 (82)，MQ-L109 成因 ②）：比对半句加判别口径——**同一主体**下的
+#: 换角度 / 追问 / 再深入 / 另一份交付物 / 隔段时间再做一次同样的事都算同一任务，做完一份交付物不等于任务
+#: 结束；只有转向另一个主体才算 DIFFERENT，并带一句 C 类反例（对不同对象的同类调研各开一本）。
+#: 依据 = 精简重放（`report-batch-SW-20261112.md` §9：A 类新建 3 → 0，C 类并进旧本 11 → 10）。
+#: 逐字来源 = `docs/benchmarks/sw/wording_drafts.py` 的甲′（`jiap`），`test_sw_wording_matches_draft.py` 逐槽对账。
+#: 后半段（记账）一字不改。
 _FIRST_STEP_WITH_LEDGER = (
     "FIRST STEP, every turn: compare the user's request with the Goal above. "
-    "If it is a DIFFERENT task, call bladex_ledger_switch (ledger_id='' creates a "
-    "new ledger; give a short title). If it matches, proceed — and record real "
+    "It is the SAME task if it is about the same subject — a new angle, a follow-up, "
+    "going deeper, another deliverable on that subject, or doing the same thing again "
+    "later all count, and finishing one deliverable does not end the task. "
+    "Only if the user has moved to a different subject is it a DIFFERENT task "
+    "(two separate investigations of different items — other models, companies or tools — "
+    "are different tasks even when the kind of work is the same): call "
+    "bladex_ledger_switch (ledger_id='' creates a new ledger; give a short title). "
+    "If it matches, proceed — and record real "
     "progress with bladex_ledger_update: add what you established to verified "
     "(with a ref) AND remove the next/open entry it resolves, in ONE "
     "bladex_ledger_update call (entries=[…]). "
@@ -192,8 +209,10 @@ _RECORD_ONLY_WITH_LEDGER = (
 #: ⇒ 危害未证，而 ADR-0029 的规矩是**加注入者举证**。详见 MQ-L72「撤回」节。
 _FIRST_STEP_NO_LEDGER = (
     "No active task ledger for this session. FIRST STEP: if one of the ledgers "
-    "listed below already covers this request, call bladex_ledger_switch with its "
-    "id to continue it. Otherwise call bladex_ledger_switch with ledger_id='', a "
+    "listed below already covers this request — same subject; a new angle, a follow-up, "
+    "another deliverable or the same thing done again later all count — call "
+    "bladex_ledger_switch with its id to continue it. Otherwise call bladex_ledger_switch "
+    "with ledger_id='', a "
     "short title, and initial core entries — the hard constraints and taboos the "
     "user has ALREADY stated (plus open/next if you have them), following the "
     "template below. The Goal is set from the user's own words — you do not write it. "
@@ -202,10 +221,16 @@ _FIRST_STEP_NO_LEDGER = (
 
 #: MQ-L38 相关性段标题（2026-09-04）。与 "Other recent ledgers" 并列：那段答"最近在干什么"，
 #: 这段答"以前干过这件事没有"。无命中整段不出现（块逐字等于修前）。
+#: 批 SW · 步骤 3：去掉「先 read 再 switch」——混合调用路径上 read 之后的 switch 落在工具面
+#: （"do NOT switch or create ledgers here"），两句互相打架（拍板 (67)-e）。
 _MATCHING_LEDGERS_HEADER = (
-    "Ledgers that look like the SAME task as the current request (read it with "
-    "bladex_ledger_read, then bladex_ledger_switch to it - do NOT create a new ledger "
-    "if one matches):"
+    "Ledgers that look like the SAME subject as the current request (if it is, call "
+    "bladex_ledger_switch to it - do NOT create a new ledger):"
+)
+
+#: recency 段标题（批 SW · 步骤 3：原为行内字面量，提成常量好让草案对账；文案同上去掉「先 read」）。
+_RECENT_LEDGERS_HEADER = (
+    "Other recent ledgers (bladex_ledger_switch to one if the request continues its subject):"
 )
 
 #: 批 Y · Y1d（2026-09-28，拍板 (30)，MQ-L93）：项目键落空 ∧ 同 agent Global 有绑定 ⇒
@@ -224,11 +249,19 @@ _GLOBAL_BOUND_SUFFIX = " (your active ledger outside any project - switch to it 
 #: 那个会话列出（`closed_by_session == session_id`），交接换会话、换 agent 必然不满足；
 #: L98 原病例（09-28 任务 2 返工原话）在相关性段上按内容命中原本（0.48 / shared 17）⇒
 #: 并成一条规则、删掉同会话分支（`report-batch-HO-20261015.md` §2）。
-def _closed_match_suffix(led: Any) -> str:
+def _closed_match_suffix(led: Any, now_ms: float | None = None) -> str:
     who = f" by {led.closed_by_agent}" if getattr(led, "closed_by_agent", "") else ""
     at = (led.closed_at or "")
     when = f" {at[:10]} {at[11:16]} UTC" if len(at) >= 16 else ""
-    return f" [closed{who}{when}; switching to it reopens it]"
+    # 批 L116 · 2b：久关本（> `CLOSED_MATCH_WINDOW_S`）带上「关了多久」——让模型知道这是之前做完的那一次，
+    # 不是刚关的。≤ 窗口的行逐字不变（批 HO 的用例钉着原文）。
+    ago = ""
+    if at and len(at) >= 16:
+        age_s = ((time.time() * 1000.0 if now_ms is None else now_ms) - iso_ms(at)) / 1000.0
+        if age_s > CLOSED_MATCH_WINDOW_S:
+            d = int(age_s // 86400)
+            ago = f" ({d} day{'s' if d != 1 else ''} ago)"
+    return f" [closed{who}{when}{ago}; switching to it reopens it]"
 
 
 #: 账本块的构成桶（F-A1 / MQ-A35）。前六个来自渲染好的账本 MD（`header` = 标题 +
@@ -366,6 +399,32 @@ def rare_pending_units(pool: dict[str, Ledger], units: frozenset[str], *,
             df[u] = df.get(u, 0) + 1
     rare_df = max(2, len(corpus) // 10)
     return frozenset(u for u in kept if df.get(u, 0) <= rare_df)
+
+
+#: MQ-L110：`_user_words_seen` 的容量。超出按最久未见淘汰；淘汰的后果只是退回修前行为（判 user，
+#: 多注一次），不会漏注。正常流量下一条用户话只在它自己的工具往返期间有用，1024 远大于并发会话数。
+_USER_WORDS_SEEN_MAX = 1024
+
+
+def _last_turn_words(messages: list[dict] | None) -> tuple[str, bool]:
+    """最后一个用户轮的开头那句话 → `(内容哈希, 这句话是否已被回答过)`。
+
+    轮次边界与 `user_turn_index` 同一个算法（`turn_starts`），工具循环中的用户插话不算新话。
+    "已被回答过" = 这句话之后已经有 assistant 消息，即模型至少处理过它一次。
+    取不到正文（没有用户消息 / 只有图）⇒ `("", False)`，调用方按修前处理。
+    """
+    from bladex_core.task_unit import turn_starts  # noqa: PLC0415
+
+    msgs = messages or []
+    starts = turn_starts(msgs)
+    if not starts:
+        return "", False
+    texts = _user_texts(msgs[starts[-1]:starts[-1] + 1])
+    if not texts or not texts[0]:
+        return "", False
+    answered = any(isinstance(m, dict) and m.get("role") == "assistant"
+                   for m in msgs[starts[-1] + 1:])
+    return hashlib.sha256(texts[0].encode("utf-8")).hexdigest()[:16], answered
 
 
 def _call_names(calls: list[dict]) -> str:
@@ -554,13 +613,18 @@ class AgencyRuntime(ToolFaceHandlersMixin):
         #: 分开（前者形状完全相同 ⇒ 沿用上次判定，后者 uti 不变但变长 ⇒ 工具面）。
         #: 重启归零 ⇒ 重启后第一个请求判 `face=user`，只会多注一次，不会漏注。
         self._last_seen_face_turn: dict[tuple[str, str], tuple[tuple[int, int], bool]] = {}
+        #: MQ-L110：(激活作用域, 用户话哈希) —— 这句话已经判过面。**不含 session_id**：
+        #: 没有显式会话 id 的 agent，会话 id 在第一次工具往返时从 `tw:*` 变成 `fp:*`，
+        #: 上面那张表在这一刻查不到东西。只由 `_judge_new_user_turn` 读写。
+        self._user_words_seen: OrderedDict[tuple[str, str], None] = OrderedDict()
         self.recent = RecentRequests()
         self.toolface = ToolFace()
         self.toolface.register("bladex_memory_search", self._h_memory_search)
         self.toolface.register("bladex_ledger_read", self._h_ledger_read)
         self.toolface.register("bladex_ledger_update", self._h_ledger_update)
-        self.toolface.register("bladex_ledger_switch", self._h_ledger_switch)
-        self.toolface.register("bladex_ledger_close", self._h_ledger_close)
+        self._ledger_ops: dict[tuple[str, str], list] = {}
+        self.toolface.register("bladex_ledger_switch", self._track_ledger_op(self._h_ledger_switch))
+        self.toolface.register("bladex_ledger_close", self._track_ledger_op(self._h_ledger_close))
         self._load_pool()
 
     # ── 开关（每请求 env 读，µs 级；默认全关 = 零行为差异）──
@@ -575,6 +639,28 @@ class AgencyRuntime(ToolFaceHandlersMixin):
     @property
     def ledger_on(self) -> bool:
         return module_enabled("ledger")
+
+    # ── 批 BA2（MQ-A94 R3）：本轮 switch / close 调用前后的激活本 ──
+    def _track_ledger_op(self, handler):  # noqa: ANN001, ANN202
+        """包住会改激活位的两个工具。失败 / 幂等的调用也记一条（before == after）：
+        `active_at_spawn` 按 tool_events 里的调用数对位，少记一条就错位。"""
+        async def wrapped(args: dict, *, allowed_exposure: str, context: dict | None = None) -> str:
+            ctx = context or {}
+            agent, session = str(ctx.get("agent_id", "")), str(ctx.get("session_id", ""))
+            scope = self.scope_of(agent, str(ctx.get("project_id", "")))
+            before = self.activation.active(scope)
+            try:
+                return await handler(args, allowed_exposure=allowed_exposure, context=context)
+            finally:
+                from bladex_proxy.subtask_lineage import LedgerOp  # noqa: PLC0415
+                self._ledger_ops.setdefault((agent, session), []).append(
+                    LedgerOp(before=before, after=self.activation.active(scope)))
+        return wrapped
+
+    def drain_ledger_ops(self, agent_id: str, session_id: str, project_id: str) -> tuple[list, str]:
+        """(本轮的调用记录, 此刻的激活本)。取走即清。"""
+        ops = self._ledger_ops.pop((agent_id, session_id), [])
+        return ops, self.activation.active(self.scope_of(agent_id, project_id))
 
     # ── 池装载（Hub 投影）──
     def _load_pool(self) -> None:
@@ -591,6 +677,8 @@ class AgencyRuntime(ToolFaceHandlersMixin):
                 self.activation.restore(bindings, sessions=binding_sessions(events))
                 logger.info("agency_pool_loaded", ledgers=len(self.pool),
                             bindings=len(bindings))
+        except HubRequiresNewerVersion:  # 批 UE 步骤 2：运行中的拒绝不许被吞
+            raise
         except Exception as e:  # noqa: BLE001 —— 投影装载失败 = 优雅降级空池
             logger.warning("agency_pool_load_failed", error=str(e))
 
@@ -1113,8 +1201,9 @@ class AgencyRuntime(ToolFaceHandlersMixin):
               # MQ-L38（2026-09-04）：相关性位——按当前用户话在**全池**找"像同一件事"的本。
               # recency top-5 只能回答"最近在干什么"；08-25 的泰山旧本排第 9，用户原话逐字
               # 重提时模型面前没有"切回"这个选项，只能新建。两段并列，top-5 一字不动。
+              _diag: dict[str, int] = {}
               matches = relevant_ledgers(self.pool, user_text,
-                                         exclude_id=led.ledger_id if led else "")
+                                         exclude_id=led.ledger_id if led else "", diag=_diag)
               self._last_candidates = matches
               # 判据是「**渲染到了正文里**」，不是「算出来了」：空候选段不入块，
               # 模型看到的和没算过完全一样（下面 `if matches:` 才是真正的渲染点）。
@@ -1154,8 +1243,7 @@ class AgencyRuntime(ToolFaceHandlersMixin):
                   if _global_bound:
                       rows = [(_global_bound, (self.pool[_global_bound].title or _global_bound)
                                + _GLOBAL_BOUND_SUFFIX)] + rows[:4]
-                  _put("recent", "", "Other recent ledgers (read one with "
-                                     "bladex_ledger_read before switching):")
+                  _put("recent", "", _RECENT_LEDGERS_HEADER)
                   _put("recent", *[f"- {lid}: {title}" for lid, title in rows])
               # 🔴 G16.0：补 `agent` —— 本事件此前无 agent 字段，导致混合日志里
               # 按时序分段无效（两 agent 请求交错），codex 的段内位置至今 NO-DATA。
@@ -1167,6 +1255,12 @@ class AgencyRuntime(ToolFaceHandlersMixin):
                               relevant=[m.ledger_id for m in matches],
                               # 批 HO（MQ-L99）：其中哪些是已关的本（读数 = 交接/返工找回的分子）
                               relevant_closed=[m.ledger_id for m in matches if m.closed],
+                              # 批 L116 · 2b（MQ-L115）：久关本（关闭 > 24 h）强命中列出几条 / 内容上强命中、
+                              # 仅因长度闸门没列几条（= 去掉闸门会多列的；批 DA 修好信封识别后 N 能不能放宽看它）
+                              closed_old_listed=_diag.get("closed_old_listed", 0),
+                              closed_gt24h_gated_by_len=_diag.get("closed_old_gated_by_len", 0),
+                              # 批 DA · E（MQ-L125）：靠「短话稀有拉丁标识」放行 min_score 列出几条
+                              score_gate_waived=_diag.get("score_gate_waived", 0),
                               top_score=(matches[0].score if matches else 0.0),
                               recent=(min(len(others), 5) if _user_face else 0),
                               # Y1d：置顶那本的来源可指认（原则 13 层 4）——值来自
@@ -1187,6 +1281,47 @@ class AgencyRuntime(ToolFaceHandlersMixin):
                            ledger=bd.ledger_id, buckets=bd.total(),
                            content=len(content), delta=bd.total() - len(content))
         return {"role": "system", "content": content}, bd
+
+    def _judge_new_user_turn(self, scope: str, session_id: str,
+                             messages: list[dict]) -> bool:
+        """这一请求是不是新用户轮（True = 用户面）。**面判定的唯一实现点**，状态只在这里读写。
+
+        本会话见过（`_prev` 非空）：逐字重试沿用上次判定；否则看用户轮序号变没变（G16）。
+
+        本会话没见过（`_prev` 为空）：通常是新用户轮，判 user。🔴 **MQ-L110 例外**：这句用户话
+        已经判过面，而且请求里它已被回答过 ⇒ 是同一句话的工具往返，只是会话 id 变了，判 tool。
+        病例（11-03 hermes:accept）：`tw:*` → `fp:*`，`_prev` 为空，"FIRST STEP … If it is a
+        DIFFERENT task" 重发，模型把第一次「留在原账本」的判断推翻，多建了一本。
+
+        为什么要"已被回答过"：另一个会话说了一模一样的话，它的第一个请求里这句话后面还没有
+        assistant ⇒ 仍判 user。这里不做任何推断，请求里带着对这句话的回答就是工具往返的事实。
+        """
+        from bladex_core.ledger_runtime import user_turn_index  # noqa: PLC0415
+
+        uti = user_turn_index(messages)
+        shape = (uti, len(messages or ()))
+        key = (scope, session_id or "")
+        prev = self._last_seen_face_turn.get(key)
+        words, answered = _last_turn_words(messages)
+        words_key = (scope, words)
+        if prev is None:
+            carried = answered and words_key in self._user_words_seen
+            new_user_turn = not carried
+            if carried:
+                # 上线后的激活读数：这一行的次数 = 修前会被多判一次用户面的次数。
+                logger.info("agency_face_same_user_words",
+                            scope=scope, session=(session_id or "")[:24], uti=uti)
+        elif prev[0] == shape:
+            new_user_turn = prev[1]            # 逐字重试：沿用，不翻面
+        else:
+            new_user_turn = prev[0][0] != uti
+        self._last_seen_face_turn[key] = (shape, new_user_turn)
+        if words:
+            self._user_words_seen[words_key] = None
+            self._user_words_seen.move_to_end(words_key)
+            while len(self._user_words_seen) > _USER_WORDS_SEEN_MAX:
+                self._user_words_seen.popitem(last=False)
+        return new_user_turn
 
     def insert_ledger_block(self, messages: list[dict], agent_id: str,
                             *, project_id: str = "", auxiliary: bool = False,
@@ -1314,14 +1449,8 @@ class AgencyRuntime(ToolFaceHandlersMixin):
         # 用户轮被 185 秒超时打断后重发（MQ-A57 实测 11 次 / 单会话），重试就丢掉 (a)。
         # 于是记 `(uti, len(messages))` 并连上次的 face 一起存：完全相同 ⇒ 原样沿用。
         _uti = user_turn_index(messages)
-        _face_key = (self.scope_of(agent_id, project_id), session_id or "")
-        _shape = (_uti, len(messages or ()))
-        _prev = self._last_seen_face_turn.get(_face_key)
-        if _prev is not None and _prev[0] == _shape:
-            _new_user_turn = _prev[1]          # 逐字重试：沿用，不翻面
-        else:
-            _new_user_turn = (_prev is None) or (_prev[0][0] != _uti)
-        self._last_seen_face_turn[_face_key] = (_shape, _new_user_turn)
+        _new_user_turn = self._judge_new_user_turn(
+            self.scope_of(agent_id, project_id), session_id, messages)
         _last_role = ""
         if messages:
             _m = messages[-1]
@@ -1342,26 +1471,39 @@ class AgencyRuntime(ToolFaceHandlersMixin):
         msg, breakdown = self._build_ledger_block(
             agent_id, project_id=project_id, with_instruction=with_instruction,
             user_text=_utext, face=_face)
+        # 🔴 批 BD · 步骤 1：bench 填充臂「每个会注块的轮都注」——含真块为 None 的轮
+        # （无账本 + 工具面：填充臂里模型不建账本，否则块在场的轮次模式会与开臂不同）。
+        # 判据 = 填充开关 > 0 ∧ 模块开 ∧ 工具面开（已过上面 aux / 档位两道门）。默认 0 ⇒ 本分支恒不进。
+        _filler_n = bench_ledger_filler_chars()
+        _filler_on = _filler_n > 0 and self.ledger_on and self.toolface_on
         if msg is None:
-            # 门 ③：`_build_ledger_block` 只在两处返回 None——模块关，或无激活账本且不给指令。
-            return _gated("module_off" if not (self.ledger_on and self.toolface_on)
-                          else "no_ledger_no_instruction")
-        _step = dynamic_trim_step(len(msg["content"]), breakdown.chars, budget_chars)
-        if _step == "candidates":
-            log_trim("candidates",
-                     chars=sum(int(breakdown.chars.get(b, 0) or 0) for b in LEDGER_BLOCK_TRIM_BUCKETS),
-                     budget=budget_chars, estimate=len(msg["content"]), session=session_id)
-            msg, breakdown = self._build_ledger_block(
-                agent_id, project_id=project_id, with_instruction=with_instruction,
-                user_text=_utext, face=_face, omit_buckets=LEDGER_BLOCK_TRIM_BUCKETS, quiet=True)
-            if msg is None:
+            if not _filler_on:
+                # 门 ③：`_build_ledger_block` 只在两处返回 None——模块关，或无激活账本且不给指令。
+                return _gated("module_off" if not (self.ledger_on and self.toolface_on)
+                              else "no_ledger_no_instruction")
+            msg = {"role": "system", "content": ""}   # 占位：内容在下面被填充替换；角色与真块一致
+        else:
+            _step = dynamic_trim_step(len(msg["content"]), breakdown.chars, budget_chars)
+            if _step == "candidates":
+                log_trim("candidates",
+                         chars=sum(int(breakdown.chars.get(b, 0) or 0) for b in LEDGER_BLOCK_TRIM_BUCKETS),
+                         budget=budget_chars, estimate=len(msg["content"]), session=session_id)
+                msg, breakdown = self._build_ledger_block(
+                    agent_id, project_id=project_id, with_instruction=with_instruction,
+                    user_text=_utext, face=_face, omit_buckets=LEDGER_BLOCK_TRIM_BUCKETS, quiet=True)
+                if msg is None:
+                    return messages
+            elif _step == "ledger_block":
+                log_trim("ledger_block", chars=len(msg["content"]), budget=budget_chars,
+                         estimate=len(msg["content"]), session=session_id)
+                self._last_candidates = []
+                self._candidates_shown = False
                 return messages
-        elif _step == "ledger_block":
-            log_trim("ledger_block", chars=len(msg["content"]), budget=budget_chars,
-                     estimate=len(msg["content"]), session=session_id)
-            self._last_candidates = []
-            self._candidates_shown = False
-            return messages
+        if _filler_on:
+            _text = bench_filler(_filler_n)
+            msg = {**msg, "content": _text}
+            breakdown = LedgerBlockBreakdown(ledger_id=breakdown.ledger_id, rev=breakdown.rev)
+            breakdown.chars = {"filler": len(_text)}
         self.last_ledger_breakdown = breakdown
         out = [*messages, msg]
         # 🔴 观测缺口 MQ-L5 #3：此前这一步**一条日志都没有** ⇒ live 上无法证明
@@ -1375,6 +1517,9 @@ class AgencyRuntime(ToolFaceHandlersMixin):
         # 的量级版）。`(ledger, rev)` 一对让任一轮的读数能在 Hub 事件流里重放。
         logger.info("agency_ledger_block_injected",
                     ledger=led.ledger_id if led else "",
+                    # MQ-V51（批 SW · 步骤 3）：此前没有 agent，按 agent 拆读数只能靠前后行关联。
+                    # 值直接取自形参（单一来源，不是推断）。
+                    agent=agent_id,
                     rev=breakdown.rev,
                     with_instruction=with_instruction,
                     # G16.0 观测（零行为改变）：`face` 是**将来**要接门控的判别器，
@@ -1398,7 +1543,9 @@ class AgencyRuntime(ToolFaceHandlersMixin):
                     # 没有这一列，"块真没变"始终是代理证据。sha256[:16]，与 Hub
                     # `LedgerAnchor.added_hash` 同款截断。
                     block_hash=hashlib.sha256((msg.get("content") or "").encode("utf-8")).hexdigest()[:16],
-                    sections=json.dumps(breakdown.chars, separators=(",", ":")))
+                    sections=json.dumps(breakdown.chars, separators=(",", ":")),
+                    # 批 BD · 步骤 1：仅填充臂带这两列；关着时字段集与改前逐字相同（守卫 ①）。
+                    **({"filler": 1, "filler_chars": len(msg["content"])} if _filler_on else {}))
         return out
 
     # ── server 接线面 ③ 非流式响应处置 ──

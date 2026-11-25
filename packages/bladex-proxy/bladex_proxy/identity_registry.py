@@ -28,6 +28,8 @@ from typing import Any
 import structlog
 from pydantic import BaseModel, Field
 
+from bladex_proxy.storage.memory_hub import HubRequiresNewerVersion
+
 logger = structlog.get_logger()
 
 
@@ -322,6 +324,8 @@ class IdentityRegistry:
             for _key, ev in ledger.scan_admin_events():
                 if ev.event_type == AdminEventType.IDENTITY_MERGE:
                     journaled.add(ev.matter_id)  # matter_id 复用为 principal_id
+        except HubRequiresNewerVersion:  # 批 UE 步骤 2：运行中的拒绝不许被吞
+            raise
         except Exception as e:  # noqa: BLE001
             logger.warning("identity_legacy_journal_scan_failed", error=str(e))
             return 0

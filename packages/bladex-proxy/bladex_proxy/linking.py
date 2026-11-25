@@ -105,7 +105,7 @@ class LLMLinkJudge:
             if self._no_think:
                 kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
-            response = router_sdk.completion(**kwargs)
+            response = router_sdk.completion(purpose="link_judge", **kwargs)
             raw_text = response.choices[0].message.content or ""
             return _parse_link_json(raw_text, items)
         except Exception as e:  # noqa: BLE001

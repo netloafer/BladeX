@@ -258,7 +258,8 @@ class TestProductionWiring:
         assert "_message_as_dict(m2)" in src[i0:i0 + 1200]
         # 直接证：_loop_reply 挂 usage
         i = src.find("def _loop_reply(")
-        assert '"usage"' in src[i:i + 1200] and "_extract_usage_dict(usage)" in src[i:i + 1200]
+        # 批 AC（MQ-P34）：挂的是上游原文（`usage_raw`），三键由 loopledger 入库时投影
+        assert '"usage"' in src[i:i + 1600] and "usage_raw(usage)" in src[i:i + 1600]
 
     def test_loop_cost_reads_normalized_total(self):
         from bladex_proxy.agency import _loop_cost

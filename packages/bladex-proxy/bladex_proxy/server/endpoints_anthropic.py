@@ -44,6 +44,7 @@ from bladex_proxy.server.orchestration import (
     _extract_output_modalities,
     _intercept_non_stream,
     _loop_reply,
+    _note_nonstream_cache_reading,
     _prepare_round,
     _store_raw_request,
 )
@@ -341,6 +342,7 @@ async def _handle_anthropic_non_stream(
             content={"type": "error", "error": {"type": "upstream_error",
                     "message": f"Upstream error: {router_sdk.error_text(e)}"}},
         )
+    _note_nonstream_cache_reading(identity, response)
 
     # 🔴 入库口径：Hub 存**完整真相**（含被拦下的 bladex 调用），agent 拿处置后的。
     # 故先用未处置的 response 抽 tool_events，再做拦截（chat 侧同序，V-P5a）。

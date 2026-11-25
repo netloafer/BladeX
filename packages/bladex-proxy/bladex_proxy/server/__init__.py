@@ -97,6 +97,7 @@ from bladex_proxy.server.orchestration import (  # noqa: F401
     _ledger_next_referenced,
     _loop_reply,
     _message_as_dict,
+    _note_nonstream_cache_reading,
     _prepare_round,
     _record_inject_metrics,
     _redis_skip_count,

@@ -472,6 +472,24 @@ async def _narrate_until_done(task: Any, q: Any, *, narrator: Any, keepalive: An
 #   这保证不会给 agent 一个空流，代价是那轮不做多轮内循环（记 V-P5c）。
 
 
+def _is_agent_call_event(out: dict) -> bool:
+    """放行事件里有没有 **agent 自己的工具调用**（MQ-P46：看结构，不看字符串）。
+
+    此前用 `"tool_use" in json.dumps(out)`：正文或回程 reasoning 里写到「tool_use」一词，
+    纯 bladex 轮就被判成混合轮而错走剥离-拼接。现按协议的块 / item 类型判：
+    anthropic = `content_block_start` 的 `tool_use` 块；responses = 事件类型含 `function_call`
+    （参数 delta）或 item 为 `function_call` / `custom_tool_call`。
+    `out` 已过剥离器，bladex 调用不在其中。
+    """
+    t = out.get("type", "")
+    if t == "content_block_start" and (out.get("content_block") or {}).get("type") == "tool_use":
+        return True
+    if isinstance(t, str) and "function_call" in t:
+        return True
+    item = out.get("item")
+    return isinstance(item, dict) and item.get("type") in ("function_call", "custom_tool_call")
+
+
 async def _intercept_protocol_stream(
     sse_iter: Any, *, agency: AgencyRuntime, stripper: Any, capture_result: Any,
     session_prefix: str, allowed_exposure: str, session_id: str, agent_id: str,
@@ -485,6 +503,10 @@ async def _intercept_protocol_stream(
 
     held: list[bytes] = []
     forwarded_calls = False
+    #: 批 BC：放行的调用（function + custom）按发出顺序记下，只在有 custom 时用作拼接锚。
+    #: 剥离器只认 function_call，而 codex 回放时两种都会变成 assistant `tool_calls`。
+    released_calls: list[dict] = []
+    released_custom = False
     _last_out = [time.monotonic()]   # V-P3：上次给客户端发字节的时刻
     #: 合成 item 的落点与 index（responses 协议：与终止快照同源，见 _synth_* 注释）
     synth_items: list = []
@@ -514,8 +536,15 @@ async def _intercept_protocol_stream(
             if isinstance(out.get("output_index"), int):
                 max_index = max(max_index, out["output_index"])
             t = out.get("type", "")
-            if "tool_use" in _json.dumps(out) or "function_call" in t:
+            _item = out.get("item") or {}
+            if _is_agent_call_event(out):
                 forwarded_calls = True
+            if t == "response.output_item.done" and _item.get("type") in (
+                    "function_call", "custom_tool_call"):
+                released_custom = released_custom or _item["type"] == "custom_tool_call"
+                released_calls.append({"id": _item.get("call_id", ""), "type": "function",
+                                       "function": {"name": _item.get("name", ""),
+                                                    "arguments": _item.get("arguments", "")}})
             _emitted = True
             _last_out[0] = time.monotonic()
             yield f"event: {t or etype}\ndata: {_json.dumps(out, ensure_ascii=False)}\n\n".encode()
@@ -641,7 +670,8 @@ async def _intercept_protocol_stream(
         # MQ-P8：同 chat 侧——tool_calls 取剥离器已发射形态（含铸 id）。
         stripped_assistant = {"role": "assistant",
                               "content": capture_result.full_text or "",
-                              "tool_calls": list(stripper.forwarded_calls)}
+                              "tool_calls": (released_calls if released_custom
+                                             else list(stripper.forwarded_calls))}
         if not stripped_assistant["tool_calls"]:
             stripped_assistant.pop("tool_calls")
         agency.splice.add(SpliceRecord(
@@ -727,9 +757,21 @@ def _rewrite_stop_responses(chunk: bytes, forwarded_calls: bool,
 
 
 def _synth_responses_tool_call_events(tool_calls: list[dict], *, index: int = 0,
-                                      sink: list | None = None):
-    """agent tool_calls → Responses `function_call` 事件（每个调用占一个 item）。"""
+                                      sink: list | None = None,
+                                      custom_names: frozenset[str] = frozenset()):
+    """agent tool_calls → Responses 调用事件（每个调用占一个 item）。
+
+    🔴 P36（MQ-P36）：内循环最终回复里的 agent 调用也走这里，而它是**第三条**
+    把「上游 chat 调用名」写回 `function_call` item 的路径（另两条在
+    `bladex_proxy.responses`）。少了 `responses_call_item_name_fields` 这一层，
+    namespace 工具的调用名会以 `ns-<族名>-<内层名>` 原样回到 codex ⇒
+    `unsupported call`（live：BLADEX_MODULE_INTERCEPTION=1，X1 第一次调用就是
+    这条路径发出的，id 形如 `fc_bladex_0`）。还原点与 responses.py 共用同一个函数。
+    🔴 批 BC（MQ-P37）：同理，`apply_patch` 在这里也要还原成 `custom_tool_call`。
+    """
     import json as _json
+
+    from bladex_proxy.responses import _call_item, responses_call_item_fields
 
     def ev(name, obj):
         return f"event: {name}\ndata: {_json.dumps(obj, ensure_ascii=False)}\n\n".encode()
@@ -739,15 +781,21 @@ def _synth_responses_tool_call_events(tool_calls: list[dict], *, index: int = 0,
         call_id = str(tc.get("id") or f"call_bladex_{off}")
         item_id = f"fc_bladex_{off}"
         args = str(fn.get("arguments") or "{}")
-        item = {"type": "function_call", "id": item_id, "call_id": call_id,
-                "name": str(fn.get("name") or ""), "arguments": args,
-                "status": "completed"}
+        name = str(fn.get("name") or "")
+        item = _call_item(item_id, call_id, responses_call_item_fields(name, args, custom_names),
+                          "completed")
         if sink is not None:
             sink.append(item)
         idx = index + off
         yield ev("response.output_item.added", {
             "type": "response.output_item.added", "output_index": idx,
-            "item": {**item, "arguments": "", "status": "in_progress"}})
+            "item": _call_item(item_id, call_id,
+                               responses_call_item_fields(name, None, custom_names),
+                               "in_progress")})
+        if item["type"] == "custom_tool_call":
+            yield ev("response.output_item.done", {
+                "type": "response.output_item.done", "output_index": idx, "item": item})
+            continue
         yield ev("response.function_call_arguments.delta", {
             "type": "response.function_call_arguments.delta",
             "item_id": item_id, "output_index": idx, "delta": args})
@@ -874,12 +922,15 @@ def intercept_anthropic_stream(sse_iter, **kw):
         narrate=_AnthropicNarrator, **kw)
 
 
-def intercept_responses_stream(sse_iter, **kw):
+def intercept_responses_stream(sse_iter, *, custom_names: frozenset[str] = frozenset(), **kw):
+    from functools import partial
+
     from bladex_proxy.interception import ResponsesStreamStripper
     return _intercept_protocol_stream(
         sse_iter, stripper=ResponsesStreamStripper(),
         terminal_types=("response.completed", "response.incomplete"),
         rewrite_stop=_rewrite_stop_responses,
         synth_text_events=_synth_responses_text_events,
-        synth_tool_call_events=_synth_responses_tool_call_events,
+        synth_tool_call_events=partial(_synth_responses_tool_call_events,
+                                       custom_names=custom_names),
         narrate=_ResponsesNarrator, **kw)

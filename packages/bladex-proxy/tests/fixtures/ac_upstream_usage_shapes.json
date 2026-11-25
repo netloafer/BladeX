@@ -1,0 +1,685 @@
+{
+ "cells": [
+  {
+   "elapsed_s": 1.59,
+   "keys": [
+    "completion_tokens",
+    "completion_tokens_details",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "total_tokens"
+   ],
+   "model": "openai/deepseek-v4-flash",
+   "protocol": "chat",
+   "stream": false,
+   "usage": {
+    "completion_tokens": 10,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 8,
+     "rejected_prediction_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "prompt_tokens": 90,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "total_tokens": 100
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 1.28,
+   "keys": [
+    "completion_tokens",
+    "completion_tokens_details",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "total_tokens"
+   ],
+   "model": "openai/deepseek-v4-flash",
+   "protocol": "chat",
+   "stream": true,
+   "usage": {
+    "completion_tokens": 14,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 12,
+     "rejected_prediction_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "prompt_tokens": 90,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "total_tokens": 104
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 1.53,
+   "keys": [
+    "completion_tokens",
+    "completion_tokens_details",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "total_tokens"
+   ],
+   "model": "openai/deepseek-v4-flash",
+   "protocol": "anthropic",
+   "stream": false,
+   "usage": {
+    "completion_tokens": 28,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 26,
+     "rejected_prediction_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "prompt_tokens": 90,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "total_tokens": 118
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 2.31,
+   "keys": [
+    "completion_tokens",
+    "completion_tokens_details",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "total_tokens"
+   ],
+   "model": "openai/deepseek-v4-flash",
+   "protocol": "anthropic",
+   "stream": true,
+   "usage": {
+    "completion_tokens": 16,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 14,
+     "rejected_prediction_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "prompt_tokens": 90,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "total_tokens": 106
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 2.45,
+   "keys": [
+    "completion_tokens",
+    "completion_tokens_details",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "total_tokens"
+   ],
+   "model": "openai/deepseek-v4-flash",
+   "protocol": "responses",
+   "stream": false,
+   "usage": {
+    "completion_tokens": 16,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 14,
+     "rejected_prediction_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "prompt_tokens": 90,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "total_tokens": 106
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 1.43,
+   "keys": [
+    "completion_tokens",
+    "completion_tokens_details",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "total_tokens"
+   ],
+   "model": "openai/deepseek-v4-flash",
+   "protocol": "responses",
+   "stream": true,
+   "usage": {
+    "completion_tokens": 11,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 9,
+     "rejected_prediction_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "prompt_tokens": 90,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "total_tokens": 101
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 0.63,
+   "keys": [
+    "completion_tokens",
+    "completion_tokens_details",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "total_tokens"
+   ],
+   "model": "openai/glm-5.3",
+   "protocol": "chat",
+   "stream": false,
+   "usage": {
+    "completion_tokens": 8,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 7,
+     "rejected_prediction_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "prompt_tokens": 19,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "total_tokens": 27
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 0.65,
+   "keys": [
+    "completion_tokens",
+    "completion_tokens_details",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "total_tokens"
+   ],
+   "model": "openai/glm-5.3",
+   "protocol": "chat",
+   "stream": true,
+   "usage": {
+    "completion_tokens": 8,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 7,
+     "rejected_prediction_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "prompt_tokens": 19,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "total_tokens": 27
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 0.77,
+   "keys": [
+    "completion_tokens",
+    "completion_tokens_details",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "total_tokens"
+   ],
+   "model": "openai/glm-5.3",
+   "protocol": "anthropic",
+   "stream": false,
+   "usage": {
+    "completion_tokens": 8,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 7,
+     "rejected_prediction_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "prompt_tokens": 19,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "total_tokens": 27
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 0.64,
+   "keys": [
+    "completion_tokens",
+    "completion_tokens_details",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "total_tokens"
+   ],
+   "model": "openai/glm-5.3",
+   "protocol": "anthropic",
+   "stream": true,
+   "usage": {
+    "completion_tokens": 8,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 7,
+     "rejected_prediction_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "prompt_tokens": 19,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "total_tokens": 27
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 0.81,
+   "keys": [
+    "completion_tokens",
+    "completion_tokens_details",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "total_tokens"
+   ],
+   "model": "openai/glm-5.3",
+   "protocol": "responses",
+   "stream": false,
+   "usage": {
+    "completion_tokens": 8,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 7,
+     "rejected_prediction_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "prompt_tokens": 19,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "total_tokens": 27
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 0.76,
+   "keys": [
+    "completion_tokens",
+    "completion_tokens_details",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "total_tokens"
+   ],
+   "model": "openai/glm-5.3",
+   "protocol": "responses",
+   "stream": true,
+   "usage": {
+    "completion_tokens": 8,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 7,
+     "rejected_prediction_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "prompt_tokens": 19,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": null,
+     "video_tokens": null
+    },
+    "total_tokens": 27
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 0.87,
+   "keys": [
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "completion_tokens",
+    "completion_tokens_details",
+    "inference_geo",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "service_tier",
+    "speed",
+    "total_tokens"
+   ],
+   "model": "anthropic/glm-5.3-flash",
+   "protocol": "chat",
+   "stream": false,
+   "usage": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "completion_tokens": 8,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 8,
+     "rejected_prediction_tokens": null,
+     "text_tokens": 0,
+     "video_tokens": null
+    },
+    "inference_geo": null,
+    "prompt_tokens": 19,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cache_creation_tokens": 0,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": 19,
+     "video_tokens": null
+    },
+    "service_tier": null,
+    "speed": null,
+    "total_tokens": 27
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 0.88,
+   "keys": [
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "completion_tokens",
+    "completion_tokens_details",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "total_tokens"
+   ],
+   "model": "anthropic/glm-5.3-flash",
+   "protocol": "chat",
+   "stream": true,
+   "usage": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "completion_tokens": 8,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 8,
+     "rejected_prediction_tokens": null,
+     "text_tokens": 0,
+     "video_tokens": null
+    },
+    "prompt_tokens": 19,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cache_creation_tokens": 0,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": 19,
+     "video_tokens": null
+    },
+    "total_tokens": 27
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 0.8,
+   "keys": [
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "completion_tokens",
+    "completion_tokens_details",
+    "inference_geo",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "service_tier",
+    "speed",
+    "total_tokens"
+   ],
+   "model": "anthropic/glm-5.3-flash",
+   "protocol": "anthropic",
+   "stream": false,
+   "usage": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "completion_tokens": 8,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 8,
+     "rejected_prediction_tokens": null,
+     "text_tokens": 0,
+     "video_tokens": null
+    },
+    "inference_geo": null,
+    "prompt_tokens": 19,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cache_creation_tokens": 0,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": 19,
+     "video_tokens": null
+    },
+    "service_tier": null,
+    "speed": null,
+    "total_tokens": 27
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 1.07,
+   "keys": [
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "completion_tokens",
+    "completion_tokens_details",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "total_tokens"
+   ],
+   "model": "anthropic/glm-5.3-flash",
+   "protocol": "anthropic",
+   "stream": true,
+   "usage": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "completion_tokens": 8,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 8,
+     "rejected_prediction_tokens": null,
+     "text_tokens": 0,
+     "video_tokens": null
+    },
+    "prompt_tokens": 19,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cache_creation_tokens": 0,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": 19,
+     "video_tokens": null
+    },
+    "total_tokens": 27
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 0.8,
+   "keys": [
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "completion_tokens",
+    "completion_tokens_details",
+    "inference_geo",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "service_tier",
+    "speed",
+    "total_tokens"
+   ],
+   "model": "anthropic/glm-5.3-flash",
+   "protocol": "responses",
+   "stream": false,
+   "usage": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "completion_tokens": 8,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 8,
+     "rejected_prediction_tokens": null,
+     "text_tokens": 0,
+     "video_tokens": null
+    },
+    "inference_geo": null,
+    "prompt_tokens": 19,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cache_creation_tokens": 0,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": 19,
+     "video_tokens": null
+    },
+    "service_tier": null,
+    "speed": null,
+    "total_tokens": 27
+   },
+   "usage_type": "Usage"
+  },
+  {
+   "elapsed_s": 0.76,
+   "keys": [
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "completion_tokens",
+    "completion_tokens_details",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "total_tokens"
+   ],
+   "model": "anthropic/glm-5.3-flash",
+   "protocol": "responses",
+   "stream": true,
+   "usage": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "completion_tokens": 8,
+    "completion_tokens_details": {
+     "accepted_prediction_tokens": null,
+     "audio_tokens": null,
+     "image_tokens": null,
+     "reasoning_tokens": 8,
+     "rejected_prediction_tokens": null,
+     "text_tokens": 0,
+     "video_tokens": null
+    },
+    "prompt_tokens": 19,
+    "prompt_tokens_details": {
+     "audio_tokens": null,
+     "cache_creation_tokens": 0,
+     "cached_tokens": 0,
+     "image_tokens": null,
+     "text_tokens": 19,
+     "video_tokens": null
+    },
+    "total_tokens": 27
+   },
+   "usage_type": "Usage"
+  }
+ ],
+ "probe": "AC0 upstream usage shapes",
+ "prompt": "Reply with the single word: ok",
+ "recorded_at": "2026-10-25T10:59:25"
+}

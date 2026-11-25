@@ -182,8 +182,11 @@ def test_dry_run_unchanged_and_unknown_job_404(app_client) -> None:
 
 
 def test_contract_version_bumped_for_the_protocol_change() -> None:
-    """闸 B：真跑响应形状变了（submitted + job）⇒ 协议版本必须 +1，旧 CLI 被拒而不是误读。"""
-    assert ADMIN_CONTRACT_VERSION == 2
+    """闸 B：真跑响应形状变了（submitted + job）⇒ 协议版本必须 +1，旧 CLI 被拒而不是误读。
+
+    批 DS1a 又 +1（→ 3，见 `test_ds1a_strict_params.py`）；本条只钉 I30 那次不能回退。
+    """
+    assert ADMIN_CONTRACT_VERSION >= 2
 
 
 def test_failed_tombstone_reports_error_and_freezes_done(app_client, monkeypatch) -> None:

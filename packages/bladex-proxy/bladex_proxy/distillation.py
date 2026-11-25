@@ -834,7 +834,7 @@ class LLMDistiller:
             if self._api_key:
                 kwargs["api_key"] = self._api_key
 
-            response = router_sdk.completion(**kwargs)
+            response = router_sdk.completion(purpose="distill", **kwargs)
             raw_text = response.choices[0].message.content or ""
             finish_reason = _finish_reason(response)
 
@@ -866,7 +866,7 @@ class LLMDistiller:
                 retry_kwargs = dict(kwargs)
                 # MS-15：从**生效**预算放大（此前从配置值放大，输入越大越可能白重试）
                 retry_kwargs["max_tokens"] = max(int(kwargs["max_tokens"]) * 4, 2048)
-                response = router_sdk.completion(**retry_kwargs)
+                response = router_sdk.completion(purpose="distill", **retry_kwargs)
                 retry_text = response.choices[0].message.content or ""
                 # 重试更短（模型这次话少）时不倒退：取更可能解析成功的那份。
                 if retry_text.strip():
@@ -1051,7 +1051,7 @@ class LLMDistiller:
                 kwargs["api_base"] = self._api_base
             if self._api_key:
                 kwargs["api_key"] = self._api_key
-            resp = router_sdk.completion(**kwargs)
+            resp = router_sdk.completion(purpose="file_summary", **kwargs)
             obj = _extract_json_obj(resp.choices[0].message.content or "")
             if not obj:
                 return "", []
@@ -1143,7 +1143,7 @@ class LLMDistiller:
         retry_kwargs["messages"] = msgs
         try:
             self._call_count += 1
-            resp = router_sdk.completion(**retry_kwargs)
+            resp = router_sdk.completion(purpose="distill", **retry_kwargs)
             text = resp.choices[0].message.content or ""
             return _parse_distill_json(text, self._model,
                                        finish_reason=_finish_reason(resp))

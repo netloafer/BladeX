@@ -15,10 +15,13 @@ import asyncio
 import hashlib
 import math
 import os
+import shutil
+import threading
 import time
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping
-from datetime import datetime
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -64,7 +67,7 @@ from bladex_proxy.models import (
     JudgmentRecord,
     TaskStateJudgment,
 )
-from bladex_proxy.storage.memory_hub import MemoryHub
+from bladex_proxy.storage.memory_hub import HubRequiresNewerVersion, MemoryHub
 
 if TYPE_CHECKING:
     from bladex_core.attribution import JudgmentJournalProtocol
@@ -295,10 +298,76 @@ _DISTILL_LEDGER_PREFIX = "distill/"
 #: 拿它判"这句话蒸过没有"会次次 miss。这里只问内容，不问脉络。
 _DISCOURSE_MEMO_PREFIX = "seen_discourse/"
 _JUDGMENT_LEDGER_PREFIX = "judgment/"
+#: 批 AA · 步骤 5：写入时裁决的判决缓存（键 = 模型 + prompt 版本 + 单条候选完整输入的哈希）。
+#: 与 `distill/` 同性质——纯 LLM 产出缓存，`clear()` 不清；中断的暂存重建会被收割
+#: （`index_staging.HARVEST_PREFIXES`，两处字面量由守卫对账）。不同于 `judgment/`：
+#: 后者是**应用过的**判决台账（supersede 重放读它），缓存命中与否不改变语义。
+_ADJ_CACHE_PREFIX = "adjcache/"
+#: 批 AB · MQ-I27：嵌入台账。键 = sha256(模型身份 + 库版本与 dtype + 文本)，值 = float32 字节（缺失即现算）。
+#: 与 `distill/` 同性质、同收割；键里有模型身份和库版本（批 W21b · MQ-I45），换模型 / 换库都不读旧向量。
+#: 前缀不变 ⇒ 三张分类表、收割前缀、闭集守卫都不动；改键之前写的旧键留在库里但不再命中（回滚时重新可用）。
+_EMBED_CACHE_PREFIX = "embedcache/"
 #: G12.2 R5 新开/延续判定台账（ADR-0031 §14.1）。🔴 独立前缀，**不是** `judgment/`
 #: 的子空间（"judgment_taskstate/" 不以 "judgment/" 开头，scan_judgments 天然扫不到
 #: ——MS-17 命名空间共用事故的根治形态，verdict 白名单只是第二道保险）。
 _TASKSTATE_JUDGMENT_PREFIX = "judgment_taskstate/"
+#: 批 AA2 · MQ-I32：裁决解析型降级的**单条候选**重试计数（与 `_DISTILL_RETRY_PREFIX` 同形）。
+_ADJ_RETRY_PREFIX = "__meta__/p2_adjudicate_retry/"
+#: 批 BB · 2b（矛盾标记，默认关）：三个前缀三种命运，互不为前缀（都以 `/` 收尾）。
+#: `contradiction/<pair>`：标记 / 裁定的**物化视图**——Hub 管理事件（`audience_set` + `kind`）的派生物，
+#: 全量重建清掉后由 `_replay_admin_events` 重放回来（D8：标记集合来自 Hub，不来自模型）。
+_CONTRADICTION_PREFIX = "contradiction/"
+#: `contradiction_judged/<pair>/<sha>-<sha>`：判定台账（含否定、全文理由、解析失败计数）。纯 LLM 产出，
+#: 重建**不得**重判（设计 §6.4）⇒ 跨 full 保留；键含内容 sha，任一侧文字变了就是另一条。
+_CONTRADICTION_JUDGED_PREFIX = "contradiction_judged/"
+#: `contradiction_state/…`：pending / 日与每 fact 用量计数 / 新 fact 游标。运行状态，重启与重建都不清零。
+_CONTRADICTION_STATE_PREFIX = "contradiction_state/"
+
+# ── 批 AA2 · MQ-I37：Index meta 键前缀**闭集**（每个前缀必须且只能登记在一张表里）──
+#
+# 此前 `clear()` 是「列出来才删」：没列的一律**默认活过** clear()。`seen_discourse/`
+# 就是这样活下来的——它改变 full 的输入（已见话语整轮跳过、补采不发），于是 full
+# 的产出取决于「在哪个库上跑」而不只取决于 Hub（夹具 16 → 0；小 Hub 36 → 23）。
+# 现在三张表 + 守卫 `test_aa2_*::test_every_meta_prefix_is_classified`：新前缀不登记 = 红。
+#
+#: 派生产物：`clear()` 清（full 写入前清库）。
+_META_CLEARED: tuple[str, ...] = (
+    _FACT_PREFIX, _MATTER_PREFIX, _EDGE_PREFIX, _PROFILE_PREFIX,
+    _CONSUMED_PREFIX, _DISTILL_RETRY_PREFIX, _ADJ_RETRY_PREFIX, _INDEX_WATERMARK_KEY,
+    _CONTRADICTION_PREFIX,
+)
+#: 乙类 = 会改变 full 输入的状态：**full 开始时**清（clear() 太晚——它在蒸馏之后）。
+#: 本跑会重新写满它（增量要靠它省掉重复补采），所以 clear() 不再清第二遍。
+_META_RESET_AT_FULL_START: tuple[str, ...] = (_DISCOURSE_MEMO_PREFIX,)
+#: 跨 full 保留。甲 = Hub 内容的纯确定性缓存（带不带都不改变 full 的 fact 内容）；
+#: 丙 = 为跨重建稳定**有意**保留，只影响 id / 状态，不影响 fact 内容集合（理由见结算稿 AA2 §2）。
+_META_KEPT: dict[str, str] = {
+    _DISTILL_LEDGER_PREFIX: "甲",   # 键 = 源文 + 模型 + prompt 版本
+    _ADJ_CACHE_PREFIX: "甲",        # 键 = 模型 + ADJ_VER + 单条候选完整输入
+    _EMBED_CACHE_PREFIX: "甲",      # 键 = 模型身份 + 库版本与 dtype + 文本；batch=1 算，向量只取决于这三者
+    _RULEFILE_PREFIX: "甲",         # 规则文件正文副本：扫描时按内容哈希重新捕获
+    _JUDGMENT_LEDGER_PREFIX: "丙",  # L4 链接（matter 归属）+ 取代判决重放（t_invalid）
+    _TASKSTATE_JUDGMENT_PREFIX: "丙",  # 新开 / 延续判定（matter_id 稳定，ADR-0031 §14.1）
+    _PROJECT_PREFIX: "丙",          # Project 记录（含 CLI 手动识别；dashboard 读）
+    _FILEHASH_PREFIX: "丙",         # 文件内容索引去重，与 LanceDB files 表同生同灭
+    _EMBED_MODEL_KEY: "丙",         # 向量空间盖章（不变量）
+    _LIFECYCLE_LAST_RUN_KEY: "丙",  # 生命周期重算节流戳
+    _CONTRADICTION_JUDGED_PREFIX: "丙",  # 批 BB · 2b：判定台账；重建不重判（不进收割：不是 Hub 内容的纯函数缓存）
+    _CONTRADICTION_STATE_PREFIX: "丙",   # 批 BB · 2b：pending / 用量计数 / 游标，重启与重建都不清零
+    "__meta__/fact_corrected_ids": "丙",               # 用户更正集合；full 重放 FACT_CORRECT 重写
+    "__meta__/admin_events_replay_watermark": "丙",    # 增量重放水位；full 重放末尾重设
+}
+#: 暂存收割（I34）只许取甲类里的纯 LLM 产出缓存（守卫对账）。
+_META_HARVESTABLE: tuple[str, ...] = (
+    _DISTILL_LEDGER_PREFIX, _ADJ_CACHE_PREFIX, _EMBED_CACHE_PREFIX)
+
+def _contradiction_kinds() -> frozenset[str]:
+    """矛盾载荷 `kind` 闭集（唯一来源 `bladex_core.consistency.KINDS`；延迟取，免得 import 期多挂一层依赖）。"""
+    from bladex_core.consistency import KINDS
+
+    return KINDS
+
+
 _INDEX_JOURNAL_SEQ = 0
 """进程级单调序号（judgment 台账 seq，ADR-0020 T1.3）。"""
 
@@ -499,10 +568,21 @@ def _dedupe_aliases(title: str, entities: list[str]) -> list[str]:
     return out
 
 
+#: `FastEmbedAdapter` 的输出 dtype（理由见类 docstring）。改它 = 改 `embedcache/` 的键。
+_EMBED_OUTPUT_DTYPE = "float32"
+
+
 class FastEmbedAdapter:
     """fastembed 适配器 — multilingual-e5-large 本地推理（ADR-0008 §6.5）。
 
     可被 mock 替换（单测不跑真模型）。
+
+    🔴 **输出恒为 float32 取值的 Python float**（批 W21b，MQ-W21）。fastembed 0.8 吐 float64、0.9 吐
+    float32，`list(e)` 把 numpy 标量原样漏出去：`np.float64` 恰好是 `float` 的子类，能过
+    `json.dumps`，`np.float32` 不是 ⇒ 0.9.1 下 embed 服务每次回包都失败（11-03 第二次合并重启）。
+    选 float32 而不是 float64：LanceDB 列与 `embedcache/` 存的本来就是 float32，判重阈值 0.98 / 0.90
+    也一直在 float32 向量上比（`put_embedding` 的字节往返）；统一后「刚算出来的」「台账命中的」
+    「库里读出来的」是同一个值，两个 fastembed 版本的输出也不再差一次舍入。
     """
 
     def __init__(
@@ -519,6 +599,7 @@ class FastEmbedAdapter:
         self._model: Any = None
         self._failed: bool = False
         self._fail_reason: str = ""
+        self._fingerprint: str = ""
 
     @property
     def available(self) -> bool:
@@ -566,12 +647,18 @@ class FastEmbedAdapter:
         reembed_index），无历史兼容负担。"""
         return "e5" in self._model_name.lower()
 
+    def _embed_plain(self, prefixed: list[str]) -> list[list[float]]:
+        """模型输出 → float32 取值的纯 Python float（类型与取值都不随 fastembed 版本变）。"""
+        import numpy as np
+
+        return [np.asarray(e, dtype=_EMBED_OUTPUT_DTYPE).tolist() for e in self._model.embed(prefixed)]
+
     def embed(self, texts: list[str]) -> list[list[float]]:
         """把文本列表嵌入成向量列表（passage 语义，历史行为）。"""
         self._ensure_model()
         # e5 模型需要在文本前加 "query: " 或 "passage: " 前缀；非 e5 原文直嵌
         prefixed = [f"passage: {t}" for t in texts] if self._is_e5 else list(texts)
-        return [list(e) for e in self._model.embed(prefixed)]
+        return self._embed_plain(prefixed)
 
     def embed_passage(self, texts: list[str]) -> list[list[float]]:
         """passage 语义嵌入 = embed()（前缀 adapter 内部处理）。"""
@@ -587,7 +674,7 @@ class FastEmbedAdapter:
         """
         self._ensure_model()
         prefixed = [f"passage: query: {t}" for t in texts] if self._is_e5 else list(texts)
-        return [list(e) for e in self._model.embed(prefixed)]
+        return self._embed_plain(prefixed)
 
     @property
     def model_name(self) -> str:
@@ -597,6 +684,37 @@ class FastEmbedAdapter:
     def model_identity(self) -> str:
         """向量空间身份标识（Memory Index model_id 不变量用）。"""
         return f"local:{self._model_name}"
+
+    @property
+    def vector_fingerprint(self) -> str:
+        """算出这些向量的库版本与输出 dtype（`embedcache/` 键用，MQ-I45）。
+
+        带 onnxruntime：调度 10-22 实测它变了向量差到 8.6e-4，比 fastembed 换版大得多。
+        """
+        if not self._fingerprint:
+            from importlib import metadata
+
+            def ver(pkg: str) -> str:
+                try:
+                    return metadata.version(pkg)
+                except metadata.PackageNotFoundError:
+                    return "unknown"
+
+            self._fingerprint = (f"fastembed={ver('fastembed')};ort={ver('onnxruntime')};"
+                                 f"dtype={_EMBED_OUTPUT_DTYPE}")
+        return self._fingerprint
+
+
+@dataclass
+class _ScanState:
+    """`MemoryIndex._scan_with_cursor` 的进程内状态。"""
+    cursors: dict[str, str]         # session 前缀 -> 已见最大 key
+    known: set[str]                 # 见过的全部 key（对账判「漏」用）
+    prev_of: dict[str, str]         # key -> 同 session 上一轮 key（与全扫同一张表）
+    pending: dict[str, str]         # 还没消费的 key -> ts
+    tombstones: int                 # 建状态时的墓碑条数（变了就全扫）
+    last_full: float                # 上次全扫的 monotonic
+    rounds: int = 0                 # 上次全扫之后走了几趟游标
 
 
 class _LanceDBNoveltyChecker:
@@ -902,6 +1020,7 @@ class MemoryIndex:
         self._ann_last_maintain_ts: float = 0.0
         # MQ-W19：上次 maintain_projects 重算**之后**的输入指纹（None = 本进程还没算过）
         self._projects_inputs_fp: str | None = None
+        self._project_identity_seen: set[tuple[str, str]] = set()
         self._distiller = distiller
         # ADR-0018 §3.2: L4 链接裁决器 + top-k 召回（注入后归属走五层链接）
         self._link_judge = link_judge
@@ -913,11 +1032,21 @@ class MemoryIndex:
         self._meta_db: Rdict | None = None
         # G4: manual edge 反向索引缓存（target_key -> MatterEdge），惰性构建
         self._manual_edge_cache: dict[str, MatterEdge] | None = None
+        # 批 AB · MQ-W17 ②：增量扫描的 session 游标（进程内；None = 下一趟全扫）
+        self._scan_state: _ScanState | None = None
+        # 批 AB · MQ-W17 ③：画像输入指纹（进程内；重启后先渲染一次）
+        self._profile_inputs_fp: str | None = None
         self._lancedb: Any = None
         self._table: Any = None
         self._matter_table: Any = None  # ADR-0012: LanceDB matters 表
         # A1/T3: secondary 追新节流时间戳（monotonic）
         self._last_catchup_monotonic: float = 0.0
+        # 批 AB · MQ-I38：读端发现目录被换名后自己重开（见 `_reopen_if_swapped`）
+        self._index_ino: int | None = None
+        self._last_ino_check: float = 0.0
+        self._reopen_not_before: float = 0.0
+        self._reopen_lock = threading.Lock()
+        self._reopening = False
         # ADR-0028 E6.2：词法第二路（SQLite FTS5 / trigram）。惰性打开；
         # 打不开就整体禁用（degraded 不崩，dense 主路径不受影响）。
         self._fts: Any = None
@@ -929,6 +1058,13 @@ class MemoryIndex:
         self._files_tbl: Any = None
         # 模型产出文件的本地副本（内容寻址；只有 origin=produced 用）
         self._blobs: Any = None
+        # 批 AA · MQ-I34：暂存重建期间为真（防递归），以及换名前自检用的写入账。
+        # None = 不在暂存重建里（零开销）；clear() 时清零——只记"清库之后写进去的"。
+        self._staging_active = False
+        self._stage_track: dict[str, set[str]] | None = None
+        # 批 AA2 · MQ-I32：重建 pass 内的副作用暂存（memo 标记 / 增量画像更新）。
+        # None = 不在 pass 里（直接落库）；pass 成功提交才写，中止即丢。
+        self._pass_pending: dict[str, Any] | None = None
 
     def open(self) -> None:
         """打开 Memory Index 存储（RocksDB + LanceDB）。
@@ -959,6 +1095,22 @@ class MemoryIndex:
                 )
         else:
             self._meta_db = Rdict(str(self._path / "meta_rocksdb"))
+        self._open_vector_store()
+
+        # embedding 后端可选化：向量空间 model_id 不变量校验（换模型必须先重嵌）
+        self._check_embed_model_invariant()
+
+        logger.info("index_opened", path=str(self._path),
+                    lancedb=self._lancedb is not None,
+                    table=self._table is not None,
+                    secondary=self._read_only)
+
+    def _open_vector_store(self) -> None:
+        """打开 LanceDB 连接与 facts / matters 表句柄（不碰 meta）。
+
+        从 `open()` 拆出（批 AA）：暂存重建失败时要把**仍开着的**生产 meta 句柄接回来，
+        只重开向量侧——重开 RocksDB 会轮转 MANIFEST/WAL，生产目录就不再逐字节不变了。
+        """
         try:
             import lancedb
             self._lancedb = lancedb.connect(str(self._path / "lancedb"))
@@ -987,14 +1139,6 @@ class MemoryIndex:
                 self._matter_table = None
         else:
             self._matter_table = None
-
-        # embedding 后端可选化：向量空间 model_id 不变量校验（换模型必须先重嵌）
-        self._check_embed_model_invariant()
-
-        logger.info("index_opened", path=str(self._path),
-                    lancedb=self._lancedb is not None,
-                    table=self._table is not None,
-                    secondary=self._read_only)
 
     def _write_embed_stamp_sidecar(self, model_id: str) -> None:
         """把向量空间身份同时写成纯文本侧车 `<index>/embed_model_id`。
@@ -1239,6 +1383,8 @@ class MemoryIndex:
         ``Not implemented: Supported only by secondary instance``，此前每小时 ~1,400 条
         ``index_catch_up_failed`` 全是这条假失败，把 proxy 侧真正的追新失败淹掉。
         """
+        if self._read_only:
+            self._reopen_if_swapped()
         if self._meta_db is None or not self._read_only:
             return
         now = time.monotonic()
@@ -1249,6 +1395,62 @@ class MemoryIndex:
             self._meta_db.try_catch_up_with_primary()
         except Exception as e:
             logger.debug("index_catch_up_failed", error=str(e))
+
+    # ── 批 AB · MQ-I38：full 换名后读端自己换句柄（取代「重启 proxy」的告警 hint）──
+
+    _REOPEN_RETRY_S = 60.0
+
+    def _reopen_if_swapped(self) -> None:
+        """Index 目录 inode 变了 = 被换名（I34）。在后台开新句柄，本线程继续读旧库，热路径不等。"""
+        now = time.monotonic()
+        if now - self._last_ino_check < self._catchup_throttle_s:
+            return
+        self._last_ino_check = now
+        try:
+            ino = os.stat(self._path).st_ino
+        except OSError:
+            return
+        if self._index_ino is None:
+            self._index_ino = ino
+            return
+        if ino == self._index_ino or now < self._reopen_not_before:
+            return
+        with self._reopen_lock:
+            if self._reopening:
+                return
+            self._reopening = True
+        threading.Thread(target=self._reopen_reader, args=(ino,), daemon=True,
+                         name="index-reader-reopen").start()
+
+    def _reopen_reader(self, ino: int) -> None:
+        """开新句柄 → 锁内替换。旧句柄不主动 close：替换后这里不再持有它，在途读还拿着引用，
+        最后一个引用释放时才真正关闭（Rdict / LanceDB 的句柄都按引用计数）——不靠任何等待时长猜。
+        打开失败 ⇒ 留在旧库、告警、过一会儿再试。
+        """
+        t0 = time.perf_counter()
+        try:
+            fresh = MemoryIndex(self._path, embedder=self._embedder, read_only=True,
+                                embed_model_id=self._embed_model_id)
+            fresh.open()
+            with self._reopen_lock:
+                self._meta_db, self._lancedb = fresh._meta_db, fresh._lancedb
+                self._table, self._matter_table = fresh._table, fresh._matter_table
+                self._files_tbl, self._blobs = None, None
+                self._fts, self._fts_tried = None, False      # 惰性重开，旧连接随引用释放
+                self._manual_edge_cache = None
+                self._kw_map, self._kw_map_stamp = None, -1
+                self._entity_freq_cache = None
+                self._has_entities_col_cached = None
+                old_ino, self._index_ino = self._index_ino, ino
+            logger.warning("index_reader_reopened", path=str(self._path), old_ino=old_ino,
+                           new_ino=ino, ms=round((time.perf_counter() - t0) * 1000, 1))
+        except Exception as e:  # noqa: BLE001 —— 打不开就继续读旧库，绝不让读路径出错
+            self._reopen_not_before = time.monotonic() + self._REOPEN_RETRY_S
+            logger.warning("index_reader_reopen_failed", path=str(self._path), error=str(e),
+                           hint="still serving the previous Index; will retry")
+        finally:
+            with self._reopen_lock:
+                self._reopening = False
 
     def _refresh_lance_read(self) -> None:
         """LanceDB 读视图刷新：checkout_latest（让 search 看到 consolidator 新写）。"""
@@ -1307,6 +1509,72 @@ class MemoryIndex:
             return None
         return DistillRecord.model_validate(msgpack.unpackb(raw, raw=False))
 
+    def get_adjudication(self, key: str) -> dict[str, Any] | None:
+        """读裁决判决缓存（批 AA · 步骤 5）。key 由裁决器按单条候选的完整输入算出。"""
+        db = self.meta_db
+        if db is None:
+            return None
+        raw = db.get(f"{_ADJ_CACHE_PREFIX}{key}".encode())
+        return None if raw is None else msgpack.unpackb(raw, raw=False)
+
+    def put_adjudication(self, key: str, rec: dict[str, Any]) -> None:
+        """写裁决判决缓存（write-if-absent，同 distill/ 台账语义；`clear()` 不清）。"""
+        db = self.meta_db
+        if db is None:
+            return
+        k = f"{_ADJ_CACHE_PREFIX}{key}".encode()
+        if db.get(k) is None:
+            db[k] = msgpack.packb(rec, use_bin_type=True)
+
+    @staticmethod
+    def _embed_cache_key(identity: str, text: str) -> bytes:
+        h = hashlib.sha256(f"{identity}\x00{text}".encode()).hexdigest()[:32]
+        return f"{_EMBED_CACHE_PREFIX}{h}".encode()
+
+    def _embed_cache_scope(self, identity: str) -> str | None:
+        """台账键的「谁算的」部分 = 模型身份 + 库版本与 dtype（批 W21b · MQ-I45）。
+
+        🔴 版本取 embedder 自己报的：IPC 档向量是 embed 服务算的，版本要以服务端为准，
+        客户端进程的 `importlib.metadata` 答不了（`uv sync` 了但 embed 服务没重启时两边不同）。
+        报空串 = 此刻不知道谁算的（握手失败）⇒ 返回 None，这次不读不写，只多算一次。
+        没这个属性的后端（api：版本在远端，模型名就是能知道的全部）按固定标记分桶。
+        """
+        if not hasattr(self._embedder, "vector_fingerprint"):
+            return f"{identity}\x00unversioned"
+        fp = self._embedder.vector_fingerprint
+        return f"{identity}\x00{fp}" if fp else None
+
+    def get_embeddings(self, identity: str, texts: list[str]) -> dict[str, list[float]]:
+        """批 AB · MQ-I27：读嵌入台账，只返回命中的。"""
+        import numpy as np
+
+        db = self.meta_db
+        scope = self._embed_cache_scope(identity)
+        if db is None or scope is None:
+            return {}
+        out: dict[str, list[float]] = {}
+        for text in texts:
+            raw = db.get(self._embed_cache_key(scope, text))
+            if raw is not None:
+                out[text] = np.frombuffer(raw, dtype=np.float32).tolist()
+        return out
+
+    def put_embedding(self, identity: str, text: str, vector: Any) -> list[float]:
+        """写嵌入台账（write-if-absent），返回**经 float32 字节往返后**的向量。
+
+        冷算与命中必须拿到同一个值，否则第一跑和第二跑的判重比的不是同一批数。
+        """
+        import numpy as np
+
+        raw = np.asarray(vector, dtype=np.float32).tobytes()
+        db = self.meta_db
+        scope = self._embed_cache_scope(identity)
+        if db is not None and not self._read_only and scope is not None:
+            key = self._embed_cache_key(scope, text)
+            if db.get(key) is None:
+                db[key] = raw
+        return np.frombuffer(raw, dtype=np.float32).tolist()
+
     def discourse_seen(self, text: str, prompt_ver: str) -> bool:
         """这条话语在**任何**轮次里被蒸过吗（纯内容判定）。
 
@@ -1317,7 +1585,10 @@ class MemoryIndex:
         if db is None:
             return False
         h = hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
-        return db.get(f"{_DISCOURSE_MEMO_PREFIX}{h}/{prompt_ver}".encode()) is not None
+        k = f"{_DISCOURSE_MEMO_PREFIX}{h}/{prompt_ver}".encode()
+        if self._pass_pending is not None and k in self._pass_pending["memo"]:
+            return True
+        return db.get(k) is not None
 
     def mark_discourse(self, text: str, prompt_ver: str, ledger_key: str = "") -> None:
         """标记这条话语已蒸。值存首次蒸它的轮次，供审计"它是在哪被吃进去的"。
@@ -1328,8 +1599,14 @@ class MemoryIndex:
         if db is None:
             return
         h = hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
-        db[f"{_DISCOURSE_MEMO_PREFIX}{h}/{prompt_ver}".encode()] = (
-            ledger_key or "1").encode()
+        k = f"{_DISCOURSE_MEMO_PREFIX}{h}/{prompt_ver}".encode()
+        if self._pass_pending is not None:
+            # 批 AA2 · MQ-I32：重建 pass 期间只记账，**提交时**才落库；pass 中止 = 丢弃。
+            # 此前当场写：中止的 pass 已把补采话语标成"蒸过"，重试 pass 便不再补采，
+            # 那些 fact 永久缺席（实验 I：36 → 23）。
+            self._pass_pending["memo"].setdefault(k, (ledger_key or "1").encode())
+            return
+        db[k] = (ledger_key or "1").encode()
 
     def append_judgment(
         self, fact_id: str, candidates: list[dict], verdict: str, judge_model: str,
@@ -1484,6 +1761,8 @@ class MemoryIndex:
         meta = fact.model_dump(mode="json", exclude={"embedding"})
         key = f"{_FACT_PREFIX}{fact.id}"
         self.meta_db[key.encode()] = msgpack.packb(meta, use_bin_type=True)
+        if self._stage_track is not None:
+            self._stage_track["written"].add(fact.id)
 
         # 存向量到 LanceDB
         # ADR-0028 E1.3（F2 止血）：file_ref 退出向量检索平面——只写 meta，不写 LanceDB。
@@ -1493,6 +1772,8 @@ class MemoryIndex:
             logger.debug("index_fact_vector_skipped_file_ref", fact_id=fact.id)
         elif fact.embedding is not None and self._lancedb is not None:
             self._add_to_lancedb(fact)
+            if self._stage_track is not None:
+                self._stage_track["vec"].add(fact.id)
 
         # ADR-0028 E6.2：词法倒排同步（单写者 = consolidator；file_ref 不入、
         # t_invalid 非空则删——与向量平面同边界）。
@@ -2180,6 +2461,8 @@ class MemoryIndex:
     # ── U10（ADR-0026 R5）：画像卡——被动捕获 + 工具计数器 + 渲染 ──
 
     def _profile_get(self, key: str) -> dict:
+        if self._pass_pending is not None and key in self._pass_pending["profile"]:
+            return dict(self._pass_pending["profile"][key])
         raw = self.meta_db.get(key.encode()) if self.meta_db is not None else None
         if raw is None:
             return {}
@@ -2189,7 +2472,23 @@ class MemoryIndex:
             return {}
 
     def _profile_put(self, key: str, data: dict) -> None:
+        if self._pass_pending is not None and key.startswith(_PROFILE_PREFIX):
+            # 批 AA2 · MQ-I32：画像（工具计数器等）不是幂等的——中止的 pass 当场写了，
+            # 重试 pass 会把同一批轮次再数一遍。pass 内只记账，提交时才落库。
+            self._pass_pending["profile"][key] = dict(data)
+            return
         self.meta_db[key.encode()] = msgpack.packb(data, use_bin_type=True)
+
+    def _commit_pass_pending(self) -> None:
+        """批 AA2：本 pass 的副作用落库（只在 pass 成功、即将写事实时调）。"""
+        pend, self._pass_pending = self._pass_pending, None
+        if not pend or self.meta_db is None:
+            return
+        for k, v in pend["memo"].items():
+            if self.meta_db.get(k) is None:          # 值 = 首次蒸它的轮次，先到先得
+                self.meta_db[k] = v
+        for key, data in pend["profile"].items():
+            self.meta_db[key.encode()] = msgpack.packb(data, use_bin_type=True)
 
     def update_profiles_from_turn(self, turn: Any, uid: str) -> None:
         """U10：从一条 Memory Hub Turn 确定性更新画像存储（rebuild 侧调用，gated）。
@@ -2575,10 +2874,13 @@ class MemoryIndex:
         Index 的 meta key 全部以 bytes 写入（`f"...".encode()` / bytes 常量），
         故 bytes 前缀 seek 覆盖 `startswith` 全扫看得到的每一条。
         """
-        import hashlib
+        return self._meta_prefixes_fingerprint(self._PROJECT_INPUT_PREFIXES)
 
+    def _meta_prefixes_fingerprint(self, prefixes: Iterable[str], *, extra: bytes = b"") -> str:
+        """若干 meta 前缀下全部 key + value 的逐字节指纹（W19 判据的公共实现）。"""
         h = hashlib.blake2b(digest_size=16)
-        for prefix in self._PROJECT_INPUT_PREFIXES:
+        h.update(extra)
+        for prefix in prefixes:
             p = prefix.encode()
             h.update(b"\x00" + p)
             for key_raw, value_raw in self.meta_db.items(from_key=p):
@@ -2593,50 +2895,119 @@ class MemoryIndex:
         return h.hexdigest()
 
     def _maintain_projects_recompute(self) -> int:
-        """`maintain_projects` 的重算本体（MQ-W19 前的函数体原样，不含短路）。"""
-        from bladex_core.project import Project, name_from_root, project_id_for
+        """`maintain_projects` 的重算本体（MQ-W19 前的函数体，不含短路）。
+
+        批 BA2（MQ-I36）：根目录一律取「绝对路径的父目录」。旧写法 `path.rsplit("/", 1)[0]`
+        对裸文件名返回文件名本身，生产唯一的 Project 就是这样来的（root_path=`AGENTS.md`）。
+        裸文件名 / 相对路径认不出是哪个仓库 ⇒ 如实计数、不造 Project，也不硬挂。
+        """
+        from bladex_core.project import Project
 
         roots: set[str] = set()
+        bare = relative = 0
         for f in self.all_facts():
             if f.item_kind != ItemKind.FILE_REF:
                 continue
             path = (getattr(f, "subject", "") or "").replace("\\", "/")
             name = path.rsplit("/", 1)[-1].lower()
             if name in ("claude.md", "agents.md", "agent.md", ".cursorrules"):
-                root = path.rsplit("/", 1)[0]
-                if root:
-                    roots.add(root)
+                if "/" not in path:
+                    bare += 1
+                elif not path.startswith("/"):
+                    relative += 1
+                else:
+                    root = path.rsplit("/", 1)[0]
+                    if root:
+                        roots.add(root)
+        if bare or relative:
+            logger.info("index_project_root_skipped", bare=bare, relative=relative)
         n = 0
         for root in sorted(roots):
-            pid = project_id_for(root)
+            pid, real_root, name = self._project_key_for_root(root)
             proj = self.get_project(pid) or Project(
-                project_id=pid, root_path=root, name=name_from_root(root))
+                project_id=pid, root_path=real_root, name=name)
             self.upsert_project(proj)
-            self.link_matters_to_project(pid, root)
+            self.link_matters_to_project(pid, proj.root_path)
             self.refresh_project_fields(pid)
             n += 1
         return n
+
+    @staticmethod
+    def _project_key_for_root(root: str) -> tuple[str, str, str]:
+        """根目录 → (项目键, 根, 名)。**与账本 scope 的 `identity.project_id` 同一实现**（MQ-A75 甲）。
+
+        目录还在 ⇒ `resolve_project`；不在了 / 认不出 ⇒ `project_id_for`（git-root 档同公式）。
+        """
+        from bladex_core.project import name_from_root, project_id_for
+
+        from bladex_proxy.project_identity import resolve_project
+
+        ident = resolve_project(root)
+        if ident.project_id:
+            return ident.project_id, ident.root or root, ident.name or name_from_root(root)
+        return project_id_for(root), root, name_from_root(root)
 
     def discover_project_from_paths(self, paths: list[str]) -> str:
         """ADR-0028 E7.2 识别②：同 session 内 tool 路径的高频公共前缀（≥5 次、深度 ≥2）。
 
         返回新建/命中的 project_id（识别不出返回空串——识别不出就不识别，不猜）。
         """
-        from bladex_core.project import (
-            Project,
-            infer_root_from_paths,
-            name_from_root,
-            project_id_for,
-        )
+        from bladex_core.project import Project, infer_root_from_paths
 
         root = infer_root_from_paths(paths)
         if not root or self._read_only:
             return ""
-        pid = project_id_for(root)
+        pid, real_root, name = self._project_key_for_root(root)
         if self.get_project(pid) is None:
-            self.upsert_project(Project(project_id=pid, root_path=root,
-                                        name=name_from_root(root)))
+            self.upsert_project(Project(project_id=pid, root_path=real_root, name=name))
         return pid
+
+    def note_project_identity(self, project_id: str, *, name: str = "", root: str = "",
+                              agent_id: str = "") -> bool:
+        """轮次自带的项目身份写进 Project 表（批 BA2，MQ-A75 甲）。返回是否写了。
+
+        这是 Project 键与账本 scope 键逐字一致的来源：值就是 `identity.project_id`。
+        不做 link / refresh——那两步每个 Project 一次全库扫描（MQ-W19 实测 57 s），
+        而识别②之外的 Matter 目前也挂不上（file_ref 多为相对路径，MQ-I8），这里只保证键。
+        同一 (项目, agent) 进程内只写一次，不给 W19 指纹添抖动。
+        """
+        from bladex_core.project import Project, canonical_project_id, name_from_root
+
+        pid = canonical_project_id(project_id or "")
+        if not pid or self._read_only:
+            return False
+        self._ensure_meta_db()
+        # 键带 bool(root)：早期有轮次身份里没记根（生产 p-10ad 4 轮），先见到它不能挡住后面带根的。
+        seen_key = (pid, agent_id, bool(root))
+        if self.meta_db is None or seen_key in self._project_identity_seen:
+            return False
+        self._project_identity_seen.add(seen_key)
+        proj = self.get_project(pid)
+        changed = proj is None
+        if proj is None:
+            proj = Project(project_id=pid, root_path=root,
+                           name=name or (name_from_root(root) if root else ""))
+        if root and not proj.root_path:
+            proj.root_path = root
+            proj.name = proj.name or name or name_from_root(root)
+            changed = True
+        if agent_id and agent_id not in proj.agent_ids:
+            proj.agent_ids = sorted([*proj.agent_ids, agent_id])
+            changed = True
+        if not changed:
+            return False
+        self.upsert_project(proj)
+        return True
+
+    def delete_project(self, project_id: str) -> bool:
+        """删一条 Project 记录（派生层，Hub 不动）。返回是否存在过。"""
+        self._ensure_meta_db()
+        key = f"{_PROJECT_PREFIX}{project_id}".encode()
+        if self.meta_db is None or self._read_only or self.meta_db.get(key) is None:
+            return False
+        del self.meta_db[key]
+        logger.info("index_project_deleted", project_id=project_id)
+        return True
 
     # ── ADR-0028 E7.2：Project 实体（主题轴最上层）──
 
@@ -3000,6 +3371,26 @@ class MemoryIndex:
         """
         if self._read_only:
             return 0
+        # 批 AB · MQ-W17 ③（W19 同形）：输入没变就不重写。全量渲染 5.2 s，是修后空载轮的最大项。
+        # 判据 = 渲染读到的全部前缀 + **日期桶**：`build_user_md` 有 7 天窗口（只读时钟），
+        # 不带日期，内容不变时窗口滑过去画像也不会更新。指纹取在写之后（写会改 updated_at）。
+        self._ensure_meta_db()
+        if self.meta_db is None:
+            return 0
+        day = datetime.now(UTC).date().isoformat().encode()
+        fp = self._meta_prefixes_fingerprint(self._PROFILE_INPUT_PREFIXES, extra=day)
+        if fp == self._profile_inputs_fp:
+            logger.info("index_profile_docs_skipped", reason="inputs_unchanged")
+            return 0
+        n = self._render_profile_docs()
+        self._profile_inputs_fp = self._meta_prefixes_fingerprint(
+            self._PROFILE_INPUT_PREFIXES, extra=day)
+        return n
+
+    # 渲染读的全部前缀：all_facts（fact/）；get_tool_stats（profile/）；get_rule_files（profile/ + rulefile/）。
+    _PROFILE_INPUT_PREFIXES: tuple[str, ...] = (_FACT_PREFIX, _PROFILE_PREFIX, _RULEFILE_PREFIX)
+
+    def _render_profile_docs(self) -> int:
         users, agents = set(), set()
         for f in self.all_facts():
             if f.source_user_id:
@@ -3341,26 +3732,25 @@ class MemoryIndex:
         return sum(1 for k in self.meta_db.keys()
                    if (k.decode() if isinstance(k, bytes) else str(k)).startswith(_FACT_PREFIX))
 
-    def clear(self) -> None:
-        """清空 Memory Index（用于重建）。"""
-        # 清 metadata（含 fact / matter / edge / 消费游标 / 遗留水位）
-        # 🔴 有意不清（ADR-0018 §4.1 收录原则：不可确定性重算的记录）：
-        #   distill/ ｜ judgment/ ｜ judgment_taskstate/（G12.2 新开判定——清了它，
-        #   重放的首轮集合就随旋钮漂，matter_id 跟着漂 = §0.1b 重演）｜ __meta__/*
-        # 想"顺手清干净"之前先读 ADR-0031 §14.1。
-        keys_to_delete = []
+    def _delete_meta_prefixes(self, prefixes: tuple[str, ...]) -> list[Any]:
+        """删掉 meta 里以这些前缀开头的全部键（前缀闭集见 `_META_CLEARED` 一族）。"""
+        pre = tuple(prefixes)
+        doomed = []
         for key_raw in self.meta_db.keys():
             key_str = key_raw.decode() if isinstance(key_raw, bytes) else str(key_raw)
-            if (key_str.startswith(_FACT_PREFIX)
-                    or key_str.startswith(_MATTER_PREFIX)
-                    or key_str.startswith(_EDGE_PREFIX)
-                    or key_str.startswith(_CONSUMED_PREFIX)
-                    or key_str.startswith(_DISTILL_RETRY_PREFIX)
-                    or key_str.startswith(_PROFILE_PREFIX)
-                    or key_str == _INDEX_WATERMARK_KEY):
-                keys_to_delete.append(key_raw)
-        for k in keys_to_delete:
+            if key_str.startswith(pre):
+                doomed.append(key_raw)
+        for k in doomed:
             del self.meta_db[k]
+        return doomed
+
+    def clear(self) -> None:
+        """清空 Memory Index（用于重建）。"""
+        # 清 metadata：只清 `_META_CLEARED`（派生产物）。保留什么、为什么保留，
+        # 见模块顶部三张表（批 AA2 起闭集化：新前缀不登记，守卫红）。
+        # 🔴 judgment_taskstate/ 等丙类的保留理由：清了它，重放的首轮集合就随旋钮漂，
+        # matter_id 跟着漂 = §0.1b 重演。想"顺手清干净"之前先读 ADR-0031 §14.1。
+        keys_to_delete = self._delete_meta_prefixes(_META_CLEARED)
 
         # ADR-0028 E6.2：词法倒排随库清（rebuild 时重建）
         fts = self._ensure_fts()
@@ -3381,6 +3771,8 @@ class MemoryIndex:
             self._matter_table = None
 
         self._invalidate_manual_edge_cache()
+        if self._stage_track is not None:      # 批 AA：自检只认清库之后的写入
+            self._stage_track = {"written": set(), "vec": set()}
         logger.info("index_cleared", deleted_keys=len(keys_to_delete))
 
     # ── ADR-0012 §3.1/3.2: Matter 卡 + 归属边存储 ──
@@ -3533,10 +3925,16 @@ class MemoryIndex:
                     logger.warning("index_ann_drop_failed", table=table_name,
                                    name=idx_name, error=str(e))
 
+        # 批 AA · MQ-W22：lancedb ≥0.34 的统一 API（旧的 metric/num_partitions 关键字形态
+        # 已弃用、将被删）。参数逐项等价：列 vector、cosine、同一分区数、replace=True（旧默认）。
+        from lancedb.index import IvfFlat
+        if params["index_type"] != "IVF_FLAT":
+            raise ValueError(f"unsupported ANN index type {params['index_type']!r}")
         table.create_index(
-            metric="cosine",
-            num_partitions=params["num_partitions"],
-            index_type=params["index_type"],
+            "vector",
+            config=IvfFlat(distance_type="cosine",
+                           num_partitions=params["num_partitions"]),
+            replace=True,
         )
         logger.info("index_ann_index_created", table=table_name,
                     num_partitions=params["num_partitions"],
@@ -4594,6 +4992,35 @@ class MemoryIndex:
                 out[edge.matter_id].append(edge)
         return out
 
+    def get_matter_members(
+        self, matter_ids: Iterable[str], top_k: int = 5,
+    ) -> dict[str, tuple[Matter, list[MatterEdge], list[Fact] | None]]:
+        """批量取多张 Matter 的「卡 + 归属边 + 成员 fact」——**一次**全扫 meta（MQ-I41，批 DS1b）。
+
+        逐个取（`get_edges` + `get_facts_for_matter`）每张卡要全扫两遍：生产快照 329 张
+        = 658 遍 = 66.6 s（批 DS1a §5）。这里边走 `get_edges_for_matters` 一遍分组；卡与
+        成员 fact 都是按 key 点查（`get_matter` / `get_fact`），不再扫。成员 fact 的排序 /
+        可见性 / 截断仍是 `get_facts_for_matter` 那一份（传入已分组的边），与逐个取逐条相同。
+
+        返回 `{matter_id: (matter, edges, facts)}`；卡不存在的 id 不出现（照实缺席）。
+        `facts=None` = 取成员时抛了异常（已记日志）——调用方按逐个取的口径当空列表。
+        只读，不在热路径上（admin 批量读用）。
+        """
+        edges_by = self.get_edges_for_matters(matter_ids)
+        out: dict[str, tuple[Matter, list[MatterEdge], list[Fact] | None]] = {}
+        for mid, edges in edges_by.items():
+            matter = self.get_matter(mid)
+            if matter is None:
+                continue
+            facts: list[Fact] | None
+            try:
+                facts = self.get_facts_for_matter(mid, top_k=top_k, edges=edges)
+            except Exception as e:  # noqa: BLE001 —— 单张卡取不到成员不毁掉整批
+                logger.warning("index_matter_members_facts_failed", matter_id=mid, error=str(e))
+                facts = None
+            out[mid] = (matter, edges, facts)
+        return out
+
     def get_matter_aggregate_view(self, matter_id: str) -> MatterAggregateView | None:
         """从归属边即时聚合 Matter 的聚合视图（不落独立存储）。"""
         matter = self.get_matter(matter_id)
@@ -5631,6 +6058,7 @@ class MemoryIndex:
             if self.meta_db.get(key.encode()) is not None:
                 del self.meta_db[key.encode()]
                 removed += 1
+            self._stage_untrack(fid)
 
         # 从 LanceDB 删除向量
         if self._table is not None and facts_to_delete:
@@ -5705,6 +6133,7 @@ class MemoryIndex:
         existed = self.meta_db.get(key.encode()) is not None
         if existed:
             del self.meta_db[key.encode()]
+        self._stage_untrack(fact_id)
         if self._table is not None:
             try:
                 safe_id = fact_id.replace("'", "''")
@@ -5765,9 +6194,12 @@ class MemoryIndex:
     # ── MS-1（复核 D4）：蒸馏失败轮的重试计数 ─────────────────────────────────
 
     def _distill_retry_count(self, ledger_key: str) -> int:
+        return self._retry_count(_DISTILL_RETRY_PREFIX, ledger_key)
+
+    def _retry_count(self, prefix: str, key: str) -> int:
         if self.meta_db is None:
             return 0
-        raw = self.meta_db.get(f"{_DISTILL_RETRY_PREFIX}{ledger_key}".encode())
+        raw = self.meta_db.get(f"{prefix}{key}".encode())
         if raw is None:
             return 0
         try:
@@ -5777,17 +6209,23 @@ class MemoryIndex:
 
     def _bump_distill_retry(self, ledger_key: str) -> int:
         """失败重试计数 +1 并返回新值（持久化——进程重启不清零）。"""
+        return self._bump_retry(_DISTILL_RETRY_PREFIX, ledger_key)
+
+    def _bump_retry(self, prefix: str, key: str) -> int:
         if self.meta_db is None:
             return 0
-        n = self._distill_retry_count(ledger_key) + 1
-        self.meta_db[f"{_DISTILL_RETRY_PREFIX}{ledger_key}".encode()] = str(n).encode()
+        n = self._retry_count(prefix, key) + 1
+        self.meta_db[f"{prefix}{key}".encode()] = str(n).encode()
         return n
 
     def _clear_distill_retry(self, ledger_key: str) -> None:
         """成功消费后清掉计数（下次再失败重新从 1 起算）。"""
+        self._clear_retry(_DISTILL_RETRY_PREFIX, ledger_key)
+
+    def _clear_retry(self, prefix: str, key: str) -> None:
         if self.meta_db is None:
             return
-        k = f"{_DISTILL_RETRY_PREFIX}{ledger_key}".encode()
+        k = f"{prefix}{key}".encode()
         if self.meta_db.get(k) is not None:
             del self.meta_db[k]
 
@@ -5868,6 +6306,7 @@ class MemoryIndex:
         if self.meta_db is None:
             return 0
         removed = 0
+        self._scan_state = None     # 批 AB · MQ-W17 ②：消费标记被撤，游标的 pending 作废
         # ① 惰性扫描：只需 key + ts，不必付完整反序列化
         for key_str, ts_iso in ledger.scan_meta(""):
             if not _turn_matches_filter(
@@ -5941,6 +6380,166 @@ class MemoryIndex:
             logger.info("index_admin_events_incremental_replayed", count=replayed)
         return replayed
 
+    # ── 批 BB · 2b：矛盾标记（默认关）——物化视图 / 台账 / 状态的存取与读面 ─────────────
+    # 写者只有 consolidator（Index 单写者，ADR-0032 §2.3）；proxy 以 secondary 只读。
+    # 三个前缀的命运见常量处。0.3.0 回滚时这些前缀被 `all_facts` 等的前缀判断自然跳过。
+
+    _CONTRA_PREFIXES = (_CONTRADICTION_PREFIX, _CONTRADICTION_JUDGED_PREFIX, _CONTRADICTION_STATE_PREFIX)
+
+    def contradiction_kv_get(self, key: str) -> dict[str, Any] | None:
+        self._ensure_meta_db()
+        self._try_catch_up()
+        if self.meta_db is None:
+            return None
+        raw = self.meta_db.get(key.encode())
+        return None if raw is None else msgpack.unpackb(raw, raw=False)
+
+    def contradiction_kv_put(self, key: str, obj: dict[str, Any]) -> None:
+        if not key.startswith(self._CONTRA_PREFIXES):
+            raise ValueError(f"not a contradiction key: {key!r}")
+        if self.meta_db is not None:
+            self.meta_db[key.encode()] = msgpack.packb(obj, use_bin_type=True)
+
+    def contradiction_kv_delete(self, key: str) -> None:
+        if not key.startswith(self._CONTRA_PREFIXES):
+            raise ValueError(f"not a contradiction key: {key!r}")
+        if self.meta_db is not None and self.meta_db.get(key.encode()) is not None:
+            del self.meta_db[key.encode()]
+
+    def contradiction_kv_scan(self, prefix: str) -> list[tuple[str, dict[str, Any]]]:
+        self._ensure_meta_db()
+        self._try_catch_up()
+        out: list[tuple[str, dict[str, Any]]] = []
+        if self.meta_db is None:
+            return out
+        for k, v in self.meta_db.items(from_key=prefix.encode()):
+            ks = k.decode() if isinstance(k, bytes) else str(k)
+            if not ks.startswith(prefix):
+                break
+            out.append((ks, msgpack.unpackb(v, raw=False)))
+        return out
+
+    def _apply_contradiction_event(self, event: AdminEvent) -> bool:
+        """把一条矛盾标记 / 裁定事件物化到 `contradiction/<pair>`。幂等；不碰任何 fact。"""
+        from bladex_core import consistency as cs
+
+        rec = cs.parse_payload(event.payload)
+        if rec is None:
+            logger.warning("contradiction_event_invalid", kind=str(event.payload.get("kind")))
+            return False
+        key = f"{_CONTRADICTION_PREFIX}{rec.key}"
+        cur = self.contradiction_kv_get(key) or {}
+        ts = event.ts.isoformat() if getattr(event, "ts", None) else ""
+        if isinstance(rec, cs.FlagRecord):
+            cur["flag"] = {"pair": list(rec.pair), "shas": list(rec.shas), "judge_model": rec.judge_model,
+                           "prompt_sha": rec.prompt_sha, "reason_sha": rec.reason_sha, "rank": rec.rank,
+                           "cos": rec.cos, "ts": ts}
+        else:
+            cur["verdict"] = {"pair": list(rec.pair), "shas": list(rec.shas), "verdict": rec.verdict,
+                              "origin": rec.origin, "note": rec.note, "ts": ts}
+        self.contradiction_kv_put(key, cur)
+        return True
+
+    def contradiction_neighbors(self, fact: Fact, k: int = 50) -> list[tuple[Fact, float]]:
+        """矛盾预筛的邻居口径（同步骤 2-0 `Snapshot.older_mask`）：e5 前 `k` 条里**比它旧、现行、非 file_ref** 的 `(Fact, cos)`。
+
+        向量按 fact 正文现算（`embed_passage_compat`，与入库同一口径；嵌入台账命中则零成本）。
+        拿不到 embedder / 表 ⇒ 空（= 无可判，不报错）。
+        """
+        if self._embedder is None or self._table is None:
+            return []
+        try:
+            vec = embed_passage_compat(self._embedder, [fact.content])[0]
+            self._table.checkout_latest()
+            rows = self._table.search(vec).distance_type("cosine").limit(max(1, k) + 1).to_list()
+        except Exception as e:  # noqa: BLE001 —— 检索失败 = 这一条本轮无邻居，不拖垮 pass
+            logger.warning("contradiction_neighbors_failed", fact_id=fact.id, error=str(e))
+            return []
+
+        def _key(f: Fact) -> tuple[float, str]:
+            return (f.t_valid.timestamp() if f.t_valid else 0.0, f.id)
+
+        me = _key(fact)
+        out: list[tuple[Fact, float]] = []
+        for r in rows:
+            if r.get("id") == fact.id:
+                continue
+            f = self.get_fact(str(r.get("id")))
+            if f is None or f.t_invalid or f.superseded_by or f.item_kind == ItemKind.FILE_REF or _key(f) >= me:
+                continue
+            out.append((f, max(0.0, 1.0 - float(r.get("_distance", 1.0)))))
+        return out
+
+    def contradiction_usage(self, day: str) -> dict[str, int]:
+        """`bladex status` 的矛盾检测读数：待判 fact 数 + 当日已用 input token（读 `contradiction_state/`）。"""
+        base = _CONTRADICTION_STATE_PREFIX
+        return {
+            "pending": len(self.contradiction_kv_scan(f"{base}pending/")),
+            "daily_input_tokens_used": int((self.contradiction_kv_get(f"{base}day/{day}") or {}).get("n", 0)),
+        }
+
+    def contradiction_settled(self) -> Any:  # noqa: ANN401 —— consistency.SettledPairs
+        from bladex_core import consistency as cs
+
+        verdicts = {}
+        for _k, cur in self.contradiction_kv_scan(_CONTRADICTION_PREFIX):
+            v = cur.get("verdict")
+            if v:
+                rec = cs.VerdictRecord((v["pair"][0], v["pair"][1]), (v["shas"][0], v["shas"][1]),
+                                       v["verdict"], v["origin"], v.get("note", ""))
+                verdicts[rec.key] = rec
+        return cs.SettledPairs(verdicts)
+
+    def _contradiction_item(self, cur: dict[str, Any]) -> dict[str, Any] | None:
+        """一条物化记录 → 读面条目。无 flag 的（只有裁定）不显示。任一侧不存在 / 被取代 ⇒ `obsolete`（读时算，不写事件）。"""
+        from bladex_core import consistency as cs
+
+        fl = cur.get("flag")
+        if not fl:
+            return None
+        a_id, b_id = fl["pair"]
+        facts = [self.get_fact(a_id), self.get_fact(b_id)]
+        v = cur.get("verdict")
+        status = "unsettled"
+        if any(f is None or f.t_invalid or f.superseded_by for f in facts):
+            status = "obsolete"
+        elif v and [cs.content_sha(f) for f in facts] == list(v["shas"]):  # type: ignore[union-attr]
+            status = v["verdict"]
+        reason = ""
+        judged = self.contradiction_kv_get(
+            f"{_CONTRADICTION_JUDGED_PREFIX}{a_id}|{b_id}/{fl['shas'][0]}-{fl['shas'][1]}")
+        if judged:
+            reason = str((judged.get("record") or {}).get("reason", ""))
+        return {
+            "pair_id": f"{a_id}|{b_id}", "fact_ids": [a_id, b_id], "status": status,
+            "flagged_at": fl.get("ts", ""), "judge_model": fl.get("judge_model", ""),
+            "prompt_sha": fl.get("prompt_sha", ""), "rank": fl.get("rank", 0), "cos": fl.get("cos", 0.0),
+            "settled_at": (v or {}).get("ts", "") if status in cs.USER_VERDICTS else "",
+            "origin": (v or {}).get("origin", "") if status in cs.USER_VERDICTS else "",
+            "note": (v or {}).get("note", "") if status in cs.USER_VERDICTS else "",
+            "reason": reason,
+            "facts": [{"id": f.id, "content": f.content} if f else {"id": i, "content": ""}
+                      for f, i in zip(facts, (a_id, b_id), strict=True)],
+        }
+
+    def contradictions(self, *, status: str = "", limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        """列表读面：按状态过滤（`unsettled` / `not_same_thing` / `confirmed` / `obsolete`），按标记时间倒序。"""
+        items = [it for _k, cur in self.contradiction_kv_scan(_CONTRADICTION_PREFIX)
+                 if (it := self._contradiction_item(cur)) is not None]
+        if status:
+            items = [it for it in items if it["status"] == status]
+        items.sort(key=lambda it: (it["flagged_at"], it["pair_id"]), reverse=True)
+        return {"total": len(items), "items": items[max(0, offset):max(0, offset) + max(0, limit)]}
+
+    def contradictions_for(self, fact_id: str) -> list[dict[str, Any]]:
+        """某条 fact 的冲突（每条带 `other_fact_id`）。"""
+        out = []
+        for it in self.contradictions(limit=10**9)["items"]:
+            if fact_id in it["fact_ids"]:
+                other = it["fact_ids"][1] if it["fact_ids"][0] == fact_id else it["fact_ids"][0]
+                out.append({**it, "other_fact_id": other})
+        return out
+
     def _set_admin_events_watermark(self, entry_id: str) -> None:
         if self.meta_db is not None and entry_id:
             self.meta_db[self._ADMIN_EVENTS_WATERMARK_KEY] = entry_id.encode()
@@ -5993,6 +6592,11 @@ class MemoryIndex:
                             logger.debug("index_correct_replay_embed_skip", error=str(ee))
                     self.correct_fact(fact)
                     return True
+                if event.event_type == "audience_set" and event.payload.get("kind") in _contradiction_kinds():
+                    # 批 BB · 2b：🔴 **先看 `kind`**。命中闭集的事件只归 consistency（物化到 `contradiction/`），
+                    # 不得再落到下面老的 `fact_id` / `audience` 分支——载荷本就不带这两个键（守卫），
+                    # 这里再把顺序钉死：老分支永远看不到矛盾载荷。老事件（无 `kind`）逐字走老路。
+                    return self._apply_contradiction_event(event)
                 if event.event_type == "audience_set":
                     # MQ-L27 修法③：人设事实 audience 补标（payload 带 fact_id，
                     # matter_id 留空——MQ-A7 护栏）。幂等：重复应用同值无害。
@@ -6242,7 +6846,256 @@ class MemoryIndex:
         logger.info("index_reattributed", dry_run=dry_run, **out)
         return out
 
-    def rebuild_from_hub(
+    # ── 批 AA · MQ-I34：全量重建走暂存目录 + 原子换名 ─────────────────────────
+
+    def _stage_untrack(self, fact_id: str) -> None:
+        if self._stage_track is not None:
+            self._stage_track["written"].discard(fact_id)
+            self._stage_track["vec"].discard(fact_id)
+
+    def _reset_storage_handles(self) -> None:
+        """丢掉所有与 `self._path` 绑定的句柄与缓存（不 close meta——调用方决定它的去留）。"""
+        if self._fts is not None:
+            self._fts.close()
+        self._meta_db = None
+        self._lancedb = None
+        self._table = None
+        self._matter_table = None
+        self._files_tbl = None
+        self._blobs = None
+        self._fts = None
+        self._fts_tried = False
+        self._manual_edge_cache = None
+        self._kw_map = None
+        self._kw_map_stamp = -1
+        self._entity_freq_cache = None
+        self._has_entities_col_cached = None
+
+    def _close_storage(self) -> None:
+        if self._meta_db is not None:
+            self._meta_db.close()
+        self._reset_storage_handles()
+
+    def _scan_all_turn_keys(
+        self, ledger: MemoryHub, *, full: bool = False,
+        row_filter: Callable[[str, str], bool] | None = None,
+    ) -> tuple[list[tuple[str, str]], dict[str, str], int, dict[str, list[str]]]:
+        """全扫：`(待消费 [(ts, key)] 已排序, 会话内前驱 {key: 上一轮 key}, 被过滤条数, 各会话的 key)`。"""
+        batch: list[tuple[str, str]] = []
+        sess_keys: dict[str, list[str]] = defaultdict(list)
+        skipped = 0
+        for k, t in ledger.scan_meta(""):
+            if row_filter is not None and not row_filter(k, t):
+                skipped += 1
+                continue
+            sess_keys[k.rsplit("/", 1)[0]].append(k)
+            if not full and self.is_consumed(k):
+                continue
+            batch.append((t, k))
+        # 会话前缀内 key 字典序 == 时间序（entry_id = `{unix_ms}-{seq}`，session 内有序；
+        # 跨 session 才乱，而这里从不跨 session 比较）。
+        prev_of: dict[str, str] = {}
+        for keys in sess_keys.values():
+            keys.sort()
+            for a, b in zip(keys, keys[1:], strict=False):
+                prev_of[b] = a
+        batch.sort()
+        return batch, prev_of, skipped, sess_keys
+
+    def _scan_cursor_full(self, ledger: MemoryHub, tombstones: int) -> tuple[
+            list[tuple[str, str]], dict[str, str]]:
+        """全扫并（重）建游标状态。有旧状态时顺带对账：排在游标之前、游标却没见过的 key = 漏了。"""
+        batch, prev_of, _, sess_keys = self._scan_all_turn_keys(ledger)
+        old = self._scan_state
+        if old is not None:
+            missed = sorted(
+                k for sess, keys in sess_keys.items() if sess in old.cursors
+                for k in keys if k <= old.cursors[sess] and k not in old.known)
+            if missed:
+                logger.warning(
+                    "index_scan_cursor_missed", count=len(missed), sample=missed[:3],
+                    hint="turns landed behind a session cursor (overflow replay?); this "
+                         "reconcile scan picked them up")
+        self._scan_state = _ScanState(
+            cursors={sess: keys[-1] for sess, keys in sess_keys.items()},
+            known={k for keys in sess_keys.values() for k in keys},
+            prev_of=prev_of, pending={k: t for t, k in batch},
+            tombstones=tombstones, last_full=time.monotonic())
+        return batch, prev_of
+
+    def _scan_with_cursor(self, ledger: MemoryHub) -> tuple[list[tuple[str, str]], dict[str, str]]:
+        """批 AB · MQ-W17 ②：返回值与 `_scan_all_turn_keys` 逐字相同，只是不全扫。
+
+        状态全在进程内（`_RecentTurnIndex` 同款理由：派生键不进 Hub），重启 = 首趟全扫重建。
+        全扫的场合：首趟 · 墓碑集合变了（前驱链要跳过被删的轮）· 到对账点（N 轮或 ≥ 1 h）。
+        🔴 对账是游标假设的兜底：overflow 回灌可能写入 entry_id 更小的旧轮次，游标看不见；
+        对账发现后打 `index_scan_cursor_missed`，全扫结果直接接管，漏的轮次当轮进待消费。
+        """
+        if not callable(getattr(ledger, "scan_turn_keys_after", None)):
+            return self._scan_all_turn_keys(ledger)[:2]     # 快照包装器 / 测试替身：照旧全扫
+        tombstones = len(ledger._tombstoned_keys())
+        st = self._scan_state
+        if (st is None or st.tombstones != tombstones
+                or st.rounds >= int(flag_number("BLADEX_SCAN_RECONCILE_ROUNDS"))
+                or time.monotonic() - st.last_full >= flag_number("BLADEX_SCAN_RECONCILE_S")):
+            return self._scan_cursor_full(ledger, tombstones)
+        st.rounds += 1
+        for k, t in ledger.scan_turn_keys_after(st.cursors):
+            sess = k.rsplit("/", 1)[0]
+            last = st.cursors.get(sess)
+            if last is not None:
+                st.prev_of[k] = last
+            st.cursors[sess] = k
+            st.known.add(k)
+            st.pending[k] = t
+        for k in [k for k in st.pending if self.is_consumed(k)]:
+            del st.pending[k]
+        return sorted((t, k) for k, t in st.pending.items()), st.prev_of
+
+    def _staged_full_rebuild(self, ledger: MemoryHub, **kw: Any) -> int:
+        """全量重建：生产 → 暂存副本 → 同一引擎重建 → 自检 → 原子换名（旧库留 `.bak-<ts>`）。
+
+        任何一步没走完（守卫中止 / 异常 / 自检不过 / 换名做不到 / 进程被 kill），
+        **生产目录逐字节不变**；暂存留在原地，下次重建收割其中的 LLM 缓存（`index_staging`）。
+        本进程全程持有生产 meta 的写句柄（= RocksDB 锁），别的 consolidator 进不来。
+        """
+        from bladex_proxy.storage import index_staging as stg
+
+        prod = self._path
+        self.open()
+        if self._fts is not None:       # FTS 走 SQLite backup，先放掉本进程的连接
+            self._fts.close()
+            self._fts, self._fts_tried = None, False
+        prev = stg.retire_leftovers(prod)
+        try:
+            staging = stg.build_staging(prod, self._meta_db)
+        except Exception as e:  # noqa: BLE001 —— 建不出暂存 = 不重建，生产不动
+            logger.error("index_rebuild_staging_build_failed", error=str(e), prod=str(prod))
+            self._last_rebuild_abort_reason = "staging_build_failed"
+            return 0
+
+        prod_meta = self._meta_db        # 留着不关：它就是生产的锁
+        self._reset_storage_handles()
+        self._path = staging
+        n, ok, problems = 0, False, []
+        try:
+            self.open()
+            stg.harvest(prev, self._meta_db)
+            self._stage_track = {"written": set(), "vec": set()}
+            self._staging_active = True
+            n = self.rebuild_from_hub(ledger, full=True, **kw)
+            if self._last_rebuild_abort_reason is None:
+                problems = self._staging_self_check()
+                if problems:
+                    self._last_rebuild_abort_reason = "staging_self_check_failed"
+                    logger.error("index_rebuild_staging_self_check_failed",
+                                 problems=problems, staging=str(staging),
+                                 hint="production Index left untouched; the staging "
+                                      "copy is kept for inspection and its LLM caches "
+                                      "are reused by the next full rebuild")
+                else:
+                    ok = True
+        finally:
+            self._staging_active = False
+            self._stage_track = None
+            self._close_storage()
+            self._path = prod
+            if not ok:
+                # 不换名：把**仍开着的**生产句柄接回来，只重开向量侧。关掉再开 RocksDB
+                # 会轮转 MANIFEST/WAL —— 数据没变，但生产目录就不再逐字节不变了。
+                self._meta_db = prod_meta
+                self._open_vector_store()
+        if ok:
+            prod_meta.close()
+            try:
+                bak = stg.swap_in(staging, prod)
+                logger.warning("index_full_rebuild_swapped", prod=str(prod), backup=str(bak),
+                               hint="the previous Index is kept as the backup above (not "
+                                    "deleted automatically). Readers that had the old Index "
+                                    "open (the proxy) reopen it on their own within seconds "
+                                    "(look for index_reader_reopened)")
+            except stg.AtomicSwapError as e:
+                self._last_rebuild_abort_reason = "swap_failed"
+                logger.error("index_rebuild_swap_failed", error=str(e), staging=str(staging),
+                             prod=str(prod),
+                             hint="atomic rename is not possible here; production Index left "
+                                  "untouched. Not falling back to copy+delete by design")
+            self.open()
+        return n
+
+    def _staging_self_check(self) -> list[str]:
+        """换名前自检（在暂存上跑）。返回问题列表，空 = 通过。
+
+        三库对账以 meta 为真身（口径同 MQ-I18）：
+          ① meta 的 fact 集合 == 本跑清库后写入的集合（不多：无残留；不少：无丢写）
+          ② 向量表 id 集合 == 写过向量且仍在 meta、非 file_ref 的集合
+          ③ FTS 行数 == meta 里 现行 ∧ 非 file_ref 的条数
+          ④ 用全新的只读句柄（= proxy 的打开方式）打开暂存，向量检索取回其中一条
+        """
+        problems: list[str] = []
+        track = self._stage_track or {"written": set(), "vec": set()}
+        meta_ids: set[str] = set()
+        nonref: set[str] = set()
+        current_nonref = 0
+        probe: Fact | None = None
+        for f in self.all_facts():
+            meta_ids.add(f.id)
+            if f.item_kind != ItemKind.FILE_REF:
+                nonref.add(f.id)
+                if f.t_invalid is None:
+                    current_nonref += 1
+                    if probe is None and f.id in track["vec"]:
+                        probe = f
+        if meta_ids != track["written"]:
+            problems.append(
+                f"meta_vs_written meta={len(meta_ids)} written={len(track['written'])} "
+                f"stale={len(meta_ids - track['written'])} "
+                f"lost={len(track['written'] - meta_ids)}")
+        self._lazy_open_facts_table()
+        lance_ids: list[str] = []
+        if self._table is not None:
+            lance_ids = [x for x in self._table.to_arrow().column("id").to_pylist() if x]
+        want_vec = track["vec"] & nonref
+        if set(lance_ids) != want_vec:
+            problems.append(f"vector_vs_meta vector={len(set(lance_ids))} expected={len(want_vec)}")
+        fts = self._ensure_fts()
+        if fts is not None and fts.available and fts.count() != current_nonref:
+            problems.append(f"fts_vs_meta fts={fts.count()} expected={current_nonref}")
+        if probe is not None and self._embedder is not None:
+            ro = MemoryIndex(self._path, embedder=self._embedder, read_only=True)
+            try:
+                ro.open()
+                got = ro.get_fact(probe.id)
+                vec = self._embedder.embed([probe.content])[0]
+                hits = ([] if ro._table is None else
+                        [r.get("id") for r in ro._table.search(vec)
+                         .distance_type("cosine").limit(10).to_list()])
+                if got is None or probe.id not in hits:
+                    problems.append(f"probe_search_miss fact={probe.id} "
+                                    f"meta_ok={got is not None}")
+            except Exception as e:  # noqa: BLE001 —— 打不开/检索抛错本身就是自检失败
+                problems.append(f"probe_open_failed {type(e).__name__}: {e}")
+            finally:
+                ro.close()
+                shutil.rmtree(self._path / "meta_rocksdb_secondary", ignore_errors=True)
+        logger.info("index_rebuild_staging_self_check", ok=not problems,
+                    facts=len(meta_ids), vectors=len(lance_ids), fts_expected=current_nonref,
+                    probe=probe.id if probe is not None else None)
+        return problems
+
+    def rebuild_from_hub(self, ledger: MemoryHub, **kw: Any) -> int:
+        """从 Memory Hub 增量/全量重建 Memory Index（引擎见 `_rebuild_from_hub_impl`）。
+
+        批 AA2 · MQ-I32：pass 内的副作用（memo / 画像）先记账、成功提交才落库；
+        这里的 finally 保证中止 / 异常的 pass 一条都不留下——重试 pass 看到的输入
+        与这一 pass 开始时相同。
+        """
+        try:
+            return self._rebuild_from_hub_impl(ledger, **kw)
+        finally:
+            self._pass_pending = None
+
+    def _rebuild_from_hub_impl(
         self, ledger: MemoryHub, *, full: bool = False, max_turns: int = 30,
         legacy_map: dict[str, str] | None = None,
         fold_user_id: str = "",
@@ -6272,6 +7125,11 @@ class MemoryIndex:
         重建期只降级不停摆（consolidation 失败不阻塞）。
         返回新提炼的 Fact 数。
         """
+        # 批 BA2b（拍板 (36)-a）：先于任何轮次。下面的逐轮循环会按 `canonical_project_id` 写 Project 表，
+        # 而 `load_ledger_events` 在锚层才跑——新起的进程第一趟会拿空表把旧键写进去。
+        from bladex_proxy.ledger_events import refresh_project_key_map
+        refresh_project_key_map(ledger)
+
         self._last_rebuild_backlog = False
         self._last_rebuild_candidates = 0   # MQ-W17 读数，每轮先清零
         self._last_rebuild_abort_reason = None   # MQ-I33：每轮先清掉上一轮的中止信号
@@ -6281,6 +7139,15 @@ class MemoryIndex:
             # MQ-I33：full CLI 不能把“没做”报成 done；增量路径不读这个信号。
             self._last_rebuild_abort_reason = "no_embedder"
             return 0
+
+        # 批 AA · MQ-I34：真正的全量（清库）一律在暂存目录里跑，自检通过才原子换名。
+        # 下面这一整段引擎原样不动——它跑在暂存上（`_staging_active` 防递归）。
+        if (full and not (since or until or agents or exclude_agents)
+                and not self._staging_active):
+            return self._staged_full_rebuild(
+                ledger, max_turns=max_turns, legacy_map=legacy_map,
+                fold_user_id=fold_user_id, distill_concurrency=distill_concurrency,
+                progress_cb=progress_cb)
 
         # MS-13：全量重建 = 新的一轮 run，刷新 rebuild_id（增量 pass 沿用进程 run id
         # ——复验要区分的是"16:33 那次全量"与"12:44 的历史 run"，进程粒度足够）。
@@ -6299,6 +7166,14 @@ class MemoryIndex:
         # （清库+子集重放 = 其余数据静默丢失）。clear_db 才是真正的全量语义。
         has_filter = bool(since or until or agents or exclude_agents)
         clear_db = full and not has_filter
+        # 批 AA2：本 pass 的副作用暂存（成功提交才写，见 `rebuild_from_hub`）
+        self._pass_pending = {"memo": {}, "profile": {}}
+        if clear_db:
+            # 批 AA2 · MQ-I37：full 的产出只许取决于 Hub。乙类（会改变 full 输入的状态）
+            # 在**开始时**清——clear() 在蒸馏之后，太晚。full 只在暂存上跑（I34），生产不受影响。
+            _reset = self._delete_meta_prefixes(_META_RESET_AT_FULL_START)
+            logger.info("index_full_rebuild_inputs_reset", deleted_keys=len(_reset),
+                        prefixes=list(_META_RESET_AT_FULL_START))
         if full and has_filter:
             logger.info("index_rebuild_filtered_replay_no_clear",
                         since=since or None, until=until or None,
@@ -6312,6 +7187,8 @@ class MemoryIndex:
         if not clear_db:
             try:
                 self._replay_new_admin_events(ledger)
+            except HubRequiresNewerVersion:  # 批 UE 步骤 2：运行中的拒绝不许被吞
+                raise
             except Exception as e:  # noqa: BLE001 —— 管理事件重放失败不阻塞蒸馏主线
                 logger.warning("index_admin_events_incremental_failed", error=str(e))
 
@@ -6319,6 +7196,8 @@ class MemoryIndex:
         # 在 turn 扫描之前构造一次；扫描失败不阻塞蒸馏主线（映射为空 = 保持原 agent_id）。
         try:
             agent_claim_map = self.build_agent_claim_map(ledger)
+        except HubRequiresNewerVersion:  # 批 UE 步骤 2：运行中的拒绝不许被吞
+            raise
         except Exception as e:  # noqa: BLE001 —— 映射构造失败不该拖垮重建
             logger.warning("index_agent_claim_map_failed", error=str(e))
             agent_claim_map = {}
@@ -6367,6 +7246,7 @@ class MemoryIndex:
             progress_cb=progress_cb,
             funnel=self._funnel,          # M4-2：写入侧漏斗埋点
             adjudicator=self._adjudicator,  # M2-2：写入时裁决
+            embed_ledger=self,            # 批 AB · MQ-I27：嵌入台账（embedcache/）
             # 🔴 2026-09-18（批 S · S2.1，MQ-I20）：库内邻居用 meta 里的完整 Fact 补齐坐标
             # （向量表无 subject/attribute 列 ⇒ 此前库内同键从不命中快路径）。
             neighbor_source=InRunNeighborSource(
@@ -6462,7 +7342,6 @@ class MemoryIndex:
         #
         # 排序键 `(ts, key)`：ts 相同时用 key 兜底，保证重放两次逐位一致（G6）。
         # 内存代价：~7k 条 (str, str) 元组，可忽略（实测全库 6891 turns）。
-        _scan_batch: list[tuple[str, str]] = []
         # GM-1：会话内相邻关系必须按**全部**轮次算，不能只按本批次。
         # 🔴 首版把"上一轮"记在一个 pass 内的字典里，于是**跨批次的延续对全部丢失**
         # ——consolidator 每 60s 一批，而人说话的间隔通常大于 60s，绝大多数相邻轮
@@ -6471,28 +7350,17 @@ class MemoryIndex:
         # 修法零额外 I/O：在这趟已有的全量 `scan_meta` 里顺手记下会话内顺序，
         # 已消费的轮也要记（它正是要找的那个前驱）。过滤掉的轮不记——与定向重放
         # "不匹配的既不蒸馏也不标记消费"同语义。
-        _sess_keys: dict[str, list[str]] = defaultdict(list)
-        for _k, _t in ledger.scan_meta(""):
-            if has_filter and not _turn_matches_filter(
-                _k, _t, since=since, until=until,
-                agents=agents, exclude_agents=exclude_agents,
-            ):
-                skipped_filtered += 1
-                continue
-            if _cont_enabled:
-                _sess_keys[_k.rsplit("/", 1)[0]].append(_k)
-            if not full and self.is_consumed(_k):
-                continue
-            _scan_batch.append((_t, _k))
-
-        # 会话前缀内 key 字典序 == 时间序（entry_id = `{unix_ms}-{seq}`，session 内有序；
-        # 跨 session 才乱，而这里从不跨 session 比较）。
-        _prev_of: dict[str, str] = {}
-        for _keys in _sess_keys.values():
-            _keys.sort()
-            for _a, _b in zip(_keys, _keys[1:], strict=False):
-                _prev_of[_b] = _a
-        _scan_batch.sort()
+        # 批 AB · MQ-W17 ②：增量且无过滤时走 session 游标（`_scan_with_cursor`），不再每轮全扫。
+        if not full and not has_filter and flag_enabled("BLADEX_SCAN_CURSOR"):
+            _scan_batch, _prev_of = self._scan_with_cursor(ledger)
+        else:
+            self._scan_state = None     # full / 定向重放之后消费标记大变，游标状态作废
+            _scan_batch, _prev_of, skipped_filtered, _ = self._scan_all_turn_keys(
+                ledger, full=full,
+                row_filter=((lambda _k, _t: _turn_matches_filter(
+                    _k, _t, since=since, until=until,
+                    agents=agents, exclude_agents=exclude_agents))
+                    if has_filter else None))
         # MQ-W17：这一行日志此前是"空载 consolidator 每 134s 全扫一遍"的唯一证据，
         # 但只有人去 tail 日志才看得到。把同一个数留给调用方（空载退避的输入）。
         self._last_rebuild_candidates = len(_scan_batch)
@@ -6557,6 +7425,12 @@ class MemoryIndex:
                 turn.request_messages, agent_id=turn.identity.agent_id,
                 headers=turn.identity.request_headers)   # 批 E：header 快照参与重判
             is_aux = _turn_class != TURN_REAL
+            # 批 BA2：Project 表的键直接来自轮次身份（重建同路，幂等）。放在聚合之外 ⇒ aux 轮也算：
+            # 它们同样落在这个项目的 scope 上，键集不该因蒸馏去留而变。
+            self.note_project_identity(turn.identity.project_id,
+                                       name=turn.identity.project_name,
+                                       root=turn.identity.project_root,
+                                       agent_id=turn.identity.agent_id)
             # 🔴 MS-2：整轮丢**只对 Hermes 原生 aux 规则**（委派回执、压缩检查点这类
             # 从头到尾都是内部通信的轮次）。信封类指纹（`DISTILL_ONLY_AUX_RULES`）说的是
             # "用户那侧这条消息是信封"，**不代表这一轮 assistant 没做实事**——整轮丢会把
@@ -6745,6 +7619,7 @@ class MemoryIndex:
 
         # 无新非 auxiliary 轮次：标记 auxiliary 已消费后返回
         if not turns:
+            self._commit_pass_pending()     # 批 AA2：这一 pass 没有可中止的蒸馏，直接提交
             # clear_db=True 且无可处理 turn：Memory Index 应与 Memory Hub 一致（清空）
             # 带过滤的 full 不清库——过滤掉的数据不该被静默丢弃
             if clear_db:
@@ -6825,8 +7700,27 @@ class MemoryIndex:
                     existing_facts=len(existing))
         distill_before = _distiller_counters(consolidator)
         adj_before = _adjudicator_counters(self._adjudicator)
+        # 批 AB · MQ-I39：full 同块就地重试（增量传 0，照旧跨 pass 计次）。
+        _adj_begin = getattr(self._adjudicator, "begin_rebuild_pass", None)
+        _adj_block_outcome = getattr(self._adjudicator, "block_outcome", None)
+        if callable(_adj_begin):
+            _adj_begin(max(0, int(flag_number("BLADEX_ADJUDICATE_RETRY_MAX"))) if clear_db else 0)
+        from bladex_core.adjudication import AdjudicationUpstreamUnavailable
         try:
             new_facts = consolidator.consolidate_turns(turns, existing_facts=existing)
+        except AdjudicationUpstreamUnavailable as e:
+            # 批 AA · MQ-I35：裁决上游断了且等满上限。与 outage 守卫同一处置
+            # （不写、不消费、退避），但**一条 blanket ADD 都没产生**——退避期间
+            # 网络错误从不落成判决。full 模式下暂存不换名，生产不动。
+            logger.warning(
+                "index_rebuild_adjudicate_upstream_unavailable", error=str(e),
+                turns=len(turns), consumed=0,
+                hint="adjudication upstream stayed unreachable past "
+                     "BLADEX_ADJUDICATE_OUTAGE_MAX_WAIT_S; nothing was written or "
+                     "consumed and no candidate was degraded to ADD. Check upstream "
+                     "with `bladex doctor` and re-run.")
+            self._last_rebuild_abort_reason = "adjudicate_upstream_unavailable"
+            return 0
         except Exception as e:
             logger.warning("index_rebuild_consolidation_failed", error=str(e))
             # MQ-I33：给 full CLI 一个明确信号；0 条不是判据（空库也返回 0）。
@@ -6933,11 +7827,39 @@ class MemoryIndex:
         # 当场制造同键并存（08-31 全库读数 `adjudicator_error` 46 条）。
         # 决策在 core（`adjudicate_outage`），这里只落盘 —— 与 supersede_plan 同分工。
         from bladex_core.adjudication import adjudicate_outage
+        # 批 AA2 · MQ-I32：解析型降级按**候选**计次（与蒸馏侧 MS-1 同形）。同一候选
+        # 连续 N 个 pass 都降级 ⇒ 输入本身用不了，放行（照降级写 ADD、留可 grep 记录），
+        # 不再计入中止比例——否则一条确定性坏输入让增量队列永久停摆（实验 I：4/4 pass 中止）。
+        _adj_retry_max = max(0, int(flag_number("BLADEX_ADJUDICATE_RETRY_MAX")))
+        _adj_records = getattr(consolidator, "adjudication_records", None) or []
+        _fallback_ids = [r["candidate_id"] for r in _adj_records if r.get("fallback")]
+        _released = {c for c in _fallback_ids if _adj_retry_max > 0
+                     and self._retry_count(_ADJ_RETRY_PREFIX, c) >= _adj_retry_max}
+        # 批 AB · MQ-I39 + 拍板 (42)-d：full 内就地重试耗尽的候选，**本跑有块成功或总块数 ≤ 3** 才放行。
+        # 没有这个条件，上游整段回垃圾时每一块都会被放行 = blanket ADD 换条路回来（MQ-S32 病 B）。
+        # 小库一块全坏落在 ≤ 3 内，不会永远重建不完。
+        if clear_db and _adj_block_outcome is not None:
+            _blocks, _blocks_ok, _exhausted = _adj_block_outcome()
+            if _blocks_ok > 0 or _blocks <= 3:
+                _released |= _exhausted & set(_fallback_ids)
+            elif _exhausted:
+                logger.warning("index_rebuild_adjudicate_release_refused", blocks=_blocks,
+                               blocks_ok=_blocks_ok, exhausted=len(_exhausted),
+                               hint="every adjudication block came back unparseable; that looks "
+                                    "like a bad upstream rather than bad input, so nothing is released")
+        _adj_after = _adjudicator_counters(self._adjudicator)
+        if _released and _adj_after:
+            _adj_after = dict(_adj_after)
+            _adj_after["degraded_items"] = max(
+                0, int(_adj_after.get("degraded_items", 0)) - len(_released))
         _abort, _items, _degraded, _ratio = adjudicate_outage(
-            adj_before, _adjudicator_counters(self._adjudicator),
+            adj_before, _adj_after,
             flag_number("BLADEX_ADJUDICATE_OUTAGE_ABORT_RATIO"),
         )
         if _abort:
+            for _cid in _fallback_ids:
+                if _cid not in _released:
+                    self._bump_retry(_ADJ_RETRY_PREFIX, _cid)
             logger.warning(
                 "index_rebuild_adjudicate_outage",
                 items=_items, degraded=_degraded, degraded_ratio=round(_ratio, 3),
@@ -6955,6 +7877,14 @@ class MemoryIndex:
             self._last_rebuild_abort_reason = "adjudicate_outage"
             # 与蒸馏中断同一处置：不写、不消费、退避（backlog 保持 False）。
             return 0
+        _cand_lk = {f.id: f.source_ledger_key for f in new_facts}
+        for _cid in sorted(_released):
+            logger.warning("index_rebuild_adjudicate_retry_exhausted", candidate_id=_cid,
+                           ledger_key=_cand_lk.get(_cid, ""), retry_max=_adj_retry_max,
+                           hint="this candidate's verdict was unusable on every retry; "
+                                "written as ADD (degraded) so the queue can move on")
+        for _r in _adj_records:
+            self._clear_retry(_ADJ_RETRY_PREFIX, _r["candidate_id"])
         if _degraded:
             # 未达阈值 = 零星降级。**不静默**：每一条降级都意味着这条候选没被真判过，
             # 它与同键兄弟的取代关系就此错过（重建也不会补——判决只剩审计价值，
@@ -6965,6 +7895,10 @@ class MemoryIndex:
                            degraded_ratio=round(_ratio, 3),
                            hint="these candidates were written as ADD without ever being "
                                 "judged; same-key siblings will coexist (MQ-S32 病 B)")
+
+        # 批 AA2 · MQ-I32：两道中断守卫都过了 = 本 pass 要提交。副作用（memo / 画像）
+        # 在这里才落库；上面任何一个 `return 0` 都由 `rebuild_from_hub` 的 finally 丢弃。
+        self._commit_pass_pending()
 
         # Beta T11（ADR-0012 §3.6）：FACT 级墓碑——重建不得复活被 forget 的 Fact。
         # fact.id 确定性（sha(ledger_key+content)），跨 rebuild 稳定 → 按 id 过滤即可。
@@ -7264,6 +8198,8 @@ class MemoryIndex:
                 _la_pool, _la_bind = _la_replay(_la_events)
                 _la_timeline = _la_tl(_la_events)
                 _la_titles = {lid: (lg.title or lid) for lid, lg in _la_pool.items()}
+            except HubRequiresNewerVersion:  # 批 UE 步骤 2：运行中的拒绝不许被吞
+                raise
             except Exception as e:  # noqa: BLE001 —— 锚层装载失败=降级走 D1/五层
                 logger.warning("ledger_anchor_load_failed", error=str(e))
                 _la_enabled = False
@@ -8113,6 +9049,18 @@ class IndexDistillJournal:
         if self._index is None:
             return
         self._index.mark_discourse(text, prompt_ver, ledger_key)
+
+    # ── 裁决判决缓存（批 AA · 步骤 5）：同一个台账对象，`LLMAdjudicator(journal=…)` 用 ──
+
+    def get_adjudication(self, key: str) -> dict[str, Any] | None:
+        if self._index is None:
+            return None
+        return self._index.get_adjudication(key)
+
+    def put_adjudication(self, key: str, rec: dict[str, Any]) -> None:
+        if self._index is None:
+            return
+        self._index.put_adjudication(key, rec)
 
 
 class IndexConsolidationWorker:

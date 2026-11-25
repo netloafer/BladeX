@@ -29,10 +29,13 @@ from bladex_proxy.responses import (
     empty_input_error,
     format_responses_response,
     parse_responses_request,
+    responses_custom_tool_names,
     responses_stream_generator,
+    responses_wants_reasoning_item,
+    strip_response_inline_reasoning,
     tool_events_from_output,
 )
-from bladex_proxy.route import call_model
+from bladex_proxy.route import RESPONSES_REASONING_OFF_KWARG, call_model
 from bladex_proxy.server.orchestration import (
     _apply_agency_surfaces,
     _build_request_params,
@@ -46,11 +49,27 @@ from bladex_proxy.server.orchestration import (
     _extract_output_modalities_responses,
     _intercept_non_stream,
     _loop_reply,
+    _note_nonstream_cache_reading,
     _prepare_round,
     _store_raw_request,
 )
 
 logger = structlog.get_logger()
+
+
+def _upstream_400_response(exc: Exception) -> JSONResponse | None:
+    """上游 400 → 原样回 400；其它错误 → None（调用方维持 502）。
+
+    🔴 批 BC §2.1：修前一律 502，而 codex 把 5xx 当瞬时错误重试，「配置/参数错」就变成几轮
+    徒劳的重试，用户看不到真正的报错（原则 9：报错要指向配置）。
+    """
+    if getattr(exc, "status_code", None) != 400:
+        return None
+    return JSONResponse(
+        status_code=400,
+        content={"error": {"type": "invalid_request_error",
+                           "message": router_sdk.error_text(exc)}},
+    )
 
 
 def register_responses_routes(app: FastAPI) -> None:
@@ -132,6 +151,11 @@ def register_responses_routes(app: FastAPI) -> None:
             logger.warning("responses_empty_input_rejected", message=empty["error"]["message"])
             return JSONResponse(status_code=400, content=empty)
         is_stream = body.get("stream", False)
+        # 批 BC §2.1：只有这条路径带这个键（chat / messages 不带 ⇒ 仍归 drop_params）；
+        # 不带 `reasoning` 的请求不带 ⇒ 出站与修前逐字相同。按模型的判定在 `route._do_call`。
+        if "reasoning_effort" in extra_kwargs:
+            extra_kwargs[RESPONSES_REASONING_OFF_KWARG] = (
+                cfg.routing_config.reasoning_off_models())
 
         # G11.1：完整 header 集合进身份解析（厂商前缀 header 此前被丢在门外）。
         headers = _collect_headers(request, authorization, x_agent_id, x_session_id, user_agent)
@@ -170,6 +194,8 @@ def register_responses_routes(app: FastAPI) -> None:
         injected_text, ms_identity, ms_inject = (
             prep.injected_text, prep.ms_identity, prep.ms_inject)
         allowed_exposure = prep.allowed_exposure
+        emit_reasoning = responses_wants_reasoning_item(body)
+        custom_names = responses_custom_tool_names(body)
 
         if is_stream:
             return await _handle_responses_stream(
@@ -178,6 +204,7 @@ def register_responses_routes(app: FastAPI) -> None:
                 agent_source, original_messages=messages,
                 request_params=request_params, decision_meta=decision_meta,
                 raw_request_ref=raw_request_ref, allowed_exposure=allowed_exposure,
+                emit_reasoning=emit_reasoning, custom_names=custom_names,
             )
         else:
             return await _handle_responses_non_stream(
@@ -187,6 +214,7 @@ def register_responses_routes(app: FastAPI) -> None:
                 request_params=request_params, decision_meta=decision_meta,
                 raw_request_ref=raw_request_ref,
                 allowed_exposure=allowed_exposure,
+                emit_reasoning=emit_reasoning, custom_names=custom_names,
             )
 
 
@@ -208,6 +236,8 @@ async def _handle_responses_stream(
     decision_meta: DecisionMeta | None = None,
     raw_request_ref: str = "",
     allowed_exposure: str = "public",
+    emit_reasoning: bool = False,
+    custom_names: frozenset[str] = frozenset(),
 ) -> StreamingResponse:
     """Responses /v1/responses 流式处理：转发 -> 按 Responses SSE 回传 -> 入库。
 
@@ -235,6 +265,9 @@ async def _handle_responses_stream(
                            "", [], TurnStatus.FAILED, str(e), ms_identity, ms_inject, t_start,
                            agent_source, request_params=request_params, decision_meta=decision_meta,
                            raw_request_ref=raw_request_ref)
+        rejected = _upstream_400_response(e)
+        if rejected is not None:
+            return rejected
         return JSONResponse(
             status_code=502,
             content={"error": {"type": "upstream_error",
@@ -243,7 +276,8 @@ async def _handle_responses_stream(
 
     # V-P5b：responses 流式拦截（interception 关 = 原路径逐字不变）。
     _agency = request.app.state.agency
-    _src = responses_stream_generator(stream, result, model)
+    _src = responses_stream_generator(stream, result, model, emit_reasoning=emit_reasoning,
+                                      custom_names=custom_names)
     if _agency.interception_on:
         # V-P5c：内循环的 call_llm——上游本就是 OpenAI 兼容，用同一路由再调一次；
         # 最终消息交回本协议的 generator 合成（协议转换只发生在出口）。
@@ -251,6 +285,8 @@ async def _handle_responses_stream(
             r2 = await call_model(model, msgs, stream=False, route=route,
                                   failover=failover, health=health,
                                   on_success=on_used, **extra_kwargs)
+            # 批 BC：内循环的最终回复同样可能带孤立 `</think>`，这条路不经流式 generator。
+            strip_response_inline_reasoning(r2, "responses:inner_loop")
             return _loop_reply(r2)
 
         _src = intercept_responses_stream(
@@ -259,7 +295,7 @@ async def _handle_responses_stream(
             allowed_exposure=allowed_exposure, session_id=identity.session_id,
             agent_id=identity.agent_id,
             project_id=identity.project_id, upstream_messages=messages,
-            call_llm=_loop_llm)
+            call_llm=_loop_llm, custom_names=custom_names)
 
     async def generate():
         try:
@@ -306,6 +342,8 @@ async def _handle_responses_non_stream(
     decision_meta: DecisionMeta | None = None,
     raw_request_ref: str = "",
     allowed_exposure: str = "public",
+    emit_reasoning: bool = False,
+    custom_names: frozenset[str] = frozenset(),
 ) -> JSONResponse:
     """Responses /v1/responses 非流式处理。"""
     _ledger_messages = original_messages if original_messages is not None else messages
@@ -319,15 +357,22 @@ async def _handle_responses_non_stream(
                            "", [], TurnStatus.FAILED, str(e), ms_identity, ms_inject, t_start,
                            agent_source, request_params=request_params, decision_meta=decision_meta,
                            raw_request_ref=raw_request_ref)
+        rejected = _upstream_400_response(e)
+        if rejected is not None:
+            return rejected
         return JSONResponse(
             status_code=502,
             content={"error": {"type": "upstream_error",
                     "message": f"Upstream error: {router_sdk.error_text(e)}"}},
         )
+    _note_nonstream_cache_reading(identity, response)
+    # 批 BC §2.2：下游（格式化 / 拦截 / ResponseMeta / Hub）读到的都是剥过的这一份。
+    strip_response_inline_reasoning(response, "responses:non_stream")
 
     # 🔴 入库口径：Hub 存**完整真相**（含被拦下的 bladex 调用），agent 拿处置后的。
     # 故先用未处置的 response 抽 tool_events，再做拦截（chat 侧同序，V-P5a）。
-    _truth = format_responses_response(response, model)
+    _truth = format_responses_response(response, model, emit_reasoning=emit_reasoning,
+                                       custom_names=custom_names)
     # 复用 tool_events_from_output：带 tool_call_id + 解析后的 dict arguments，
     # 与流式路径一致，跨轮 result 匹配不断链。
     full_text = _truth.get("output_text", "")
@@ -339,7 +384,9 @@ async def _handle_responses_non_stream(
         messages=messages, identity=identity, allowed_exposure=allowed_exposure,
         extra_kwargs=extra_kwargs, health=health, on_used=on_used)
     responses_response = (_truth if _processed is response
-                          else format_responses_response(_processed, model))
+                          else format_responses_response(_processed, model,
+                                                         emit_reasoning=emit_reasoning,
+                                                         custom_names=custom_names))
 
     status = TurnStatus.OK if responses_response.get("status") != "failed" else TurnStatus.FAILED
     response_meta = _build_response_meta_from_response(response)

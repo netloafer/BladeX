@@ -57,6 +57,8 @@ from typing import Any
 
 import structlog
 
+from bladex_proxy.process_probe import pid_maybe_alive
+
 logger = structlog.get_logger()
 
 #: 登记 TTL（秒）。心跳每 TTL/3 续一次；异机崩溃留下的 stale 登记最多挡这么久。
@@ -78,16 +80,6 @@ def instance_home() -> str:
     """本实例的身份 = 部署根的真实路径（`BLADEX_HOME` → 含 config/.env 的祖先 → cwd）。"""
     from bladex_proxy.deployment import deployment_root
     return os.path.realpath(deployment_root())
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
 
 
 def _decode(raw: Any) -> dict | None:
@@ -187,7 +179,7 @@ class InstanceClaim:
         if theirs is None or theirs.get("home") == self.record["home"]:
             reason = "same_home" if theirs is not None else "unreadable_claim"
         elif (theirs.get("host") == self.record["host"]
-              and isinstance(theirs.get("pid"), int) and not _pid_alive(theirs["pid"])):
+              and isinstance(theirs.get("pid"), int) and not pid_maybe_alive(theirs["pid"])):
             reason = "stale"
             logger.warning("instance_claim_stale_takeover", key=self._key,
                            previous_home=theirs.get("home"), previous_pid=theirs.get("pid"),

@@ -159,6 +159,12 @@ def _reply_text(reply: dict) -> str:
     return str(content or "")
 
 
+def _reply_reasoning(reply: dict) -> str:
+    """回复里的思考文本（`reasoning_content` / `reasoning`，list 拼接）——原则 13：不丢。"""
+    rc = reply.get("reasoning_content") or reply.get("reasoning") or ""
+    return "".join(str(x) for x in rc) if isinstance(rc, list) else str(rc)
+
+
 def build_inner_loop_turn(identity: Identity, model: str, pending: PendingRound,
                           *, trigger_ts: Any = None) -> Turn:
     """把一轮待入账记录构造成 aux `Turn`（不入库，纯构造；入库由调用方走管线）。"""
@@ -184,7 +190,11 @@ def build_inner_loop_turn(identity: Identity, model: str, pending: PendingRound,
         auxiliary=True, aux_source=INNER_LOOP_AUX_SOURCE,
         session_id_source=identity.session_id_source,
         sensitivity=identity.sensitivity,
+        # MQ-P34（批 AC）：`pending.usage` 是 `server._loop_reply` 挂上的上游原文（`capture.usage_raw`），
+        # 原样进 `usage_raw`；三键是它的投影。
         response_meta=ResponseMeta(usage=normalize_usage(pending.usage),
-                                   finish_reason=finish),
+                                   usage_raw=dict(pending.usage),
+                                   finish_reason=finish,
+                                   reasoning_text=_reply_reasoning(reply)),
         ms_total=pending.tool_ms + pending.llm_ms,
     )

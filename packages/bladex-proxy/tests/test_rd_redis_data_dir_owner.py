@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import socket
 import subprocess
 import types
 from pathlib import Path
@@ -304,14 +305,23 @@ def test_repair_cli_preview_changes_nothing_and_names_apply(_cwd: Path, monkeypa
 
 def _doctor(monkeypatch, capsys, owners: list[RedisOwner]) -> str:
     from bladex_proxy import cli
-    from bladex_proxy.cli import lifecycle
+    from bladex_proxy.cli import doctor_cmd
     for k in list(os.environ):  # 与 test_cli_lifecycle._tmp_cwd 同款：外部 BLADEX_* 不许泄进来
         if k.startswith("BLADEX_"):
             monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("BLADEX_REDIS_URL", "redis://127.0.0.1:6379/0")
-    monkeypatch.setattr(lifecycle, "_redis_ping", lambda _u: False)
-    monkeypatch.setattr(lifecycle, "redis_servers_on_data_dir", lambda _d="data": owners)
+    # MQ-V43：doctor 探测的 proxy 端口指到空闲端口，不碰本机 live proxy 的 38080
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        monkeypatch.setenv("BLADEX_PORT", str(s.getsockname()[1]))
+    probed: list[int] = []
+    orig = doctor_cmd._probe_port
+    monkeypatch.setattr(doctor_cmd, "_probe_port",
+                        lambda host, port: (probed.append(port), orig(host, port))[1])
+    monkeypatch.setattr(doctor_cmd, "_redis_ping", lambda _u: False)
+    monkeypatch.setattr(doctor_cmd, "redis_servers_on_data_dir", lambda _d="data": owners)
     cli.main(["doctor"])
+    assert probed and 38080 not in probed, probed
     return capsys.readouterr().out
 
 
@@ -331,10 +341,10 @@ def test_doctor_passes_with_the_one_configured_server(_cwd: Path, monkeypatch, c
 
 def test_e2e_step2_tolerates_a_slow_turn_listing(monkeypatch, capsys):
     """/admin/turns 在 17.7k 轮上要 ≈4 s：3 s 超时会读成 None ⇒ 假报"not stored"。"""
-    from bladex_proxy.cli import lifecycle
-    monkeypatch.setattr(lifecycle.secrets, "token_hex", lambda _n: "deadbeef")
-    monkeypatch.setattr(lifecycle.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(lifecycle, "_http_request", lambda *a, **k: (200, {}))
+    from bladex_proxy.cli import doctor_cmd
+    monkeypatch.setattr(doctor_cmd.secrets, "token_hex", lambda _n: "deadbeef")
+    monkeypatch.setattr(doctor_cmd.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(doctor_cmd, "_http_request", lambda *a, **k: (200, {}))
     token = "bxdeadbeef"
 
     def _http_json(url, key="", timeout=3.0):
@@ -346,7 +356,7 @@ def test_e2e_step2_tolerates_a_slow_turn_listing(monkeypatch, capsys):
             return {"facts": [{"id": "fact_x", "content": token}]}
         return None
 
-    monkeypatch.setattr(lifecycle, "_http_json", _http_json)
+    monkeypatch.setattr(doctor_cmd, "_http_json", _http_json)
     cfg = types.SimpleNamespace(host="127.0.0.1", port=1, upstream_model="m")
-    assert lifecycle._run_e2e_check(cfg, timeout_s=1.0) == 0
+    assert doctor_cmd._run_e2e_check(cfg, timeout_s=1.0) == 0
     assert "step 2 stored" in capsys.readouterr().out

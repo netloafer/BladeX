@@ -82,7 +82,7 @@ def test_all_three_gaps_reported_together_in_stable_order():
 def test_home_dir_project_is_not_a_gap():
     """🔴 判据是 `cwd_found`，**不是 `project_id`**。
 
-    hermes 的 live 形态：载体抽到了（`Current working directory: /Users/jasonye`），
+    hermes 的 live 形态：载体抽到了（`Current working directory: /Users/alice`），
     值是纯家目录 ⇒ `resolve_project` 第三档**正确**判 Global、`project_id` 为空。
     这是设计上正确的行为，不是缺口。
 

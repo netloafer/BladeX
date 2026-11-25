@@ -25,12 +25,15 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import os
+import threading
 from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
+
+from bladex_proxy.process_probe import pid_maybe_alive
 
 logger = structlog.get_logger()
 
@@ -254,13 +257,19 @@ _THRESHOLD_ENVS = {
 }
 
 
+#: 代码默认值。`config.py` 那份由 `test_ae_global_config` 对账（原则 12：同一个参数不许有两个默认）。
+DEFAULT_PROXY_URL = "http://127.0.0.1:38080"
+DEFAULT_QUERY_CACHE_SIZE = 256
+
+
 @dataclass
 class EmbedSettings:
-    """解析后的 embedding 生效配置（三层合并结果）。
+    """解析后的 embedding 生效配置（四级合并结果，批 AE）。
 
-    优先级：显式 env（BLADEX_EMBED_*，仅当该 env 真的被设置）
-          > routing.toml [embedding]（结构化管理，与 [distill] 同先例）
-          > 内置默认（local + e5-large 零回归）。
+    优先级（逐键）：显式 env（BLADEX_EMBED_*，仅当该 env 真的被设置）
+          > config/bladex.toml [embedding]
+          > routing.toml [embedding]（已弃用，至少再读一个版本）
+          > 内置默认（backend=local；model 空 = 库内盖章或 DEFAULT_LOCAL_MODEL）。
     密钥纪律：toml 只存 api_key_env / proxy_key_env（环境变量名），密钥不入 toml。
     """
 
@@ -268,12 +277,12 @@ class EmbedSettings:
     model: str = ""
     api_base: str = ""
     api_key: str = ""
-    proxy_url: str = "http://127.0.0.1:38080"
+    proxy_url: str = DEFAULT_PROXY_URL
     proxy_key: str = ""
-    query_cache_size: int = 256
+    query_cache_size: int = DEFAULT_QUERY_CACHE_SIZE
     # 合并后的阈值 profile 表（内置 MODEL_PROFILES + toml [embedding.profiles] 覆盖/新增）
     profiles: dict[str, dict[str, Any]] = field(default_factory=dict)
-    # 每个字段的**来源**：env | routing.toml | default（G9.4 H3 `config show --effective`）。
+    # 每个字段的**来源**：env | bladex.toml | routing.toml | default（G9.4 H3 `config show --effective`）。
     # 🔴 由 `pick` 在合并的同一处记录，不另写一份判断——"生效值"与"它从哪来"
     # 必须出自同一次合并，否则展示层会和真实优先级各说各话（这正是 H3 要终结的排查成本）。
     sources: dict[str, str] = field(default_factory=dict)
@@ -308,20 +317,38 @@ def _stored_local_model(cfg: Any) -> str:
 
 
 def resolve_embed_settings(cfg: Any) -> EmbedSettings:
-    """把 env / routing.toml [embedding] / 内置默认合并成生效配置。"""
-    toml_cfg = getattr(getattr(cfg, "routing_config", None), "embedding", None)
+    """把 env / bladex.toml / routing.toml [embedding] / 内置默认合并成生效配置。"""
+    from bladex_proxy.global_config import (
+        ORIGIN_GLOBAL,
+        ORIGIN_LEGACY,
+        embedding_section,
+        log_key_resolution,
+    )
+
+    section = embedding_section(cfg)
+    toml_cfg = section.config
 
     s = EmbedSettings()
 
     def pick(env_key: str, cfg_val: Any, toml_val: Any, default: Any,
-             field_name: str = "") -> Any:
+             field_name: str = "", toml_key: str = "") -> Any:
         # 显式优先级：env 真被设置（回滚通道，与 distill 同序）或 cfg 字段被程序化
-        # 改离默认值（测试/嵌入式构造）> toml > 内置默认。
+        # 改离默认值（测试/嵌入式构造）> toml（内部已按 bladex.toml > routing.toml 合并）> 内置默认。
         # `field_name` 只用于把这次判断的**结果来源**记进 s.sources（H3 可见性），
         # 不参与任何取值逻辑；不传就不记，行为逐字不变。
+        logical = toml_key or field_name
+        origin = section.origins.get(logical, ORIGIN_LEGACY)
+
         def note(src: str) -> None:
             if field_name:
                 s.sources[field_name] = src
+            present = [name for name, here in (
+                ("env", env_key in os.environ),
+                (ORIGIN_GLOBAL, logical in section.global_keys),
+                (ORIGIN_LEGACY, logical in section.legacy_keys),
+            ) if here]
+            if len(present) > 1:
+                log_key_resolution(logical, src, present)
 
         if env_key in os.environ:
             note("env")
@@ -330,7 +357,7 @@ def resolve_embed_settings(cfg: Any) -> EmbedSettings:
             note("env")   # 程序化构造（测试/嵌入式）与 env 同级，对外都算"显式设置"
             return cfg_val
         if toml_val not in (None, ""):
-            note("routing.toml")
+            note(origin)
             return toml_val
         note("default")
         return default
@@ -344,15 +371,15 @@ def resolve_embed_settings(cfg: Any) -> EmbedSettings:
     # 密钥：显式 env BLADEX_EMBED_API_KEY > toml api_key_env 引用的环境变量
     key_env = getattr(toml_cfg, "api_key_env", "") or ""
     s.api_key = pick("BLADEX_EMBED_API_KEY", getattr(cfg, "embed_api_key", ""),
-                     os.environ.get(key_env, "") if key_env else "", "", "api_key")
+                     os.environ.get(key_env, "") if key_env else "", "", "api_key", "api_key_env")
     s.proxy_url = pick("BLADEX_EMBED_PROXY_URL", getattr(cfg, "embed_proxy_url", ""),
-                       getattr(toml_cfg, "proxy_url", ""), "http://127.0.0.1:38080", "proxy_url")
+                       getattr(toml_cfg, "proxy_url", ""), DEFAULT_PROXY_URL, "proxy_url")
     pkey_env = getattr(toml_cfg, "proxy_key_env", "") or ""
     s.proxy_key = pick("BLADEX_EMBED_PROXY_KEY", getattr(cfg, "embed_proxy_key", ""),
-                       os.environ.get(pkey_env, "") if pkey_env else "", "", "proxy_key")
+                       os.environ.get(pkey_env, "") if pkey_env else "", "", "proxy_key", "proxy_key_env")
     s.query_cache_size = int(pick("BLADEX_EMBED_QUERY_CACHE",
-                                  getattr(cfg, "embed_query_cache_size", 256),
-                                  getattr(toml_cfg, "query_cache_size", None), 256,
+                                  getattr(cfg, "embed_query_cache_size", DEFAULT_QUERY_CACHE_SIZE),
+                                  getattr(toml_cfg, "query_cache_size", None), DEFAULT_QUERY_CACHE_SIZE,
                                   "query_cache_size"))
 
     # 默认值变更保护（2026-07-26 默认 e5-large -> bge-small-en-v1.5）：
@@ -378,7 +405,7 @@ def resolve_embed_settings(cfg: Any) -> EmbedSettings:
 
     # 阈值 profile 合并：内置为底，toml 覆盖/新增（只覆盖非 None 字段）
     s.profiles = {k: dict(v) for k, v in MODEL_PROFILES.items()}
-    for name, prof in (getattr(toml_cfg, "profiles", None) or {}).items():
+    for name, prof in toml_cfg.profiles.items():
         base = dict(s.profiles.get(name, {}))
         for f_name in ("dim", "novelty", "semantic", "digestion"):
             val = getattr(prof, f_name, None)
@@ -483,7 +510,7 @@ def _write_download_state(cache_dir: str, **fields: Any) -> None:
         # 顺手清掉死进程留下的标记（被 kill -9 的上一次首启）
         for name in os.listdir(os.path.dirname(path)):
             stem = name.removesuffix(".json")
-            if stem.isdigit() and int(stem) != os.getpid() and not _pid_alive(int(stem)):
+            if stem.isdigit() and int(stem) != os.getpid() and not pid_maybe_alive(int(stem)):
                 with contextlib.suppress(OSError):
                     os.unlink(os.path.join(os.path.dirname(path), name))
         tmp = f"{path}.tmp"
@@ -497,16 +524,6 @@ def _write_download_state(cache_dir: str, **fields: Any) -> None:
 def _clear_download_state(cache_dir: str) -> None:
     with contextlib.suppress(OSError):
         os.unlink(_download_state_path(cache_dir, os.getpid()))
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
 
 
 def read_download_state(cache_dir: str, pid: int) -> dict | None:
@@ -526,7 +543,7 @@ def read_download_state(cache_dir: str, pid: int) -> dict | None:
         return None
     if not isinstance(data, dict):
         return None
-    if data.get("state") == "downloading" and not _pid_alive(pid):
+    if data.get("state") == "downloading" and not pid_maybe_alive(pid):
         return None
     return data
 
@@ -628,20 +645,26 @@ class _QueryLRU:
     def __init__(self, capacity: int = 256) -> None:
         self._capacity = max(0, capacity)
         self._data: OrderedDict[str, list[float]] = OrderedDict()
+        # MQ-W26：批 DS1a 起 `GET /admin/facts?q=` 在工作线程里 embed_query，与事件循环上的
+        # 工具面检索并发。"先查在不在、再 move_to_end" 两步之间被另一线程淘汰 ⇒ KeyError。
+        # 命中 / 写入 / 淘汰都在这把锁里（全是内存操作，持锁时间微秒级）。
+        self._lock = threading.Lock()
 
     def get(self, key: str) -> list[float] | None:
-        if key not in self._data:
-            return None
-        self._data.move_to_end(key)
-        return self._data[key]
+        with self._lock:
+            if key not in self._data:
+                return None
+            self._data.move_to_end(key)
+            return self._data[key]
 
     def put(self, key: str, value: list[float]) -> None:
         if self._capacity <= 0:
             return
-        self._data[key] = value
-        self._data.move_to_end(key)
-        while len(self._data) > self._capacity:
-            self._data.popitem(last=False)
+        with self._lock:
+            self._data[key] = value
+            self._data.move_to_end(key)
+            while len(self._data) > self._capacity:
+                self._data.popitem(last=False)
 
 
 class RouterEmbedAdapter:
@@ -680,7 +703,7 @@ class RouterEmbedAdapter:
             kwargs["api_base"] = self._api_base
         if self._api_key:
             kwargs["api_key"] = self._api_key
-        resp = router_sdk.embedding(**kwargs)
+        resp = router_sdk.embedding(purpose="embedding", **kwargs)
         data = resp["data"] if isinstance(resp, dict) else resp.data
         rows = sorted(data, key=lambda d: d["index"] if isinstance(d, dict) else d.index)
         out: list[list[float]] = []
@@ -718,6 +741,10 @@ class RouterEmbedAdapter:
         return f"api:{self._model}"
 
 
+#: 远端答不上指纹时，两次握手的最小间隔（秒）。
+_FINGERPRINT_PROBE_INTERVAL_S = 60.0
+
+
 class ProxyEmbedAdapter:
     """共享模型 adapter（方案 D）：HTTP 调 BladeX proxy 的 `/v1/embeddings`。
 
@@ -741,6 +768,8 @@ class ProxyEmbedAdapter:
         self._query_cache = _QueryLRU(query_cache_size)
         self._remote_model: str | None = None
         self._remote_identity: str | None = None
+        self._remote_fingerprint = ""
+        self._fingerprint_probed_at: float | None = None
         # 调用方归因（2026-08-09）：共享模型档下 consolidator 用的就是数据面那把
         # key，远端只看 key label 分不出是"agent 在对话"还是"consolidator 在嵌入"。
         # 故恒发调用方 header —— 是 BladeX 自家两个进程之间的私有约定，
@@ -777,6 +806,7 @@ class ProxyEmbedAdapter:
         body = resp.json()
         self._remote_model = body.get("model") or self._remote_model
         self._remote_identity = body.get("bladex_model_identity") or self._remote_identity
+        self._remote_fingerprint = body.get("bladex_vector_fingerprint") or self._remote_fingerprint
         rows = sorted(body["data"], key=lambda d: d["index"])
         return [[float(x) for x in row["embedding"]] for row in rows]
 
@@ -813,7 +843,7 @@ class ProxyEmbedAdapter:
         raise RuntimeError(
             f"BladeX proxy at {self._base_url} not ready after {timeout_s}s "
             f"(last error: {last}). Is the proxy running? "
-            f"If it requires auth, set the client key via [embedding].proxy_key_env."
+            f"If it requires auth, set the client key via [embedding].proxy_key_env in config/bladex.toml."
         )
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -846,6 +876,29 @@ class ProxyEmbedAdapter:
         """远端的向量空间身份（与远端 proxy/consolidator 盖章一致）。"""
         self._probe()
         return self._remote_identity or f"proxy:{self._base_url}"
+
+    @property
+    def vector_fingerprint(self) -> str:
+        """算向量的 embedder 指纹，**取 proxy 端回报的**（MQ-I46，与 IPC 档同一约定）。
+
+        算向量的是远端，本进程的库版本答不了这个问题。每次真实调用都刷新，所以远端换模型或
+        换库后，第一次未命中的调用就会换桶；命中台账的读不走网络，感知不到，这点与 IPC 档相同。
+        空串 = 答不上来（远端没起 / 旧版 proxy 不回报）⇒ `MemoryIndex` 这次旁路台账，只多算一次。
+        旧版 proxy 每次都答不上来，握手要限频：一次握手是一次真实的嵌入请求。
+        """
+        if self._remote_fingerprint:
+            return self._remote_fingerprint
+        import time
+
+        now = time.monotonic()
+        if (self._fingerprint_probed_at is None
+                or now - self._fingerprint_probed_at >= _FINGERPRINT_PROBE_INTERVAL_S):
+            self._fingerprint_probed_at = now
+            try:
+                self._call(["__probe__"], "passage")
+            except Exception as e:  # noqa: BLE001 —— 握手失败不改变 adapter 状态，同 IPC 档
+                logger.debug("embed_identity_probe_failed", error=str(e), url=self._base_url)
+        return self._remote_fingerprint
 
 
 def validate_embed_sensitivity(cfg: Any) -> None:
@@ -1002,7 +1055,7 @@ def embed_model_identity(cfg: Any, role: str = "proxy") -> str:
 def effective_thresholds(cfg: Any) -> dict[str, float]:
     """解析生效阈值：显式 env > per-model profile > 全局默认（+告警）。
 
-    profile 表 = 内置 MODEL_PROFILES + routing.toml [embedding.profiles] 覆盖/新增
+    profile 表 = 内置 MODEL_PROFILES + toml [embedding.profiles] 覆盖/新增（bladex.toml > routing.toml）
     （api 模型也可声明 profile，声明 calibrated=true 后不再告警）。
     评估 §4.3：阈值是 e5-large 上标定的。换模型时若用户没显式设阈值，
     用 profile 的保守默认并告警（建议真实流量重标）。
@@ -1030,6 +1083,6 @@ def effective_thresholds(cfg: Any) -> dict[str, float]:
             thresholds=out,
             hint="novelty/semantic/digestion were calibrated on e5-large; "
                  "re-validate on real traffic, set BLADEX_*_THRESHOLD, or declare "
-                 "[embedding.profiles.\"<model>\"] with calibrated=true in routing.toml",
+                 "[embedding.profiles.\"<model>\"] with calibrated=true in config/bladex.toml",
         )
     return out

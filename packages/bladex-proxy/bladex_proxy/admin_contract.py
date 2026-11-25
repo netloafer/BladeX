@@ -37,7 +37,11 @@ from __future__ import annotations
 #: 2 = 批 Q3A（2026-09-29，MQ-I30）：`POST /admin/turns/tombstone-by-project` 真跑改为
 #: 后台 job——回 `status="submitted"` + `job_id`，结果经 `GET /admin/jobs/{job_id}` 取。
 #: 旧 CLI 会把 "submitted" 当失败渲染 ⇒ 必须 +1，生产 proxy 必须重启。
-ADMIN_CONTRACT_VERSION = 2
+#: 3 = 批 DS1a（2026-10-25，MQ-R15 / DS-04）：`POST /admin/turns/tombstone-by-project` 未知 body
+#: 键改报 400；`POST /admin/ledgers/user-edit` 认 `expected_rev`（旧 proxy 会静默忽略它而照样
+#: 整本覆盖——正是 MQ-I24 的形态，所以调用方要先确认对面认这个版本）；`sticky/flush` /
+#: `queue/flush` 未知 query 改报 400。生产 proxy 必须重启。
+ADMIN_CONTRACT_VERSION = 3
 
 #: `/ready` 里承载它的键名（CLI 与服务端共用，避免两处各写一个字符串）。
 ADMIN_CONTRACT_FIELD = "admin_contract"

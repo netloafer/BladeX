@@ -188,9 +188,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "bladex_ledger_read",
+            # 批 SW · 步骤 3：去掉 "BEFORE switching to it"——它把 read 写成 switch 的前置步骤，
+            # 混合调用路径上 read 之后落在工具面（"do NOT switch…"）。逐字来源 = wording_drafts.py 甲′ S7。
             "description": "Read a task ledger (Goal/Core/Verified/Open/Next). "
                            "Omit ledger_id for the active one; pass an id from the "
-                           "listed ledgers to inspect it BEFORE switching to it.",
+                           "listed ledgers to inspect it without switching.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -303,6 +305,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                             "required": ["op"],
                         },
                     },
+                    # 🔴 批 PW · 步骤 2（拍板 (98)）：子本回写父本不必 switch。描述逐字来自
+                    # report-batch-PW §4；校验在 `_h_ledger_update`（只认激活本 Next 里
+                    # `[sub-task]` 条目的 ref）。
+                    "ledger_id": {"type": "string",
+                                  "description": "ONLY to report back to the parent "
+                                                 "ledger named in your [sub-task] Next "
+                                                 "entry (do not switch to it). Omit "
+                                                 "otherwise: the active ledger is "
+                                                 "updated."},
                     "rev": {"type": "integer",
                             "description": "the rev you last read (ledger "
                                            "header); include it — another agent "
@@ -339,9 +350,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "bladex_ledger_switch",
-            "description": "Switch this session to another ledger, or create one "
-                           "for a new task. Use only when the user clearly changed "
-                           "tasks.",
+            # 批 SW · 步骤 3：原文 "Use only when the user clearly changed tasks." 压住了候选段要模型做的
+            # 「切回旧本」，与首步指令方向相反；改成同一口径（逐字来源 = wording_drafts.py 甲′ S6）。
+            "description": "Switch this session to an existing ledger (pass its id), "
+                           "or create one (ledger_id='') when the user moved to a "
+                           "different subject. Not for a new angle, follow-up or "
+                           "another deliverable on the same subject.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -406,10 +420,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     # LLM 的决策，BladeX 不替它判（三红线：不做作者）。
                     "parent_ledger_id": {
                         "type": "string",
-                        "description": "ONLY when this new ledger is a sub-task of "
-                                       "an existing one: that ledger's id. Omit for "
-                                       "a new independent task, even if another "
-                                       "ledger is currently active.",
+                        "description": "ONLY when finishing this new ledger would "
+                                       "complete part of an existing ledger's Goal: "
+                                       "that ledger's id. A related topic, a sibling "
+                                       "task or a follow-up is NOT a sub-task — omit "
+                                       "this for it, even if another ledger is "
+                                       "currently active.",
                     },
                     # 🔴 批 Y · Y1c（MQ-L91）：轮数防抖改为**举证**。BladeX 对照本轮用户原话
                     # （剥信封）校验它是不是真摘录，结果进 Hub `LEDGER_SWITCH.evidence_ok`。

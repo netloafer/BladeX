@@ -644,6 +644,102 @@ def parse_ledger_md(text: str, *, base: Ledger | None = None) -> Ledger:
     return ledger
 
 
+# ── 用户编辑 Markdown → 只应用真正改过的条目（批 CB，dispatch 拍板 (41)-b-1）────────
+
+
+@dataclass
+class MdEdit:
+    """`merge_md_edit` 的结果：只含用户相对「当前版的那份渲染」真正改过的部分。"""
+
+    title: str | None = None
+    goal: str | None = None
+    #: 改过的段（整段新内容）；没改的段不在这里。
+    sections: dict[str, list[LedgerEntry]] = field(default_factory=dict)
+    #: 用户在文件里新加的段名。
+    new_sections: list[str] = field(default_factory=list)
+
+    @property
+    def empty(self) -> bool:
+        return self.title is None and self.goal is None and not self.sections
+
+
+def _render_key(entry: LedgerEntry) -> tuple[str, str, str, str] | None:
+    """一条条目渲染再解析之后的样子。用它比，才知道文件里的那一行是不是这一条没动过。"""
+    parsed = parse_ledger_md(f"## x\n\n{_render_entry(entry)}\n").sections.get("x") or []
+    if not parsed:
+        return None
+    p = parsed[0]
+    return (p.text, p.source, p.ref, p.writer)
+
+
+def merge_md_edit(current: Ledger, text: str) -> MdEdit:
+    """用户编辑过的 Markdown 相对 `current` 的改动。
+
+    🔴 **不能整本应用 `parse_ledger_md` 的结果**：渲染再解析不是恒等的。11-02 快照 74 本里，
+    3 条 `text` 本身带着 `<sub>[…]</sub>` 尾巴的条目会被拆成别的 text / source / ref，
+    另有二十多条 `ref` 里带 ` · @writer` 的条目 ref 与 writer 都会变。用户只改一条，这些也跟着变。
+
+    所以按「这一行与当前版某条的渲染相同 ⇒ 用户没碰 ⇒ 取当前版原对象」逐条认领，
+    只有认领不到的行才是用户写的。顺序跟文件走（用户可以调序）。
+
+    :raises LedgerError: 文件属于另一本账本，或段内有解析不了的行（不静默丢用户写的字）。
+    """
+    for raw in text.splitlines():
+        m = _META_RE.match(raw.rstrip())
+        if m and m.group(1) == "ledger" and m.group(2).strip() != current.ledger_id:
+            raise LedgerError(f"this file is for ledger {m.group(2).strip()}, "
+                              f"not {current.ledger_id}")
+    rendered = render_ledger_md(current)
+    base = parse_ledger_md(rendered, base=current)
+    new = parse_ledger_md(text, base=current)
+    rendered_lines = set(rendered.splitlines())
+    _reject_dropped_lines(text, rendered_lines)
+
+    out = MdEdit()
+    if new.title != base.title:
+        out.title = new.title
+    if new.goal != base.goal:
+        out.goal = new.goal
+    for key in new.section_order:
+        if key == SECTION_GOAL:
+            continue
+        if not re.fullmatch(r"[a-z][a-z0-9_-]*", key):
+            raise LedgerError(f"bad section name {key!r}")
+        if key not in current.section_order:
+            out.new_sections.append(key)
+        claimable: dict[tuple[str, str, str, str], list[LedgerEntry]] = {}
+        for e in current.entries(key):
+            k = _render_key(e)
+            if k is not None:
+                claimable.setdefault(k, []).append(e)
+        merged: list[LedgerEntry] = []
+        for e in new.entries(key):
+            hit = claimable.get((e.text, e.source, e.ref, e.writer))
+            merged.append(hit.pop(0) if hit else e)
+        if merged != current.entries(key):
+            out.sections[key] = merged
+    for key in current.section_order:
+        if key != SECTION_GOAL and key not in new.section_order and current.entries(key):
+            out.sections[key] = []    # 用户删掉了整段标题 = 清空这一段；段结构不动
+    return out
+
+
+def _reject_dropped_lines(text: str, rendered_lines: set[str]) -> None:
+    """`parse_ledger_md` 会丢掉段内不是 `- ` 开头的行；用户写的字不许这样消失。"""
+    current: str | None = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if line.startswith("## "):
+            current = line[3:].strip().lower()
+            continue
+        if current in (None, SECTION_GOAL) or not line or line == _EMPTY_MARK:
+            continue
+        if line.startswith(("- ", "<!--")) or line in rendered_lines:
+            continue
+        raise LedgerError(f"cannot read this line in section {current!r}; "
+                          f"entries must start with \"- \": {line[:80]}")
+
+
 # ── 池化路径（账本投影落点；真相在 Hub 事件流，ADR-0034 §3.2）──────────────────
 
 LEDGERS_DIR = "ledgers"

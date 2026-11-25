@@ -114,6 +114,9 @@ def test_all_memory_flags_and_defaults():
         # ≈13h CPU/天），不是加特性；=0 逐字回到每轮固定 sleep 的旧行为，
         # 既是回滚通道也是本批判据④(a) 的阴性对照。
         "BLADEX_CONSOLIDATOR_IDLE_BACKOFF": True,
+        "BLADEX_SCAN_CURSOR": True,
+        # 批 BB · 2a（拍板 (102)）：矛盾标记，公开默认关、实验性。
+        "BLADEX_CONTRADICTION_ENABLED": False,
     }
     assert "BLADEX_KEYWORD_CHANNEL" not in MEMORY_FLAG_DEFAULTS
     # 2026-09-03 S4：四个退役开关连代码一起删，表里不得再出现（僵尸回归断言）。
@@ -160,10 +163,17 @@ def test_numeric_defaults_table():
         "BLADEX_ADJUDICATE_CHUNK": 25.0,
         # 2026-08-31（MQ-S32 病 B）：裁决中断守卫。与蒸馏侧同型同默认值——
         # 裁决失败是降级不抛的（整块判 ADD），而 ADD 是合法判决，下游看不出。
-        "BLADEX_ADJUDICATE_OUTAGE_ABORT_RATIO": 0.5,
+        # 批 AA2：0.5 → 0.01（增量中止可干净重试之后统一收紧，拍板 (8)）。
+        "BLADEX_ADJUDICATE_OUTAGE_ABORT_RATIO": 0.01,
+        "BLADEX_ADJUDICATE_RETRY_MAX": 3.0,
+        # 批 AA · MQ-I35：裁决上游不可达时的退避总上限（秒）——网络错误不再降级 ADD。
+        "BLADEX_ADJUDICATE_OUTAGE_MAX_WAIT_S": 21600.0,
         # 2026-08-31（MQ-A28/A29）：嵌入分块。整批调用让 IPC 必超时、期间零进度、
         # 且打不断；512 是保守起点，按 consolidate_embed_progress 的 rate 标定。
         "BLADEX_EMBED_BATCH": 512.0,
+        # 批 AA · MQ-A28：IPC 客户端单次请求的块上限与超时（此前写死 120 s、不分块）。
+        "BLADEX_EMBED_IPC_CHUNK": 64.0,
+        "BLADEX_EMBED_IPC_TIMEOUT_S": 120.0,
         # M3-2 三时钟（5.9 拍板 6：先立观测、真实数据标定后调 —— 起步值不是结论）
         "BLADEX_CLOCK_STALE_UPDATE_D": 14.0,
         "BLADEX_CLOCK_STALE_HIT_D": 30.0,
@@ -195,6 +205,9 @@ def test_numeric_defaults_table():
         "BLADEX_INDEX_MAX_VERSIONS": 64.0,
         # MQ-S9 / G12.2-pre（2026-08-20 拍板 4h）：fp: 会话桶时间窗切分；0=关。
         "BLADEX_SESSION_FP_WINDOW_S": 14400.0,
+        # 批 BA1：会话延续凭证 ② 的产出环容量与文本下限（读数在 flags.py）。
+        "BLADEX_SESSION_OUTPUT_RING": 32.0,
+        "BLADEX_SESSION_OUTPUT_MIN_CHARS": 64.0,
         # 2026-08-22：写入侧蒸馏并发。收进本表的理由不是"它是记忆机制"（它不是），
         # 而是它犯的正是本组测试要防的那类腐化——同一个参数在两条调用路径上各带
         # 一个默认值（sync 4 / 守护进程 1），谁也不知道生产跑的是哪个。
@@ -229,10 +242,21 @@ def test_numeric_defaults_table():
         # （`bladex start` / `run_consolidator.sh`），任何一个就地默认值
         # 都会让"生产在跑哪个值"变得不可回答（刚性原则 12 第二条判据）。
         "BLADEX_CONSOLIDATOR_IDLE_AFTER": 3.0,
+        "BLADEX_SCAN_RECONCILE_ROUNDS": 120.0,
+        "BLADEX_SCAN_RECONCILE_S": 3600.0,
         "BLADEX_CONSOLIDATOR_IDLE_MAX_S": 1800.0,
         # 批 Q3C：`bladex start` 每类日志保留数（0 = 关闭清理）。此前是
         # `cli/lifecycle.py` 里就地的 `os.environ.get(..., "20")`，不受本对账约束。
         "BLADEX_LOG_KEEP": 20.0,
+        # 批 CB：交接包五个上限（取值依据见 flags.py）。
+        "BLADEX_HANDOFF_MAX_CHARS": 20000,
+        "BLADEX_HANDOFF_MAX_ROUNDS": 5,
+        "BLADEX_HANDOFF_USER_TEXT_CHARS": 500,
+        "BLADEX_HANDOFF_ROUND_ENTRIES": 8,
+        "BLADEX_HANDOFF_IMPORT_MAX_BYTES": 1048576,
+        # 批 BB · 2a：矛盾判定成本上限（每条 fact 次数 / 日 input token）。
+        "BLADEX_CONTRADICTION_MAX_JUDGMENTS_PER_FACT": 6,
+        "BLADEX_CONTRADICTION_DAILY_INPUT_TOKENS": 400000,
     }
 
 

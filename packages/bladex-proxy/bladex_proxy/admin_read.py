@@ -15,17 +15,22 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import structlog
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .metrics import DEGRADATION
-from .storage.memory_hub import MemoryHub
+from .models import AdminEvent, AdminEventType, TombstoneTargetType
+from .storage.memory_hub import HubRequiresNewerVersion, MemoryHub
 from .storage.memory_index import MemoryIndex
-from .sync_control import HEARTBEAT_KEY, JOB_PREFIX, LAST_JOB_KEY
+from .sync_control import HEARTBEAT_CONTRADICTION_FIELD, HEARTBEAT_KEY, JOB_PREFIX, LAST_JOB_KEY
+from .usage import hub_usage_summary
 
 logger = structlog.get_logger()
 
@@ -34,6 +39,93 @@ _FACT_EXCLUDE = {"embedding"}
 _MATTER_EXCLUDE = {"centroid", "embedding"}
 
 _MAX_LIMIT = 500
+
+
+#: `GET /admin/usage` 的全部 query 参数（`_strict_query` 与 `bladex usage` 共用这一份）。
+_USAGE_PARAMS = ("days", "since", "until", "agent", "model", "session", "tz")
+
+
+def _fact_correct_row(key: str, ev: AdminEvent, fact_id: str) -> dict[str, Any] | None:
+    p = ev.payload
+    if p.get("fact_id") != fact_id:
+        return None
+    entity = p.get("entity")
+    return {"type": ev.event_type.value, "at": ev.ts.isoformat(), "key": key,
+            "origin": p.get("origin", ""), "submitter": p.get("submitter", ""),
+            "previous_content": p.get("previous_content"),
+            "content": entity.get("content") if isinstance(entity, dict) else None}
+
+
+def _contradiction_row(key: str, ev: AdminEvent, fact_id: str) -> dict[str, Any] | None:
+    """批 BB · 2b：`audience_set` + `kind` 载荷（矛盾标记 / 裁定）进修改史；老的 fact_id / audience 事件不在此列。
+    解析只经 `consistency.parse_payload`（唯一解析点）；不认识的 `kind` 返回 None。"""
+    from bladex_core import consistency as cs
+
+    rec = cs.parse_payload(ev.payload)
+    if rec is None or fact_id not in rec.pair:
+        return None
+    other = rec.pair[1] if rec.pair[0] == fact_id else rec.pair[0]
+    row = {"type": ev.event_type.value, "kind": ev.payload.get("kind"), "at": ev.ts.isoformat(), "key": key,
+           "pair_id": rec.key, "other_fact_id": other}
+    if isinstance(rec, cs.VerdictRecord):
+        row.update({"verdict": rec.verdict, "origin": rec.origin, "note": rec.note})
+    else:
+        row.update({"judge_model": rec.judge_model, "prompt_sha": rec.prompt_sha})
+    return row
+
+
+#: fact 修改史收哪些管理事件：类型 → 摊平成一行（不属于这条 fact 返回 None）。
+#: 🔴 响应的 `events` 是按 `type` 区分的开放列表：BB 步骤 2 的 `audience_set` + `kind` 往这里加一项，
+#: 不改响应结构（拍板 (67)-c）。读者遇到不认识的 `type` 要照常显示，不能丢。
+_FACT_HISTORY_EVENTS: dict[AdminEventType, Callable[[str, AdminEvent, str], dict[str, Any] | None]] = {
+    AdminEventType.FACT_CORRECT: _fact_correct_row,
+    AdminEventType.AUDIENCE_SET: _contradiction_row,
+}
+
+
+def fact_history_events(hub: MemoryHub, fact_id: str) -> list[dict[str, Any]]:
+    """这条 fact 在 Hub 里的修改史，按时间升序。按前缀 seek 扫管理事件与墓碑，代价随事件数，不随 Hub 总量。"""
+    rows: list[dict[str, Any]] = []
+    for key, ev in hub.scan_admin_events():
+        build = _FACT_HISTORY_EVENTS.get(ev.event_type)
+        row = build(key, ev, fact_id) if build is not None else None
+        if row is not None:
+            rows.append(row)
+    for key, t in hub.scan_tombstones():
+        if t.target_type == TombstoneTargetType.FACT and t.target_key == fact_id:
+            rows.append({"type": "tombstone", "at": t.ts.isoformat(), "key": key,
+                         "origin": t.origin, "source": getattr(t.source, "value", str(t.source))})
+    rows.sort(key=lambda r: datetime.fromisoformat(r["at"]))
+    return rows
+
+
+def _parse_tz(text: str) -> tzinfo:
+    """`Asia/Shanghai` / `+08:00` / 空（本机时区）→ tzinfo；认不出 ⇒ ValueError。"""
+    text = text.strip()
+    if not text:
+        return datetime.now().astimezone().tzinfo or UTC
+    if text[0] in "+-":
+        try:
+            off = datetime.strptime(text.replace(":", ""), "%z").utcoffset()
+        except ValueError:
+            raise ValueError(f"tz offset must look like +08:00, got {text!r}") from None
+        return timezone(off) if off is not None else UTC
+    try:
+        return ZoneInfo(text)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ValueError(f"unknown tz {text!r}") from None
+
+
+def _parse_instant(text: str, zone: tzinfo, name: str) -> datetime | None:
+    """ISO 日期 / 时刻 → 带时区的时刻（不带时区按 `zone`）；空 ⇒ None。"""
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"{name} must be an ISO date/time, got {text!r}") from None
+    return dt if dt.tzinfo else dt.replace(tzinfo=zone)
 
 
 def _err(status_code: int, message: str, err_type: str) -> JSONResponse:
@@ -267,8 +359,74 @@ def _disk_usage(cfg: Any, *, ttl_s: float = _DISK_TTL_S,
     return value
 
 
+def _matter_detail_payload(index: MemoryIndex, matter_id: str,
+                           facts_top_k: int) -> dict[str, Any] | None:
+    """`GET /admin/matters/{id}` 的响应体（Matter 不存在 ⇒ None）。同步，经 `run_blocking` 调。
+
+    取法（逐个：`get_edges` + `get_facts_for_matter`，各全扫一遍）批 DS1b 不动；序列化在
+    `_matter_detail_from`，与批量路径 `_matter_members_payload` 同一份。
+    """
+    matter = index.get_matter(matter_id)
+    if matter is None:
+        return None
+    edges = index.get_edges(matter_id)
+    try:
+        facts = index.get_facts_for_matter(matter_id, top_k=_clamp_limit(facts_top_k))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("admin_matter_facts_failed", error=str(e))
+        facts = []
+    return _matter_detail_from(matter, edges, facts)
+
+
+def _matter_members_payload(index: MemoryIndex, matter_ids: list[str],
+                            facts_top_k: int) -> dict[str, dict[str, Any]]:
+    """`GET /admin/matters?include=members` 的 `members`（批 DS1b，MQ-I41）。同步，经 `run_blocking` 调。
+
+    取法：`index.get_matter_members` **一次**全扫 meta 按 Matter 分组（DS1a 是逐个取，
+    329 张 = 658 遍全扫 = 66.6 s）。序列化与单个详情同一份（`_matter_detail_from`）⇒
+    `members[id]` 与 `GET /admin/matters/{id}?facts_top_k=<同值>` 逐字相同。
+    列出与取详情之间被删的卡照实缺席，不补空；键序 = `matter_ids` 的顺序。
+    """
+    grouped = index.get_matter_members(matter_ids, top_k=_clamp_limit(facts_top_k))
+    out: dict[str, dict[str, Any]] = {}
+    for mid in matter_ids:
+        hit = grouped.get(mid)
+        if hit is None:
+            continue
+        matter, edges, facts = hit
+        if facts is None:  # 与单个详情同口径：取成员失败 ⇒ 空列表（日志已在 Index 侧）
+            logger.warning("admin_matter_facts_failed", matter_id=mid)
+            facts = []
+        out[mid] = _matter_detail_from(matter, edges, facts)
+    return out
+
+
+def _matter_detail_from(matter: Any, edges: list[Any], facts: list[Any]) -> dict[str, Any]:
+    """Matter 详情的序列化——单个详情与批量 `members` **共用这一份**（批 DS1a / DS1b）。"""
+    session_keys = [
+        e.target_key for e in edges if str(e.target_type.value) == "session"
+    ]
+    return {
+        "matter": _matter_dict(matter),
+        "edges": [e.model_dump(mode="json") for e in edges],
+        "facts": [_fact_dict(f) for f in facts],
+        "session_keys": session_keys,
+        "edge_count": len(edges),
+        "manual_edge_count": sum(
+            1 for e in edges if str(e.provenance.value) == "manual"
+        ),
+    }
+
+
 def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
-    """注册 T9 只读端点。admin_dep = server._admin_key_dep（同一鉴权面）。"""
+    """注册 T9 只读端点。admin_dep = server._admin_key_dep（同一鉴权面）。
+
+    🔴 批 DS1a（MQ-W24）：碰 Hub / Index（以及目录扫描 / Flash 文件）的同步读一律经
+    `server.blocking.run_blocking` 进工作线程，不许在 `async def` 体里直接调——否则一次慢读
+    卡住整个事件循环，所有 agent 的请求一起排队。守卫 `tests/test_ds1a_admin_blocking_guard.py`。
+    （延迟 import：`server` 包在 import 链上排在本模块之前，模块顶层 import 会循环。）
+    """
+    from .server.blocking import run_blocking
 
     # ── GET /admin/status ──────────────────────────────────────────
 
@@ -300,37 +458,66 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
             pipeline_info["overflow_count"] = getattr(pipeline, "overflow_count", 0)
             pipeline_info["spill_count"] = getattr(pipeline, "spill_count", 0)
 
-        # Memory Hub 完整总账
         hub: MemoryHub | None = getattr(state, "hub", None)
-        hub_turns: int | None = None
-        if hub is not None:
-            try:
-                hub_turns = hub.count()
-            except Exception as e:  # noqa: BLE001
-                logger.warning("admin_status_hub_count_failed", error=str(e))
-        hub_info = {"available": hub is not None, "turns": hub_turns}
-
-        # Memory Index 派生层 + consolidator 追新滞后
         index: MemoryIndex | None = getattr(state, "index", None)
-        index_info: dict[str, Any] = {"available": index is not None}
-        if index is not None:
-            try:
-                index_info["facts"] = index.fact_count()
-                index_info["matters"] = len(index.all_matters())
-                consumed = index.consumed_count()
-                index_info["consumed_turns"] = consumed
-                if hub_turns is not None:
-                    # MQ-R5：`hub.count()` 已扣墓碑（与 scan_meta 同一套跳过规则），
-                    # 两端口径一致后这个差才是真积压；此前恒虚报 500 轮。
-                    # MQ-R3：两个计数各自会先 catch-up，不再是冻结快照。
-                    index_info["lag_turns"] = max(0, hub_turns - consumed)
-                index_info["rebuild_backlog"] = index.last_rebuild_backlog
-            except Exception as e:  # noqa: BLE001
-                index_info["error"] = str(e)
+
+        def _storage() -> tuple[dict[str, Any], dict[str, Any]]:
+            # Memory Hub 完整总账
+            hub_turns: int | None = None
+            if hub is not None:
+                try:
+                    hub_turns = hub.count()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("admin_status_hub_count_failed", error=str(e))
+            hub_info = {"available": hub is not None, "turns": hub_turns}
+
+            # Memory Index 派生层 + consolidator 追新滞后
+            index_info: dict[str, Any] = {"available": index is not None}
+            if index is not None:
+                try:
+                    index_info["facts"] = index.fact_count()
+                    index_info["matters"] = len(index.all_matters())
+                    consumed = index.consumed_count()
+                    index_info["consumed_turns"] = consumed
+                    if hub_turns is not None:
+                        # MQ-R5：`hub.count()` 已扣墓碑（与 scan_meta 同一套跳过规则），
+                        # 两端口径一致后这个差才是真积压；此前恒虚报 500 轮。
+                        # MQ-R3：两个计数各自会先 catch-up，不再是冻结快照。
+                        index_info["lag_turns"] = max(0, hub_turns - consumed)
+                    index_info["rebuild_backlog"] = index.last_rebuild_backlog
+                except Exception as e:  # noqa: BLE001
+                    index_info["error"] = str(e)
+            return hub_info, index_info
+
+        hub_info, index_info = await run_blocking(_storage)
 
         # consolidator：最近手工同步 job + 后台循环心跳（轮内进度）
         sync_job = await _read_sync_job(pipeline)
         heartbeat = await _read_consolidator_heartbeat(pipeline)
+
+        def _contradiction_status() -> dict[str, Any] | None:
+            """批 BB · 2b/2c：判定在 consolidator 进程里跑，所以「开没开」以 consolidator 心跳里报的
+            `contradiction_enabled` 为准，**不读本进程 env**（原则 13 层 4：值要来自它声称的来源）。
+            没报过（没起 / 心跳过期 / 旧版本不带这个字段）或报的是关 ⇒ None ⇒ 响应里没有这个键。"""
+            from bladex_core import consistency as cs
+            from bladex_core.flags import flag_number
+
+            if not heartbeat or str(heartbeat.get(HEARTBEAT_CONTRADICTION_FIELD, "")) != "1":
+                return None
+            block: dict[str, Any] = {"enabled": True,
+                                     "daily_input_tokens_cap": int(flag_number(cs.DAILY_TOKENS_FLAG)),
+                                     "per_fact_cap": int(flag_number(cs.MAX_PER_FACT_FLAG))}
+            if index is None:
+                return {**block, "pending": None, "daily_input_tokens_used": None}
+            try:
+                usage = index.contradiction_usage(datetime.now(UTC).strftime("%Y-%m-%d"))
+                block["pending"] = usage["pending"]
+                block["daily_input_tokens_used"] = usage["daily_input_tokens_used"]
+            except Exception as e:  # noqa: BLE001 —— status 不因读数失败而 500
+                block.update({"pending": None, "daily_input_tokens_used": None, "error": str(e)})
+            return block
+
+        contradiction_info = await run_blocking(_contradiction_status)
 
         # 路由 source 分布 + 请求指标（metrics 快照）
         metrics = getattr(state, "metrics", None)
@@ -362,26 +549,33 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
         # 注意与 counter 的区别：这里回答的是"最近 1h 还在不在降级"，不是累计值。
         degradation = DEGRADATION.snapshot()
 
-        # 磁盘占用（O3）：60s 缓存，见 _disk_usage
-        try:
-            disk = _disk_usage(cfg)
-        except Exception as e:  # noqa: BLE001 —— status 不因磁盘扫描失败而 500
-            logger.debug("admin_status_disk_failed", error=str(e))
-            disk = {}
+        def _files() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+            # 磁盘占用（O3）：60s 缓存，见 _disk_usage
+            try:
+                disk = _disk_usage(cfg)
+            except Exception as e:  # noqa: BLE001 —— status 不因磁盘扫描失败而 500
+                logger.debug("admin_status_disk_failed", error=str(e))
+                disk = {}
 
-        # Memory Flash 新鲜度（MQ-F4 / F2）：daemon 写 `.flash_state.json`，这里只读文件。
-        # 没有读数时给 `available=False`，**不补 0**——lag 恒 0 得能证明是"真没新轮"。
-        flash_info: dict[str, Any] = {"available": False}
-        try:
-            from bladex_core.behavior import FLASH_LAG_BOUND_S
-            from bladex_core.flash import read_behavior_status, summarize_tree
-            st = read_behavior_status(_flash_dir())
-            flash_info["ledgers_projected"] = summarize_tree(_flash_dir()).ledgers
-            if st:
-                flash_info.update({"available": True, **st})
-                flash_info.setdefault("lag_bound_s", FLASH_LAG_BOUND_S)
-        except Exception as e:  # noqa: BLE001 —— status 不因 Flash 读数失败而 500
-            logger.debug("admin_status_flash_failed", error=str(e))
+            # Memory Flash 新鲜度（MQ-F4 / F2）：daemon 写 `.flash_state.json`，这里只读文件。
+            # 没有读数时给 `available=False`，**不补 0**——lag 恒 0 得能证明是"真没新轮"。
+            flash_info: dict[str, Any] = {"available": False}
+            try:
+                from bladex_core.behavior import FLASH_LAG_BOUND_S
+                from bladex_core.flash import read_behavior_status, summarize_tree
+                st = read_behavior_status(_flash_dir())
+                flash_info["ledgers_projected"] = summarize_tree(_flash_dir()).ledgers
+                # 批 DS2（MQ-F16）：None = 没有读数（daemon 还没写过这一段），不是 0
+                from bladex_proxy.flash_daemon import read_user_edit_refused
+                flash_info["user_edit_refused"] = read_user_edit_refused(_flash_dir())
+                if st:
+                    flash_info.update({"available": True, **st})
+                    flash_info.setdefault("lag_bound_s", FLASH_LAG_BOUND_S)
+            except Exception as e:  # noqa: BLE001 —— status 不因 Flash 读数失败而 500
+                logger.debug("admin_status_flash_failed", error=str(e))
+            return disk, flash_info, _memory_config(cfg)
+
+        disk, flash_info, memory_config = await run_blocking(_files)
 
         from . import __version__
         return JSONResponse(content={
@@ -389,6 +583,7 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
             "pipeline": pipeline_info,
             "hub": hub_info,
             "index": index_info,
+            **({"contradiction": contradiction_info} if contradiction_info is not None else {}),
             "flash": flash_info,
             "sync_job": sync_job,
             "consolidator": heartbeat,
@@ -398,7 +593,7 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
             "degradation": degradation,
             "disk": disk,
             # 进程实际在用的记忆配置 + 与 .env 的漂移（配置对了但进程里是旧值 = 静默失效）
-            "memory_config": _memory_config(cfg),
+            "memory_config": memory_config,
         })
 
     # ── GET /admin/queue ───────────────────────────────────────────
@@ -462,7 +657,7 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
         """
         from .behavior_read import read_behavior_card
 
-        card = read_behavior_card()
+        card = await run_blocking(read_behavior_card)
         body: dict[str, Any] = {
             "available": card.ok,
             "reason": card.reason,
@@ -528,37 +723,40 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
                 return False
             return True
 
-        mode = "list"
-        if q:
-            # 语义搜索（embedder 缺失时 index.search 返回空 → 退化为空结果而非 500）
-            try:
-                found = index.search(q, top_k=limit + offset,
-                                  user_id=user_id or None)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("admin_facts_search_failed", error=str(e))
-                found = []
-            facts = [f for f in found if _match(f)]
-            total = len(facts)
-            page = facts[offset:offset + limit]
-            mode = "search"
-        else:
-            try:
-                all_f = [f for f in index.all_facts() if _match(f)]
-            except Exception as e:  # noqa: BLE001
-                logger.warning("admin_facts_list_failed", error=str(e))
-                return _err(500, f"facts listing failed: {e}", "storage_error")
-            # 新的在前（created_at 降序）
-            all_f.sort(key=lambda f: str(getattr(f, "created_at", "")), reverse=True)
-            total = len(all_f)
-            page = all_f[offset:offset + limit]
+        def _read() -> JSONResponse:
+            mode = "list"
+            if q:
+                # 语义搜索（embedder 缺失时 index.search 返回空 → 退化为空结果而非 500）
+                try:
+                    found = index.search(q, top_k=limit + offset,
+                                      user_id=user_id or None)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("admin_facts_search_failed", error=str(e))
+                    found = []
+                facts = [f for f in found if _match(f)]
+                total = len(facts)
+                page = facts[offset:offset + limit]
+                mode = "search"
+            else:
+                try:
+                    all_f = [f for f in index.all_facts() if _match(f)]
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("admin_facts_list_failed", error=str(e))
+                    return _err(500, f"facts listing failed: {e}", "storage_error")
+                # 新的在前（created_at 降序）
+                all_f.sort(key=lambda f: str(getattr(f, "created_at", "")), reverse=True)
+                total = len(all_f)
+                page = all_f[offset:offset + limit]
 
-        return JSONResponse(content={
-            "facts": [_fact_dict(f) for f in page],
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-            "mode": mode,
-        })
+            return JSONResponse(content={
+                "facts": [_fact_dict(f) for f in page],
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "mode": mode,
+            })
+
+        return await run_blocking(_read)
 
     @app.get("/admin/facts/{fact_id}")
     async def admin_fact_detail(  # noqa: ANN202
@@ -570,10 +768,83 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
         index: MemoryIndex | None = request.app.state.index
         if index is None:
             return _index_unavailable()
-        fact = index.get_fact(fact_id)
+        fact = await run_blocking(index.get_fact, fact_id)
         if fact is None:
             return _err(404, "Fact not found", "not_found")
         return JSONResponse(content=_fact_dict(fact))
+
+    @app.get("/admin/contradictions")
+    async def admin_contradictions(  # noqa: ANN202
+        request: Request,
+        status: str = "",
+        limit: int = 50,
+        offset: int = 0,
+        cfg: Any = admin_dep,
+    ) -> JSONResponse:
+        """批 BB · 2b：矛盾标记列表（只读；开关关着也照常可读——读的是已有的标记）。
+
+        `status` ∈ `unsettled` / `not_same_thing` / `confirmed` / `obsolete`（空 = 全部）。
+        任一侧被墓碑 / 取代的显示 `obsolete`，读时算，不写事件。
+        """
+        from bladex_core import consistency as cs
+
+        allowed = {"", "unsettled", "obsolete", *cs.USER_VERDICTS}
+        if status not in allowed:
+            return _err(400, f"status must be one of {sorted(allowed - {''})}", "validation_error")
+        index: MemoryIndex | None = request.app.state.index
+        if index is None:
+            return _index_unavailable()
+        limit = max(1, min(int(limit), _MAX_LIMIT))
+        return JSONResponse(content=await run_blocking(
+            lambda: index.contradictions(status=status, limit=limit, offset=max(0, int(offset)))))
+
+    @app.get("/admin/facts/{fact_id}/history")
+    async def admin_fact_history(  # noqa: ANN202
+        request: Request,
+        fact_id: str,
+        cfg: Any = admin_dep,
+    ) -> JSONResponse:
+        """一条 fact 的来源与修改史（批 DS2，plan F5；`bladex memory show --history` 只调这里）。
+
+        - `fact_state`：`present` / `absent`（Index 里没有，比如已删）/ `no_reading`（Index 不可用或读失败）。
+          「读不到」不等于「没有」，字段值在后两种情形下为 null（原则 13 层 4）。
+        - `events`：Hub 的修改事件，见 `_FACT_HISTORY_EVENTS`。删掉的 fact 仍能看到它的历史。
+        - 既不在 Index、也没有事件 ⇒ 404；Index 读不到时判不了，回 200 + `no_reading`。
+        """
+        hub: MemoryHub | None = request.app.state.hub
+        if hub is None:
+            return _hub_unavailable()
+        index: MemoryIndex | None = request.app.state.index
+
+        def _read() -> JSONResponse:
+            fact, state = None, "no_reading"
+            if index is not None:
+                try:
+                    fact = index.get_fact(fact_id)
+                    state = "present" if fact is not None else "absent"
+                except Exception as e:  # noqa: BLE001 —— 修改史在 Hub，Index 读失败不挡它
+                    logger.warning("admin_fact_history_index_failed", fact_id=fact_id, error=str(e))
+            try:
+                events = fact_history_events(hub, fact_id)
+            except HubRequiresNewerVersion:  # 批 UE 步骤 2：运行中的拒绝不许被吞
+                raise
+            except Exception as e:  # noqa: BLE001
+                return _err(500, f"history scan failed: {e}", "storage_error")
+            if state == "absent" and not events:
+                return _err(404, "Fact not found", "not_found")
+            d = _fact_dict(fact) if fact is not None else None
+            source = None if d is None else {k: d.get(k) for k in (
+                "provenance", "source_user_id", "source_session", "source_ledger_key",
+                "distill_model", "created_at", "updated_at")}
+            supersession = None if d is None else {k: d.get(k) for k in (
+                "superseded_by", "t_invalid", "corrects")}
+            return JSONResponse(content={
+                "fact_id": fact_id, "fact_state": state,
+                "content": None if d is None else d.get("content"),
+                "source": source, "supersession": supersession,
+                "events": events, "total": len(events)})
+
+        return await run_blocking(_read)
 
     # ── GET /admin/matters + /admin/matters/{id} ───────────────────
 
@@ -583,28 +854,50 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
         status: str = "",
         limit: int = 100,
         offset: int = 0,
+        include: str = "",
+        facts_top_k: int = 50,
         cfg: Any = admin_dep,
     ) -> JSONResponse:
+        """Matter 列表。
+
+        `include=members`（批 DS1a，DS-26 前置）：额外返回 `members`——本页每个 Matter 的
+        详情，键是 matter_id，值与 `GET /admin/matters/{id}?facts_top_k=<同值>` 的响应体
+        **逐字相同**（同一个序列化函数 `_matter_detail_from`）。Graph 页一次请求取全，
+        不再逐个拉 200 次详情；批 DS1b 起取法是一次全扫按 Matter 分组（MQ-I41）。
+        """
         index: MemoryIndex | None = request.app.state.index
         if index is None:
             return _index_unavailable()
+        if include not in ("", "members"):
+            # 只读端点不挂严格 query，但 include 的值拼错会让调用方以为"没有成员"——直接说
+            return _err(400, f"include={include!r}: only 'members' is supported",
+                        "validation_error")
         limit = _clamp_limit(limit)
         offset = max(0, offset)
-        try:
-            matters = index.all_matters()
-        except Exception as e:  # noqa: BLE001
-            return _err(500, f"matters listing failed: {e}", "storage_error")
-        if status:
-            matters = [m for m in matters if str(m.status.value) == status]
-        matters.sort(key=lambda m: str(getattr(m, "updated_at", "")), reverse=True)
-        total = len(matters)
-        page = matters[offset:offset + limit]
-        return JSONResponse(content={
-            "matters": [_matter_dict(m) for m in page],
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-        })
+
+        def _read() -> JSONResponse:
+            try:
+                matters = index.all_matters()
+            except Exception as e:  # noqa: BLE001
+                return _err(500, f"matters listing failed: {e}", "storage_error")
+            if status:
+                matters = [m for m in matters if str(m.status.value) == status]
+            matters.sort(key=lambda m: str(getattr(m, "updated_at", "")), reverse=True)
+            total = len(matters)
+            page = matters[offset:offset + limit]
+            body: dict[str, Any] = {
+                "matters": [_matter_dict(m) for m in page],
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            }
+            if include == "members":
+                # 批 DS1b（MQ-I41）：一次全扫按 Matter 分组，再喂同一个序列化函数
+                body["members"] = _matter_members_payload(
+                    index, [m.matter_id for m in page], facts_top_k)
+            return JSONResponse(content=body)
+
+        return await run_blocking(_read)
 
     # 🔴 路由顺序：必须注册在 /admin/matters/{matter_id} **之前**，
     # 否则 "merge_candidates" 会被当成 matter_id 吞掉。
@@ -623,7 +916,8 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
         if index is None:
             return _index_unavailable()
         try:
-            pairs = index.matter_merge_candidates(max_pairs=_clamp_limit(limit))
+            pairs = await run_blocking(index.matter_merge_candidates,
+                                       max_pairs=_clamp_limit(limit))
         except Exception as e:  # noqa: BLE001
             return JSONResponse(status_code=503, content={"error": {
                 "message": f"merge candidate scan failed: {e}", "type": "unavailable"}})
@@ -640,28 +934,10 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
         index: MemoryIndex | None = request.app.state.index
         if index is None:
             return _index_unavailable()
-        matter = index.get_matter(matter_id)
-        if matter is None:
+        payload = await run_blocking(_matter_detail_payload, index, matter_id, facts_top_k)
+        if payload is None:
             return _err(404, "Matter not found", "not_found")
-        edges = index.get_edges(matter_id)
-        try:
-            facts = index.get_facts_for_matter(matter_id, top_k=_clamp_limit(facts_top_k))
-        except Exception as e:  # noqa: BLE001
-            logger.warning("admin_matter_facts_failed", error=str(e))
-            facts = []
-        session_keys = [
-            e.target_key for e in edges if str(e.target_type.value) == "session"
-        ]
-        return JSONResponse(content={
-            "matter": _matter_dict(matter),
-            "edges": [e.model_dump(mode="json") for e in edges],
-            "facts": [_fact_dict(f) for f in facts],
-            "session_keys": session_keys,
-            "edge_count": len(edges),
-            "manual_edge_count": sum(
-                1 for e in edges if str(e.provenance.value) == "manual"
-            ),
-        })
+        return JSONResponse(content=payload)
 
     # ── GET /admin/sessions + /admin/turns/{key} ───────────────────
 
@@ -681,41 +957,45 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
             return _hub_unavailable()
         limit = _clamp_limit(limit)
         offset = max(0, offset)
-        sessions: dict[str, dict[str, Any]] = {}
-        try:
-            for key, ts in hub.scan_meta(prefix=prefix):
-                parts = key.split("/")
-                if len(parts) < 4:
-                    continue
-                if agent and parts[1] != agent:
-                    continue
-                sess_prefix = "/".join(parts[:3]) + "/"
-                s = sessions.get(sess_prefix)
-                if s is None:
-                    s = {
-                        "session": sess_prefix,
-                        "user_id": parts[0],
-                        "agent_id": parts[1],
-                        "session_id": parts[2],
-                        "turns": 0,
-                        "first_ts": ts,
-                        "last_ts": ts,
-                    }
-                    sessions[sess_prefix] = s
-                s["turns"] += 1
-                if ts:
-                    if not s["first_ts"] or ts < s["first_ts"]:
-                        s["first_ts"] = ts
-                    if ts > s["last_ts"]:
-                        s["last_ts"] = ts
-        except Exception as e:  # noqa: BLE001
-            return _err(500, f"session scan failed: {e}", "storage_error")
-        ordered = sorted(sessions.values(), key=lambda s: s["last_ts"], reverse=True)
-        total = len(ordered)
-        page = ordered[offset:offset + limit]
-        return JSONResponse(content={
-            "sessions": page, "total": total, "limit": limit, "offset": offset,
-        })
+
+        def _read() -> JSONResponse:
+            sessions: dict[str, dict[str, Any]] = {}
+            try:
+                for key, ts in hub.scan_meta(prefix=prefix):
+                    parts = key.split("/")
+                    if len(parts) < 4:
+                        continue
+                    if agent and parts[1] != agent:
+                        continue
+                    sess_prefix = "/".join(parts[:3]) + "/"
+                    s = sessions.get(sess_prefix)
+                    if s is None:
+                        s = {
+                            "session": sess_prefix,
+                            "user_id": parts[0],
+                            "agent_id": parts[1],
+                            "session_id": parts[2],
+                            "turns": 0,
+                            "first_ts": ts,
+                            "last_ts": ts,
+                        }
+                        sessions[sess_prefix] = s
+                    s["turns"] += 1
+                    if ts:
+                        if not s["first_ts"] or ts < s["first_ts"]:
+                            s["first_ts"] = ts
+                        if ts > s["last_ts"]:
+                            s["last_ts"] = ts
+            except Exception as e:  # noqa: BLE001
+                return _err(500, f"session scan failed: {e}", "storage_error")
+            ordered = sorted(sessions.values(), key=lambda s: s["last_ts"], reverse=True)
+            total = len(ordered)
+            page = ordered[offset:offset + limit]
+            return JSONResponse(content={
+                "sessions": page, "total": total, "limit": limit, "offset": offset,
+            })
+
+        return await run_blocking(_read)
 
     @app.get("/admin/turns")
     async def admin_turns_index(  # noqa: ANN202
@@ -739,7 +1019,8 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
         limit = _clamp_limit(limit)
         offset = max(0, offset)
         try:
-            page, total = hub.recent_turns(prefix, limit=limit, offset=offset)
+            page, total = await run_blocking(hub.recent_turns, prefix,
+                                             limit=limit, offset=offset)
         except Exception as e:  # noqa: BLE001
             return _err(500, f"turn scan failed: {e}", "storage_error")
         return JSONResponse(content={
@@ -762,7 +1043,7 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
         hub: MemoryHub | None = request.app.state.hub
         if hub is None:
             return _hub_unavailable()
-        turn = hub.get(turn_key)
+        turn = await run_blocking(hub.get, turn_key)
         if turn is None:
             return _err(404, "Turn not found", "not_found")
         exclude: set[str] = set()
@@ -817,27 +1098,30 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
                 return False
             return True
 
-        mode = "list"
-        try:
-            if q:
-                vec = index.embed_query_vec(q)
-                rows = (index.search_files(vec, k=limit + offset,
-                                           user_id=user_id or None)
-                        if vec is not None else [])
-                mode = "search"
-            else:
-                rows = index.list_file_entries()
-                rows.sort(key=lambda r: str(r.get("path", "")))
-        except Exception as e:  # noqa: BLE001
-            logger.warning("admin_files_list_failed", error=str(e))
-            return _err(500, f"file listing failed: {e}", "storage_error")
-        rows = [r for r in rows if _match(r)]
-        total = len(rows)
-        page = [_file_row(dict(r)) for r in rows[offset:offset + limit]]
-        return JSONResponse(content={
-            "files": page, "total": total, "limit": limit, "offset": offset,
-            "mode": mode,
-        })
+        def _read() -> JSONResponse:
+            mode = "list"
+            try:
+                if q:
+                    vec = index.embed_query_vec(q)
+                    rows = (index.search_files(vec, k=limit + offset,
+                                               user_id=user_id or None)
+                            if vec is not None else [])
+                    mode = "search"
+                else:
+                    rows = index.list_file_entries()
+                    rows.sort(key=lambda r: str(r.get("path", "")))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("admin_files_list_failed", error=str(e))
+                return _err(500, f"file listing failed: {e}", "storage_error")
+            rows = [r for r in rows if _match(r)]
+            total = len(rows)
+            page = [_file_row(dict(r)) for r in rows[offset:offset + limit]]
+            return JSONResponse(content={
+                "files": page, "total": total, "limit": limit, "offset": offset,
+                "mode": mode,
+            })
+
+        return await run_blocking(_read)
 
     @app.get("/admin/files/{file_id}")
     async def admin_file_detail(  # noqa: ANN202
@@ -850,13 +1134,17 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
         index: MemoryIndex | None = request.app.state.index
         if index is None:
             return _index_unavailable()
-        row = index.get_file_entry(file_id)
-        if row is None:
-            return _err(404, "File entry not found", "not_found")
-        row = _file_row(dict(row))
-        if include_body:
-            row["body"] = index.get_file_body(file_id)
-        return JSONResponse(content=row)
+
+        def _read() -> JSONResponse:
+            row = index.get_file_entry(file_id)
+            if row is None:
+                return _err(404, "File entry not found", "not_found")
+            row = _file_row(dict(row))
+            if include_body:
+                row["body"] = index.get_file_body(file_id)
+            return JSONResponse(content=row)
+
+        return await run_blocking(_read)
 
     @app.get("/admin/projects")
     async def admin_projects(  # noqa: ANN202
@@ -872,7 +1160,7 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
         limit = _clamp_limit(limit)
         offset = max(0, offset)
         try:
-            projects = index.all_projects()
+            projects = await run_blocking(index.all_projects)
         except Exception as e:  # noqa: BLE001
             return _err(500, f"project listing failed: {e}", "storage_error")
         projects.sort(key=lambda p: str(getattr(p, "updated_at", "")), reverse=True)
@@ -892,7 +1180,7 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
         index: MemoryIndex | None = request.app.state.index
         if index is None:
             return _index_unavailable()
-        p = index.get_project(project_id)
+        p = await run_blocking(index.get_project, project_id)
         if p is None:
             return _err(404, "Project not found", "not_found")
         return JSONResponse(content=p.model_dump(mode="json"))
@@ -909,23 +1197,27 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
         index: MemoryIndex | None = request.app.state.index
         if index is None:
             return _index_unavailable()
-        try:
-            user_md, _ = index.get_profile_md(None)
-            agents = []
-            for base in index.list_profile_agents():
-                _, agent_md = index.get_profile_md(None, base)
-                agents.append({
-                    "agent_base": base,
-                    "agent_md": agent_md,
-                    "rule_files": index.get_rule_files(base),
-                    "tools": index.get_tool_stats(base, top=50),
-                })
-        except Exception as e:  # noqa: BLE001
-            logger.warning("admin_profiles_failed", error=str(e))
-            return _err(500, f"profile listing failed: {e}", "storage_error")
-        return JSONResponse(content={
-            "user_md": user_md, "agents": agents, "agent_count": len(agents),
-        })
+
+        def _read() -> JSONResponse:
+            try:
+                user_md, _ = index.get_profile_md(None)
+                agents = []
+                for base in index.list_profile_agents():
+                    _, agent_md = index.get_profile_md(None, base)
+                    agents.append({
+                        "agent_base": base,
+                        "agent_md": agent_md,
+                        "rule_files": index.get_rule_files(base),
+                        "tools": index.get_tool_stats(base, top=50),
+                    })
+            except Exception as e:  # noqa: BLE001
+                logger.warning("admin_profiles_failed", error=str(e))
+                return _err(500, f"profile listing failed: {e}", "storage_error")
+            return JSONResponse(content={
+                "user_md": user_md, "agents": agents, "agent_count": len(agents),
+            })
+
+        return await run_blocking(_read)
 
     @app.get("/admin/profiles/{agent_base}/rulefiles/{name}")
     async def admin_rule_file_detail(  # noqa: ANN202
@@ -938,7 +1230,7 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
         index: MemoryIndex | None = request.app.state.index
         if index is None:
             return _index_unavailable()
-        rec = index.get_rule_file(agent_base, name)
+        rec = await run_blocking(index.get_rule_file, agent_base, name)
         if not rec:
             return _err(404, "Rule file copy not found", "not_found")
         rec = dict(rec)
@@ -958,12 +1250,66 @@ def register_admin_read_routes(app: FastAPI, admin_dep: Any) -> None:
         if index is None:
             return _index_unavailable()
         top = _clamp_limit(top)
-        try:
+
+        def _read() -> dict[str, Any]:
             if agent:
-                agents = {agent: index.get_tool_stats(agent, top=top)}
-            else:
-                agents = {b: index.get_tool_stats(b, top=top)
-                          for b in index.list_tool_agents()}
+                return {agent: index.get_tool_stats(agent, top=top)}
+            return {b: index.get_tool_stats(b, top=top) for b in index.list_tool_agents()}
+
+        try:
+            agents = await run_blocking(_read)
         except Exception as e:  # noqa: BLE001
             return _err(500, f"tool stats failed: {e}", "storage_error")
         return JSONResponse(content={"agents": agents})
+
+    # ── GET /admin/usage（批 AC2，MQ-P34 展示面）────────────────────
+
+    from .server.admin_api import _strict_query
+
+    @app.get("/admin/usage")
+    async def admin_usage(  # noqa: ANN202
+        request: Request,
+        days: float | None = None,
+        since: str = "",
+        until: str = "",
+        agent: str = "",
+        model: str = "",
+        session: str = "",
+        tz: str = "",
+        cfg: Any = admin_dep,
+        _strict: None = Depends(_strict_query(*_USAGE_PARAMS)),
+    ) -> JSONResponse:
+        """用量汇总：输出**就是** `usage.aggregate` 的结构，不再加工（`bladex usage` 只调这里）。
+
+        - 窗口 `[since, until)`：ISO 时刻（不带时区按 `tz` 解释）；`days=N` ⇒ `since = 现在 − N 天`
+          （与 `since` 互斥）。都不给 = 不限。
+        - `tz`：IANA 名（`Asia/Shanghai`）或偏移（`+08:00`），决定按哪一天切；缺省本机时区。
+        - 数据 = `usage.hub_usage_summary` ← `MemoryHub.usage_rows()`：`_RecentTurnIndex` 里随 (ts, key) 增量维护的行缓存，
+          首次请求一趟全扫建成。整段经 `run_blocking`（建缓存那一趟是秒级全扫）。
+        - 未知参数 ⇒ 400（`_strict_query`）：拼错 `--agent` 之类会把过滤静默去掉、给出全量的数。
+        """
+        hub: MemoryHub | None = request.app.state.hub
+        if hub is None:
+            return _hub_unavailable()
+        try:
+            zone = _parse_tz(tz)
+            t_since = _parse_instant(since, zone, "since")
+            t_until = _parse_instant(until, zone, "until")
+            if days is not None:
+                if t_since is not None:
+                    raise ValueError("days and since are mutually exclusive")
+                if not days > 0:
+                    raise ValueError(f"days must be > 0, got {days}")
+                t_since = datetime.now(UTC) - timedelta(days=days)
+        except ValueError as e:
+            return _err(400, str(e), "validation_error")
+
+        def _read() -> dict[str, Any]:
+            return hub_usage_summary(hub, since=t_since, until=t_until, agent=agent or None,
+                                     model=model or None, session=session or None, tz=zone)
+
+        try:
+            out = await run_blocking(_read)
+        except Exception as e:  # noqa: BLE001
+            return _err(500, f"usage scan failed: {e}", "storage_error")
+        return JSONResponse(content=out)

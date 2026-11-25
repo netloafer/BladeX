@@ -282,11 +282,13 @@ async def test_ledger_write_failure_keeps_entry_and_reports_it():
 
 
 @pytest.mark.asyncio
-async def test_stuck_pending_does_not_loop_forever():
+async def test_stuck_pending_does_not_loop_forever(monkeypatch):
     """写 Ledger 一直失败的 PEL 条目会被 XAUTOCLAIM 反复捞回——必须能停下来。
 
     这个命令本来就是给"卡住了"的人用的，它自己不能卡住。
+    断言只看计数、不看退避时长，退避在这里只是干等（批 GT #6：3 条 × 2 次 × 1 s）。
     """
+    monkeypatch.setattr("bladex_proxy.storage.pipeline_worker._LEDGER_RETRY_BACKOFF", 0)
     stream = FakeStream()
     for _ in range(3):
         stream.add_pending(_make_turn())

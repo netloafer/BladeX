@@ -17,8 +17,9 @@ consolidator 与 proxy 共用一个嵌入服务时，一次 1063 条的重建批
 请求/响应都是一行 JSON + `\\n`（长度用换行分帧，不引入第二套编码）：
 
     → {"id": "...", "texts": [...], "input_type": "passage|query", "priority": "hot|bulk"}
-    ← {"id": "...", "vectors": [[...]], "model_identity": "local:BAAI/bge-small-en-v1.5"}
-    ← {"id": "...", "error": "..."}                     # 失败也带 id，客户端不悬挂
+    ← {"id": "...", "vectors": [[...]], "model_identity": "local:BAAI/bge-small-en-v1.5",
+       "vector_fingerprint": "fastembed=0.9.1;ort=1.27.0;dtype=float32"}
+    ← {"id": "...", "error": "...", "error_kind": "..."} # 失败也带 id，客户端不悬挂
 
 不用 HTTP：省一层解析、无端口鉴权面、uds 下延迟更低。传输选择在**启动时一次决断**
 （`embed_transport.resolve`，Jason 2026-08-25 拍板），结果打进启动日志。
@@ -29,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -52,6 +54,36 @@ PRIORITY_BULK = "bulk"
 #: 单片推理 ~4s（实测 66s/1063×64），故 hot 最坏等待 ≈ 一片时间而非整批。
 #: 🔴 这个值是"让路粒度"，不是吞吐旋钮：调大 = hot 等待变长，调小 = 批处理效率下降。
 DEFAULT_BULK_SLICE = 64
+
+#: 回包的 `error_kind`：服务端算出了结果却发不出去（类型不对 / 不能序列化）。
+#: 与「连接断了」是两件事，客户端据此报不同的原因（批 W21b，MQ-W29）。
+ERROR_KIND_REPLY = "reply_unserializable"
+
+
+class EmbedReplyTypeError(TypeError):
+    """向量里混进了非 Python 数值（numpy 标量等），回包前拦下。"""
+
+
+def vector_type_problem(vectors: Any) -> str | None:
+    """回包前的类型断言：向量必须是 list[list[float|int]]，返回第一处问题的说明。
+
+    🔴 按**精确类型**判，不按 isinstance：`np.float64` 是 `float` 的子类，能混过 `json.dumps`。
+    11-03 那次事故之前它就一直这样漏着，只是换到 `np.float32` 才炸；留着它等于等下一次换 dtype。
+    """
+    if not isinstance(vectors, list):
+        return f"vectors is {_type_name(vectors)}, expected list"
+    for i, vec in enumerate(vectors):
+        if not isinstance(vec, list):
+            return f"vectors[{i}] is {_type_name(vec)}, expected list"
+        for j, x in enumerate(vec):
+            if type(x) not in (float, int):
+                return f"vectors[{i}][{j}] is {_type_name(x)}, expected a plain Python float"
+    return None
+
+
+def _type_name(x: Any) -> str:
+    t = type(x)
+    return t.__name__ if t.__module__ == "builtins" else f"{t.__module__}.{t.__name__}"
 
 
 @dataclass
@@ -145,8 +177,18 @@ class EmbedService:
                         await self._drain_hot()
             else:
                 vectors = await asyncio.to_thread(self._embed, job.texts, job.input_type)
+            problem = vector_type_problem(vectors)
+            if problem is not None:
+                raise EmbedReplyTypeError(problem)
             payload = {"id": job.req_id, "vectors": vectors,
-                       "model_identity": getattr(self._embedder, "model_identity", "")}
+                       "model_identity": getattr(self._embedder, "model_identity", ""),
+                       "vector_fingerprint": getattr(self._embedder, "vector_fingerprint", "")}
+        except EmbedReplyTypeError as e:
+            logger.warning("embed_send_failed", kind="serialize", req=job.req_id,
+                           error_type=type(e).__name__, error=str(e),
+                           texts=len(job.texts))
+            payload = {"id": job.req_id, "error_kind": ERROR_KIND_REPLY,
+                       "error": f"embed module could not serialize its reply: {e}"}
         except Exception as e:  # noqa: BLE001 —— 单请求失败不炸服务
             logger.warning("embed_job_failed", req=job.req_id, error=str(e))
             payload = {"id": job.req_id, "error": str(e)}
@@ -162,10 +204,22 @@ class EmbedService:
 
     async def _send(self, writer: Any, payload: dict) -> None:
         try:
-            writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
+            line = json.dumps(payload, ensure_ascii=False)
+        except (TypeError, ValueError) as e:
+            # 🔴 这不是客户端断开，是服务端发不出去。不回错误帧的话客户端要干等到超时（默认
+            # 120 s）——11-03 那次 proxy 的 26 秒就是卡在这里，直到 sidecar 被 CLI 停掉才结束。
+            logger.warning("embed_send_failed", kind="serialize", req=payload.get("id", ""),
+                           error_type=type(e).__name__, error=str(e))
+            line = json.dumps({"id": payload.get("id", ""), "error_kind": ERROR_KIND_REPLY,
+                               "error": f"embed module could not serialize its reply: {e}"},
+                              ensure_ascii=False)
+        try:
+            writer.write((line + "\n").encode())
             await writer.drain()
-        except Exception as e:  # noqa: BLE001 —— 客户端断开不是服务端错误
-            logger.debug("embed_send_failed", error=str(e))
+        except Exception as e:  # noqa: BLE001 —— 写失败只影响这一个连接，不炸服务
+            # MQ-W29：原来只打 debug，服务完全失效时日志里什么都没有（原则 12：吞掉输出 = 销毁原因）。
+            logger.warning("embed_send_failed", kind="connection", req=payload.get("id", ""),
+                           error_type=type(e).__name__, error=str(e))
 
     async def serve_forever(self) -> None:
         while not self._stopping:
@@ -210,6 +264,26 @@ class EmbedService:
                 pass
 
 
+class EmbedSocketInUse(OSError):
+    """socket 文件有人在服务（或者判不了），不能删。"""
+
+
+def _uds_in_use(address: str) -> bool:
+    """socket 文件后面有没有活的服务端。只有明确连不上才算没有；权限错误算有（判不了就不删）。"""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(1.0)
+    try:
+        s.connect(address)
+    except (ConnectionRefusedError, FileNotFoundError):
+        return False
+    except OSError:
+        return True
+    else:
+        return True
+    finally:
+        s.close()
+
+
 async def run_server(service: EmbedService, *, transport: str, address: str) -> None:
     """起监听 + 工作循环。`transport ∈ {uds, tcp}`（决断在调用方，见 embed_transport）。"""
     worker = asyncio.ensure_future(service.serve_forever())
@@ -231,7 +305,12 @@ async def run_server(service: EmbedService, *, transport: str, address: str) -> 
         parent = os.path.dirname(address)
         if parent:
             os.makedirs(parent, exist_ok=True)
+        # 🔴 批 W33（MQ-W35）：删之前先试连。此前无条件 unlink，11-05 沙箱里那次 start 很可能
+        # 删了 live 的 run/embed.sock（旧 embed 还活着，但新连接全部 embed_socket_missing）。
         if os.path.exists(address):
+            if _uds_in_use(address):
+                raise EmbedSocketInUse(
+                    f"{address} is being served by another process; not removing it")
             os.unlink(address)
         server = await asyncio.start_unix_server(service.handle_client, path=address,
                                                  limit=STREAM_LIMIT)
@@ -249,6 +328,10 @@ async def run_server(service: EmbedService, *, transport: str, address: str) -> 
         finally:
             service.stop()
             worker.cancel()
+
+
+#: 单实例锁的文件对象：留到进程结束，被回收就等于放锁。
+_INSTANCE_LOCK = None
 
 
 def main() -> int:  # pragma: no cover —— 入口点（env 读取只在这里，导入无副作用）
@@ -278,6 +361,20 @@ def main() -> int:  # pragma: no cover —— 入口点（env 读取只在这里
                      hint="transport resolved to 'local'; the module has nothing to serve")
         return 2
 
+    # 🔴 批 W33（MQ-W35）：加载模型之前先取单实例锁。pidfile 丢了也不会起第二个。
+    from bladex_proxy.deployment import deployment_root
+    from bladex_proxy.storage.redis_launch import InstanceLockHeld, acquire_instance_lock
+    global _INSTANCE_LOCK
+    try:
+        _INSTANCE_LOCK = acquire_instance_lock("embed", deployment_root())
+    except InstanceLockHeld as e:
+        logger.error("embed_server_already_running", holder=str(e), lock=str(e.path))
+        return 3
+    except OSError as e:
+        logger.error("embed_server_lock_failed", error=str(e),
+                     hint="cannot take the single-instance lock under logs/; refusing to start")
+        return 3
+
     # 🔴 **服务端必须真加载本地模型**：它就是那份被共享的模型。`.env` 里的
     # `BLADEX_EMBED_BACKEND` 是给**客户端**（proxy/consolidator）看的，服务端
     # 对两档都必须拒绝、各有各的理由（G18.2，MQ-W9）：
@@ -294,8 +391,12 @@ def main() -> int:  # pragma: no cover —— 入口点（env 读取只在这里
     slice_n = args.bulk_slice or int(
         os.environ.get("BLADEX_EMBED_BULK_SLICE", DEFAULT_BULK_SLICE))
     service = EmbedService(embedder, bulk_slice=slice_n)
-    asyncio.run(run_server(service, transport=decision.transport,
-                           address=decision.address))
+    try:
+        asyncio.run(run_server(service, transport=decision.transport,
+                               address=decision.address))
+    except EmbedSocketInUse as e:
+        logger.error("embed_server_socket_in_use", error=str(e))
+        return 3
     return 0
 
 

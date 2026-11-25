@@ -78,6 +78,9 @@ class ModelSpec(BaseModel):
     # Z2.0 读数④：字符 → token 的换算（chars/token）。0 = 用全局 `BLADEX_CHARS_PER_TOKEN`。
     # 各模型分布见 `docs/benchmarks/surface-budget-z2/`，按模型不同时在这里覆盖。
     chars_per_token: float = 0.0
+    # 批 BC（README ④）：`"off"` = `/v1/responses` 的 `reasoning.effort` 不发给这个模型，
+    # 每轮打 `reasoning_not_forwarded`。缺省 `""` = 逐字透传，上游不认就让它报错（原则 9）。
+    reasoning: str = ""
 
     # 解析后填充（不来自 TOML）
     api_key: str = ""
@@ -111,7 +114,8 @@ class EmbeddingProfile(BaseModel):
 class EmbeddingConfig(BaseModel):
     """Embedding 后端配置（TOML [embedding]，2026-07-26 可选化）。
 
-    优先级：显式 env（BLADEX_EMBED_*）> 本段 > 内置默认（local + e5-large 零回归）。
+    批 AE 起首选 `config/bladex.toml`，读取与合并见 `global_config.py`；`routing.toml` 里的
+    同名段已弃用，至少再读一个版本。优先级：env > bladex.toml > routing.toml > 内置默认。
     密钥同 ModelSpec 纪律：api_key_env 只存环境变量名，密钥不入 toml。
     backend 空 = 未配置（回落 env/默认）。
     """
@@ -304,7 +308,8 @@ class RoutingConfig(BaseModel):
     capability: CapabilityConfig = Field(default_factory=CapabilityConfig)
     # ADR-0018 §3.6: 蒸馏模型配置（空=自举/env）
     distill: DistillConfig = Field(default_factory=DistillConfig)
-    # embedding 后端可选化（2026-07-26）：结构化配置（env 为覆盖通道）
+    # embedding 后端可选化（2026-07-26）。已弃用，新位置 `config/bladex.toml`（批 AE）：
+    # 这里只负责把旧段解析出来，生效值一律走 `global_config.embedding_section`，不要直接读。
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
 
     model_config = {"extra": "ignore"}
@@ -328,7 +333,20 @@ class RoutingConfig(BaseModel):
         cfg._validate_model_refs()
         cfg._validate_tier_consistency()
         cfg._validate_context_windows()
+        cfg._validate_reasoning()
         return cfg
+
+    def _validate_reasoning(self) -> None:
+        """批 BC：`reasoning` 只认 `""` / `"off"`；写错是配置错误，拒绝启动（同 context_window 一族）。"""
+        for m in self.models:
+            if m.reasoning not in ("", "off"):
+                raise RoutingConfigError(
+                    f"routing.toml [[models]] name={m.name!r}: reasoning={m.reasoning!r} "
+                    '(only "off" is accepted; omit it to forward reasoning_effort as sent)')
+
+    def reasoning_off_models(self) -> frozenset[str]:
+        """配了 `reasoning = "off"` 的模型名（`/v1/responses` 请求侧按调用用）。"""
+        return frozenset(m.name for m in self.models if m.reasoning == "off")
 
     def _validate_context_windows(self) -> None:
         """Z2.1：`context_window` / `chars_per_token` 非负；负值是配置错误，拒绝启动（同 api_base 一族）。"""
@@ -421,7 +439,7 @@ class RoutingConfig(BaseModel):
             )
         if self.embedding is not None:
             self.embedding.api_base = self._resolve_one_api_base(
-                what="[embedding]",
+                what="routing.toml [embedding]",
                 literal=self.embedding.api_base,
                 env_name=self.embedding.api_base_env, urlparse=urlparse,
             )

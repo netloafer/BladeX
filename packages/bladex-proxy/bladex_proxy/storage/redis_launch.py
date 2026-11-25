@@ -27,6 +27,16 @@ redis-server。** 批 F3 隔离验证把 `redis://127.0.0.1:1/0` 当"连不上�
   - 每次拉起在 redis 日志开头写一行来源（`write_launch_record`），下次可按日志判定谁拉的。
   - manifest 已坏时给**一条**可验证的恢复命令（`plan_manifest_repair`，默认只预演）。
 
+🔴 第 4 条来自 2026-11-05 事故（MQ-W33 / W35 / W37，批 W33）：Codex 沙箱里 `kill(pid, 0)` 返回
+EPERM，`ps` 被拦。CLI 把 EPERM 判成进程已死并删 pidfile，live 进程就此脱管；doctor 读不到端口，
+把生产 Redis 判成「端口不同的游离实例」并建议 kill 它。修法都落在本模块，因为它是 CLI 与
+daemon 都能 import 的那一层：
+  - **判活三态**（`pid_state`）：死 / 活 / 活着但碰不到。（批 LC：实现已移到 `bladex_proxy.process_probe`，本模块再导出。）
+  - **端口走 lsof**（`listening_ports` / `listening_pids`）：沙箱里 `lsof` 可用、`ps` 不可用。
+    读不到端口 ≠ 端口不同，`launch_refusal` 和 doctor 都不再据此给 kill。
+  - **embed、flash 单实例**（`acquire_instance_lock`）：部署根下一把 flock，锁随进程释放，
+    pidfile 再丢也不会两个进程并存抢写。
+
 本模块只用标准库，两侧（CLI 与 proxy 进程）都能 import。
 """
 
@@ -40,6 +50,24 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# 批 LC（MQ-W39）：判活 / 端口探测 / 单实例锁已收进 `bladex_proxy.process_probe`。
+# 此处原样再导出，旧的 `redis_launch.pid_state` / `acquire_instance_lock` 等名字继续可用。
+from bladex_proxy.process_probe import (  # noqa: F401
+    PID_ALIVE,
+    PID_DEAD,
+    PID_UNREACHABLE,
+    InstanceLockHeld,
+    _run_quiet,
+    acquire_instance_lock,
+    describe_lock_holder,
+    instance_lock_holder,
+    instance_lock_path,
+    listening_pids,
+    listening_ports,
+    pid_state,
+    read_instance_lock_record,
+)
 
 #: AOF 目录名与 manifest 文件名（redis 7+ multi-part AOF 固定命名）
 AOF_DIR_NAME = "appendonlydir"
@@ -91,18 +119,20 @@ class RedisOwner:
         return f"PID {self.pid} (port {self.port if self.port is not None else '?'})"
 
 
-def _run_quiet(cmd: list[str], timeout: float = 3.0) -> str:
-    """跑一个只读探测命令；拿不到输出返回空串（探测失败 ≠ 没有进程，调用方按"未知"处理）。"""
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace",  # noqa: S603
-                              timeout=timeout, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return proc.stdout or ""
+# ── 进程与端口探测（MQ-W33 / W34 / W37）────────────────────────────────────────
+
+
+# ── embed / flash 单实例（MQ-W35）───────────────────────────────────────────────
 
 
 def _redis_port_of(pid: int) -> int | None:
-    """redis-server 把进程标题改成 `redis-server *:6379`；从那里读端口。"""
+    """redis 的监听端口：先问 `lsof`，再看进程标题 `redis-server *:6379`。
+
+    🔴 批 W33（MQ-W37）：只看 `ps` 时，沙箱里读不到就成了 `port ?`，再被判成「端口不同」。
+    """
+    ports = listening_ports(pid)
+    if ports:
+        return ports[0]
     title = _run_quiet(["ps", "-p", str(pid), "-o", "command="]).strip()
     if "redis-server" not in title:
         return None
@@ -111,12 +141,9 @@ def _redis_port_of(pid: int) -> int | None:
 
 
 def _is_redis_pid(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+    if pid_state(pid) == PID_DEAD:
         return False
-    except PermissionError:
-        pass  # 活着但不是我们的：仍按命令名判
+    # 活着，或活着但碰不到（不是我们的 / 沙箱）：仍按命令名判
     return "redis-server" in _run_quiet(["ps", "-p", str(pid), "-o", "command="])
 
 
@@ -183,9 +210,17 @@ def launch_refusal(port: int, data_dir: str | Path = "data") -> str | None:
         return (f"redis-server {desc} already runs on {d} but did not answer on port {port}; "
                 f"not starting a second one on the same directory. "
                 f"Check it with: redis-cli -p {port} ping")
-    other = owners[0]
-    stop = (f"redis-cli -p {other.port} shutdown" if other.port is not None
-            else f"kill {other.pid}")
+    known = [o for o in owners if o.port is not None]
+    if not known:
+        # 🔴 批 W33（MQ-W37）：读不到端口 ≠ 端口不同。11-05 这里把生产 Redis 说成游离实例并给了
+        # `kill 17932`。只报事实和怎么查，不给任何停进程的命令。
+        pids = ",".join(str(o.pid) for o in owners)
+        return (f"redis-server {desc} already uses {d} as its data directory, but its port could "
+                f"not be read (a restricted shell cannot see it). It may well be the configured "
+                f"server on port {port}, so BladeX will not start another and does not suggest "
+                f"stopping it. Check it with: lsof -nP -a -p {pids} -iTCP -sTCP:LISTEN")
+    other = known[0]
+    stop = f"redis-cli -p {other.port} shutdown"
     return (f"redis-server {desc} already uses {d} as its data directory, on a different port "
             f"than the configured {port}. Two servers on one directory overwrite each other's "
             f"AOF manifest (MQ-A90), so BladeX will not start another. If that server is the "

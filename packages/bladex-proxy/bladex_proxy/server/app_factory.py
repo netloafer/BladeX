@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -27,6 +28,7 @@ from bladex_proxy.modules import validate_modules
 from bladex_proxy.route import init_router
 from bladex_proxy.routing_config import RoutingConfigError
 from bladex_proxy.server.admin_api import register_admin_routes
+from bladex_proxy.server.blocking import drain_blocking
 from bladex_proxy.server.endpoints_anthropic import register_anthropic_routes
 from bladex_proxy.server.endpoints_chat import register_chat_routes, register_embeddings_routes
 from bladex_proxy.server.endpoints_responses import register_responses_routes
@@ -133,6 +135,28 @@ async def lifespan(app: FastAPI):
         raise
 
 
+async def _rebuild_session_state(hub: MemoryHub) -> None:
+    """批 BA1 · D6 甲：会话身份状态从 Hub 最近一个纪元窗重放（读 Hub 在线程里，装回在事件循环里）。
+
+    失败不转热：凭证 ③ 一直关着，直到跑满一个纪元窗（`SessionCache.is_cold` 兜底）——
+    宁漏接，不误接。
+    """
+    from bladex_proxy import identity as _identity
+    t0 = time.perf_counter()
+    try:
+        records, fp_last_seen = await asyncio.to_thread(_identity.load_session_records, hub)
+        n = _identity.rebuild_session_state(records, fp_last_seen)
+        # 批 BA2：子任务归属与会话项目随同一趟读恢复。
+        from bladex_proxy.subtask_lineage import lineage as _lineage
+        _lineage.rebuild_lineage(records)
+    except Exception as e:  # noqa: BLE001 —— 重放失败只降级为「状态未热」，不影响服务
+        logger.warning("session_state_rebuild_failed", error=str(e),
+                       hint="凭证 ③ 关闭至纪元窗跑满")
+        return
+    logger.info("session_state_rebuild_done", turns=n,
+                ms=round((time.perf_counter() - t0) * 1000, 1))
+
+
 @asynccontextmanager
 async def _lifespan_body(app: FastAPI):
     cfg: ProxyConfig = app.state.config
@@ -140,6 +164,9 @@ async def _lifespan_body(app: FastAPI):
     # 在打开任何资源之前拒启动（与 identity registry 校验同一形态）。
     # 违例：未知 BLADEX_MODULE_* / Router 配开关 / 依赖不满足。
     app.state.modules = validate_modules()
+    # 批 BD · 步骤 1：账本块等长填充开着 = bench 臂，启动留一条可 grep 的 warning（默认 0，恒不打）。
+    from bladex_proxy.agency.bench_filler import warn_if_bench_filler_active
+    warn_if_bench_filler_active()
     logger.info("modules_resolved",
                 **{f"module_{k}": v for k, v in app.state.modules.items()})
     # InjectionSource 在 Memory Index 打开后才初始化（需要 Memory Index 做真召回）
@@ -256,6 +283,12 @@ async def _lifespan_body(app: FastAPI):
             logger.info("pipeline_overflow_replayed_on_startup", count=replayed)
     else:
         logger.warning("pipeline_skipped_no_redis")
+
+    # 批 BA1 · D6 甲（拍板 (30)）：进程刚起时会话状态是空的，凭证 ③（前缀指纹相同）没有任何
+    # 反证——两个开场白相同的会话谁先来谁占住指纹。重放完成前 ③ 不生效；后台跑，不阻塞 /ready。
+    from bladex_proxy import identity as _identity
+    _identity.mark_session_state_cold()
+    app.state.session_rebuild = asyncio.create_task(_rebuild_session_state(hub))
 
     # Memory Index 派生层 — proxy 只持有 MemoryIndex 供未来 M-proxy-3 prefetch 读用。
     # consolidation worker 不在 proxy 进程里跑（重操作：扫 RocksDB + embedding，
@@ -404,7 +437,13 @@ async def _lifespan_body(app: FastAPI):
         # 置位后等它采完手里这一次（见 backlog_sampler_loop 为什么不 cancel）
         app.state.backlog_sampler_stop.set()
         await asyncio.gather(sampler, return_exceptions=True)
+    # 批 DS1a：admin 读在线程里跑（`run_blocking`），关 Hub / Index 之前等它们读完
+    await drain_blocking()
 
+    # 关 Hub 之前等会话状态重放读完（它在线程里读 Hub，取消不了线程）
+    _rebuild = getattr(app.state, "session_rebuild", None)
+    if _rebuild is not None:
+        await asyncio.gather(_rebuild, return_exceptions=True)
     if app.state.pipeline_worker:
         await app.state.pipeline_worker.stop()
     # A2: drain 后台入库任务（断开连接派发的 shield task），防进程退出时丢
@@ -517,6 +556,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 m.set_gauge("bladex_pipeline_queue_depth", float(depth))
             except Exception:
                 pass
+        # MQ-V41：跳过的未知类型管理事件（>0 = 读到了比本版本新的事件，比如回滚之后）
+        hub_now = request.app.state.hub
+        if hub_now is not None:
+            m.set_gauge("bladex_hub_unknown_admin_events", float(hub_now.unknown_admin_event_count))
         return Response(content=m.render(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
     @app.get("/v1/models")

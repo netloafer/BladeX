@@ -15,8 +15,8 @@ ledger. So:
   pass `core` / `open` / `next` in the same call rather than updating right after.
 - Resuming something you can see in the injected list → `bladex_ledger_switch`
   with that id, and put in `evidence` the user's own words from this turn that
-  show the move (copied, not paraphrased). Read it first if you are unsure it
-  is the right one: `bladex_ledger_read(ledger_id=...)` inspects without switching.
+  show the move (copied, not paraphrased). `bladex_ledger_read(ledger_id=...)`
+  inspects a ledger without switching.
 - Already on the right ledger → just `bladex_ledger_update`. No switch needed.
 - Finished, or the user dropped it → `bladex_ledger_close`, with `evidence` =
   the user's own words from this turn that say so (copied). If the user later
@@ -28,8 +28,9 @@ ledger. So:
 
 These are the expensive mistakes, in rough order of how often they happen:
 
-- **Do not switch because the topic drifted.** A tangent inside the same task is
-  still that task. Switch when the *user* moved to different work.
+- **Do not switch because the topic drifted.** A tangent, a new angle, a follow-up
+  or another deliverable on the same subject is still that task. Switch when the
+  *user* moved to a different subject.
 - **Do not update every turn.** An entry earns its place if a different agent,
   picking this up tomorrow with none of your context, would need it. "Ran the
   tests" does not. "Tests fail on Python 3.11 because rocksdict pins 3.12" does.

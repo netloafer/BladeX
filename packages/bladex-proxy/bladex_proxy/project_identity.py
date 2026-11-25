@@ -24,11 +24,13 @@ MQ-A25）的一次正则；解析结果按 cwd LRU 缓存，
 from __future__ import annotations
 
 import hashlib
+import itertools
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 import structlog
+from bladex_core.project import git_remote_project_id
 
 logger = structlog.get_logger()
 
@@ -175,6 +177,8 @@ class ProjectIdentity:
     name: str = ""
     source: str = ""
     root: str = ""       # 项目根 realpath（简介蒸馏读声明文件用；Global 为空）
+    #: 请求里有没有 cwd 声明（可用与否不论）。`subtask_lineage` R2 只在**完全没有声明**时才粘。
+    cwd_declared: bool = field(default=False, compare=False)
 
 
 def _text_of(content) -> str:
@@ -190,13 +194,97 @@ def _text_of(content) -> str:
     return ""
 
 
-def _first_match(text: str) -> str:
-    """对一段文本按 `_CWD_PATTERNS` 顺序取第一个命中；无命中返回空串。"""
-    for pat in _CWD_PATTERNS:
+#: ── 候选按序尝试 + 规范化（批 A95，MQ-A95，2026-10-27）──
+#:
+#: 病例：dsh 0.2.1 的 system 里两行同现
+#:     Current working directory: "/…/tt-20261026/dsh".
+#:     … may modify files under the session workspace: "/…/tt-20261026/dsh".
+#: 原来「第一条命中即定」：通用 `working directory:` 规则先抓到第一行的 `"/…/dsh".`
+#: （引号 + 句点）⇒ 路径不存在 ⇒ **静默**落 Global；第 4 条专为 dsh 写的规则轮不到。
+#: Hub 快照回放：10-21 起 dsh 主轮 32/32 落 Global，全是这一种形态。
+#: 修法三处，对所有 agent 一视同仁（不加 dsh 分支）：
+#:   ① 每个命中先过 `_normalize_cwd`（去外层成对引号、去句末 `.,;:`）；
+#:   ② 规范化后不是已存在的绝对目录 ⇒ 试下一个候选，不再第一条即定；
+#:   ③ 有候选却没有一个可用 ⇒ `project_cwd_unresolved`（按原串去重），不再静默。
+#: 全部候选不可用时仍返回第一个候选（规范化后）：`resolve_project` 照旧判 Global，
+#: `cwd_found=True` 的读数与 header / developer 后一条两路的触发条件都与修前一致。
+_QUOTES = ('"', "'", "`")
+_TRAILING_PUNCT = ".,;:"
+
+#: 已告警过的原串（去重限频）。有上限：取值空间来自请求正文，不许无界增长。
+_unresolved_seen: set[str] = set()
+_UNRESOLVED_SEEN_MAX = 256
+
+
+def _normalize_cwd(raw: str) -> str:
+    """命中串 → 路径：去外层成对引号，再去句末 `.` `,` `;` `:`。所有模式共用这一处。
+
+    `"/a/b".` 这种引号外还挂句点的写法，先剥句末标点才露出成对引号，所以两步交替做到不再变化。
+    """
+    s = raw.strip()
+    while True:
+        prev = s
+        s = s.rstrip(_TRAILING_PUNCT).rstrip()
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in _QUOTES:
+            s = s[1:-1].strip()
+        if s == prev:
+            return s
+
+
+def _usable_dir(path: str) -> bool:
+    """候选可用 = 绝对路径且此刻是目录（与 `resolve_project` 准入同一判据）。"""
+    try:
+        return os.path.isabs(path) and os.path.isdir(path)
+    except (OSError, ValueError):
+        return False
+
+
+def _candidates(text: str, declared: bool = True):
+    """一段文本里的 cwd 候选，按 `_CWD_PATTERNS` 顺序：(模式序号, 原串, 规范化后, 是否声明)。
+
+    `declared` = 是否 agent 自己的环境声明（见 `_pick`）；只有 `_scan_candidates`
+    对 user 侧块外头部文本传 False。
+    """
+    for i, pat in enumerate(_CWD_PATTERNS):
         mm = pat.search(text)
         if mm:
-            return mm.group(1).strip()
-    return ""
+            raw = mm.group(1)
+            path = _normalize_cwd(raw)
+            if path:
+                yield i, raw, path, declared
+
+
+def _pick(cands) -> str:
+    """按序取第一个可用目录；都不可用 ⇒ 告警并返回第一个候选；没有候选 ⇒ ""。
+
+    🔴 **声明不可用时，只能由另一条声明接手**（批 A95b，MQ-A96）：按序兜底让出了一条
+    修前没有的路——system 的 cwd 不可用 ⇒ 往后试 ⇒ 头部 user 正文里用户随口贴的
+    `working directory: /别的项目` 被采用 ⇒ 这一轮记到别的项目（修前落 Global，
+    是安全方向；修后是误接方向，第一红线）。所以一旦见过不可用的候选，
+    之后的非声明候选（user 侧、块外、头部文本）一律跳过，也不算「第一个候选」。
+    没见过不可用候选时 user 文本照修前参与——不扩大也不收窄。
+    """
+    first = None
+    for i, raw, path, declared in cands:
+        if first is not None and not declared:
+            continue
+        if _usable_dir(path):
+            return path
+        if first is None:
+            first = (i, raw, path)
+    if first is None:
+        return ""
+    i, raw, path = first
+    if raw not in _unresolved_seen:
+        if len(_unresolved_seen) < _UNRESOLVED_SEEN_MAX:
+            _unresolved_seen.add(raw)
+        logger.warning("project_cwd_unresolved", raw=raw[:120], pattern=i)
+    return path
+
+
+def _first_match(text: str) -> str:
+    """对一段文本按 `_CWD_PATTERNS` 顺序取第一个**可用**候选（见 `_pick`）；无命中返回空串。"""
+    return _pick(_candidates(text))
 
 
 def extract_cwd(messages: list[dict]) -> str:
@@ -211,7 +299,14 @@ def extract_cwd(messages: list[dict]) -> str:
     （2026-09-11）：窗口为够到 dsh 的 `messages[3]` 放宽到 4，那句话立刻不成立，
     而它正是零误伤的唯一依据 —— 依据改挂在**角色分界**上（tool 是转引内容，
     不是 agent 对自己环境的声明），与窗口大小解耦。
+
+    候选按扫描序逐个尝试，取第一个已存在的绝对目录（批 A95，见 `_pick`）。
     """
+    return _pick(_scan_candidates(messages))
+
+
+def _scan_candidates(messages: list[dict]):
+    """`extract_cwd` 的扫描面，按修前的先后顺序逐个产出候选（惰性：命中可用目录即停）。"""
     scanned = 0
     for m in messages:
         role = m.get("role")
@@ -240,9 +335,8 @@ def extract_cwd(messages: list[dict]) -> str:
         block = _ENV_BLOCK.search(content)
         if block:
             # group(1) 是块名，正文在 group(2)（块名闭集化后的位移）。
-            found = _first_match(block.group(2))
-            if found:
-                return found
+            # 块内 = agent 自己声明的环境（codex 的 `<environment_context>` 就在 user 角色里）。
+            yield from _candidates(block.group(2))
         # 🔴 `system` / `developer` 全文扫（2026-09-11，MQ-A67 · Pi）。
         # MQ-A25 当年评估过这一档并**否掉了**，原话：
         #   「那两个角色里零非 env 命中（**中毒风险 0**），但 codex 的 cwd
@@ -253,12 +347,9 @@ def extract_cwd(messages: list[dict]) -> str:
         # 按他们自己的读数，这一档现在成立。
         # ⚠️ 只给这两个角色。user 角色**不放开** —— codex 的中毒源就在 user 侧
         # （tool 结果转引文档），而 tool 角色已在上面整条跳过。
-        scan = content if m.get("role") in ("system", "developer") \
-            else content[:_SCAN_CHARS]
-        found = _first_match(scan)
-        if found:
-            return found
-    return ""
+        scan = content if privileged else content[:_SCAN_CHARS]
+        # 非 system/developer 的块外头部文本 = 自由文本，不是声明（A95b，见 `_pick`）。
+        yield from _candidates(scan, declared=privileged)
 
 
 #: ── codex 自报的工作区根（批 E · MQ-A83，2026-09-28）──
@@ -325,11 +416,10 @@ def extract_cwd_after_developer(messages: list[dict]) -> str:
             if nxt.get("role") == "tool":
                 return ""
             block = _ENV_BLOCK.search(content)
+            cands = _candidates(content[:_SCAN_CHARS])
             if block:
-                found = _first_match(block.group(2))
-                if found:
-                    return found
-            return _first_match(content[:_SCAN_CHARS])
+                cands = itertools.chain(_candidates(block.group(2)), cands)
+            return _pick(cands)
         return ""
     return ""
 
@@ -393,7 +483,7 @@ def resolve_project(cwd: str) -> ProjectIdentity:
     准入（2026-08-29 护栏 C）：cwd 必须绝对且是真实目录，否则直接 Global。
 
     键分层（ADR-0032 §4 全四档已落实）：realpath(cwd)（软链收敛）→
-    ① git 仓库根：remote URL 有则 `git-remote:<url>`（跨搬家稳定）、
+    ① git 仓库根：remote URL 有则 `git-remote:<归一 url>`（跨搬家稳定，批 BA2 归一）、
       无则 `git-root:<realpath(root)>`；
     ② 无仓库但目录带项目声明标志（_PROJECT_MARKERS）→ `path:<realpath>`
       （source=path；搬家/改名会换身份——该档如实接受这个代价）；
@@ -432,9 +522,12 @@ def resolve_project(cwd: str) -> ProjectIdentity:
                 ident = ProjectIdentity()
         else:
             url = _git_remote_url(root)
-            key = f"git-remote:{url}" if url else f"git-root:{root}"
+            # 批 BA2（MQ-A75 甲）：remote 键归一，同仓多克隆 / https 与 ssh 写法同一个项目。
+            # git-root 档键不动（生产 BladeX 自身就是这一档，它的键是活账与回放集真值）。
+            pid = (git_remote_project_id(url) if url else
+                   "p-" + hashlib.sha256(f"git-root:{root}".encode()).hexdigest()[:12])
             ident = ProjectIdentity(
-                project_id="p-" + hashlib.sha256(key.encode()).hexdigest()[:12],
+                project_id=pid,
                 name=os.path.basename(root),
                 source="git-remote" if url else "git-root", root=root)
     except OSError:
@@ -465,17 +558,25 @@ def resolve_from_request(headers: dict[str, str],
     # （工作区开在 ~/dev、cwd 在 ~/dev/BladeX）header 优先会把原本认得出的项目解析成
     # ~/dev（非 git ⇒ Global），把要修的病反过来带到正常会话上。改前能认出项目的路径
     # 逐字不变，header 只救压缩后载体出窗口那一类。
+    #
+    # 🔴 批 BA2（MQ-A97）：判据从「cwd 非空」改「cwd **可用**」。`extract_cwd` 在全部候选不可用时
+    # 返回第一个候选（要留告警与读数），修前这个非空串挡住了后两路，请求明明带着 agent 自己的
+    # 声明却落 Global。A95b「不可用声明只能由另一条声明接手」不变：后两路都是确定性声明
+    # （header 自报工作区根 / developer 紧后的上下文包），不是 user 正文。
+    # 三路都不可用 ⇒ 保留第一个非空串（读数照旧，`resolve_project` 判 Global）。
     cwd = extract_cwd(messages)
     cwd_source = "messages" if cwd else ""
-    if not cwd:
-        cwd = codex_workspace_root(headers)
-        cwd_source = "codex_workspaces" if cwd else ""
-    if not cwd:
-        # 批 E · E6（MQ-A88）：前两路都空 ⇒ 读 codex 上下文包（见 `extract_cwd_after_developer`）。
-        cwd = extract_cwd_after_developer(messages)
-        cwd_source = "after_developer" if cwd else ""
+    if not _usable_dir(cwd):
+        alt = codex_workspace_root(headers)
+        if alt and (_usable_dir(alt) or not cwd):
+            cwd, cwd_source = alt, "codex_workspaces"
+    if not _usable_dir(cwd):
+        # 批 E · E6（MQ-A88）：前两路取不到可用目录 ⇒ 读 codex 上下文包（见 `extract_cwd_after_developer`）。
+        alt = extract_cwd_after_developer(messages)
+        if alt and (_usable_dir(alt) or not cwd):
+            cwd, cwd_source = alt, "after_developer"
     ident = resolve_project(cwd)
     logger.info("project_resolved", cwd_found=bool(cwd), cwd=cwd[:120], cwd_source=cwd_source,
                 project_id=ident.project_id, source=ident.source or "global",
                 name=ident.name)
-    return ident
+    return replace(ident, cwd_declared=True) if cwd else ident

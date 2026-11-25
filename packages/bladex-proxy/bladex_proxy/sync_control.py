@@ -41,12 +41,24 @@ _JOB_TTL_S = 24 * 3600
 #: 所以心跳同时带 ts，由读侧算年龄自己判断（见 admin_read._read_consolidator_heartbeat）。
 _HEARTBEAT_TTL_S = 300
 
+#: 批 BB · 2c：consolidator 报「本进程矛盾检测开关是否打开」的心跳字段（"1" / "0"）。
+#: 选心跳而不是 `contradiction_state/`：状态行只要一个布尔，心跳自带 TTL——consolidator 退出后 5 分钟内
+#: 自动「没报过」，不会留下一个过期的「on」；`contradiction_state/` 是丙类保留（重建不清），会反过来
+#: 在 consolidator 已关掉之后继续显示「on」。
+HEARTBEAT_CONTRADICTION_FIELD = "contradiction_enabled"
+
 
 class SyncControl:
     """控制通道薄封装。client = redis.Redis(decode_responses=True) 或测试替身。"""
 
     def __init__(self, client: Any) -> None:  # noqa: ANN401 —— 可注入测试替身
         self._r = client
+        #: 每次心跳都带上的固定字段（进程级事实，如矛盾开关）。HSET 是合并式更新，不是每次都写的字段
+        #: 会在重启后残留旧值直到 TTL——所以进程级事实必须随每一拍重写，不能只在启动时写一次。
+        self._beat_base: dict[str, Any] = {}
+
+    def set_beat_base(self, **fields: Any) -> None:  # noqa: ANN401
+        self._beat_base = dict(fields)
 
     # ── CLI 侧 ──
 
@@ -119,7 +131,7 @@ class SyncControl:
         phase/done/total），上一轮写的 batch、last_new_facts 该留着。
         """
         try:
-            payload = {k: str(v) for k, v in fields.items() if v is not None}
+            payload = {k: str(v) for k, v in {**self._beat_base, **fields}.items() if v is not None}
             payload["ts"] = str(time.time())
             self._r.hset(HEARTBEAT_KEY, mapping=payload)
             self._r.expire(HEARTBEAT_KEY, _HEARTBEAT_TTL_S)

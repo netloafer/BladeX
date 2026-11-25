@@ -117,6 +117,9 @@ _ISOLATED = {
     # 每个跑 lifespan 的用例拿到的硬规则随开发机当天的 .env 而变（与上面两条同型）。
     # 热加载自己的用例显式传 `interval_s` / monkeypatch 这个变量。
     "BLADEX_HARD_RULES_RELOAD_S": "0",
+    # 批 AE：指向不存在的临时路径 ⇒ 测试不读部署根的 `config/bladex.toml`。不设的话它跟着
+    # `routing.toml` 的默认相对路径走，开发机上 live 文件里的 backend / model 就渗进用例。
+    "BLADEX_GLOBAL_CONFIG": os.path.join(_TMP_ROOT, "bladex.toml"),
 }
 os.environ.update(_ISOLATED)
 
@@ -160,6 +163,41 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 POST_SCRUB_BLADEX_ENV: tuple[str, ...] = tuple(
     sorted(k for k in os.environ if k.startswith("BLADEX_"))
 )
+
+
+# ── 🔴 测试的临时目录不许落在部署根下面（批 W33，MQ-V49）──
+#
+# 用例普遍 chdir 到 tmp_path 再调 `cli.main()`，而部署根发现会沿祖先往上找 `config/.env`。
+# TMPDIR 落在部署根下时，`bladex stop` 用例找到的就是真部署：W33 排查第一跑把 TMPDIR 放进假部署根，
+# 结果 pidfile 全删、假进程全死。放到主仓下，跑一次测试就可能停掉 live。
+# 放 sessionstart：还没有任何用例跑过就失败；不用 autouse fixture，也不用 tmp_path（那样已经建了目录）。
+def _deployment_root_above(path: str) -> str | None:
+    """path 自身及祖先里第一个含 `config/.env` 的目录；没有返回 None。"""
+    cur = os.path.realpath(path)
+    while True:
+        if os.path.isfile(os.path.join(cur, "config", ".env")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return None
+        cur = parent
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    candidates = {
+        "--basetemp": session.config.getoption("basetemp", None),
+        "PYTEST_DEBUG_TEMPROOT": os.environ.get("PYTEST_DEBUG_TEMPROOT"),
+        "TMPDIR (tempfile.gettempdir)": tempfile.gettempdir(),
+    }
+    for source, path in candidates.items():
+        root = _deployment_root_above(str(path)) if path else None
+        if root is not None:
+            pytest.exit(
+                f"测试临时目录 {path}（来自 {source}）在部署根 {root} 下面（它含 config/.env）。"
+                f"用例 chdir 到临时目录后，CLI 会把它当成真部署，`bladex stop` 用例会真的停进程、删 pidfile"
+                f"（MQ-V49）。把 TMPDIR / --basetemp 指到部署根之外再跑。",
+                returncode=2,
+            )
 
 
 @atexit.register

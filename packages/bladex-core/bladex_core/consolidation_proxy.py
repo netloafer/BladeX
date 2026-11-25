@@ -32,6 +32,7 @@ from bladex_core.flags import flag_enabled, flag_number
 from bladex_core.funnel import FUNNEL_DEDUP, FUNNEL_STORED
 from bladex_core.importance import compute_importance
 from bladex_core.supersede import plan_supersede_merge
+from bladex_core.vector_matrix import FactVectors, IndexedFacts, UnitMatrix
 
 # 旧 kind（preference|event|task|decision|general）→ 新 item_kind 六类兜底映射（U4）。
 # 蒸馏器显式产出 item_kind 时优先用它；空时按旧 kind 推断，仍无则 assertion（最通用）。
@@ -217,7 +218,8 @@ class InRunNeighborSource:
     def __init__(self, checker: Any | None = None,
                  hydrate: Callable[[str], Fact | None] | None = None) -> None:
         self._checker = checker
-        self._facts: list[Fact] = []
+        #: 批 AB · MQ-I27：本轮内存集（矩阵化；`within` 的语义 = 逐条 `_cosine`）。
+        self._facts = FactVectors()
         #: 🔴 2026-09-18（批 S · S2.1，MQ-I20）：库内视图的行**没有坐标**（LanceDB facts
         #: 表只有 id/vector/content/category/source_*/entities），此前用它们拼出的 Fact
         #: subject/attribute 恒空 ⇒ `fast_path_verdict` 对库内邻居从不命中同键。
@@ -241,8 +243,7 @@ class InRunNeighborSource:
 
     def add(self, fact: Fact) -> None:
         """收录一条本轮已算过邻居的候选（无 embedding 的不收，查不到）。"""
-        if fact.embedding:
-            self._facts.append(fact)
+        self._facts.add(fact)
 
     def discard(self, fact_id: str) -> None:
         """裁决判丢弃（NOOP 不入库）后摘除——防同实例复用时幽灵邻居跨批存活。
@@ -250,19 +251,13 @@ class InRunNeighborSource:
         注意这**救不了**本批内已装好的裁决包（邻居全在循环①算完），
         那部分是文档化的悬空 target 边界；这里只保证跨批不再看见它。
         """
-        self._facts = [f for f in self._facts if f.id != fact_id]
+        self._facts.discard(fact_id)
 
     def neighbors(
         self, embedding: list[float], *, k: int = 10, min_similarity: float = 0.90,
     ) -> list[tuple[Fact, float]]:
         """取 `min_similarity` 以上的近邻，内存集 + 库内视图合并去重，按相似度取 top-k。"""
-        from bladex_core.adjudication import _cosine  # noqa: PLC0415 —— 防循环导入
-
-        out: list[tuple[Fact, float]] = []
-        for f in self._facts:
-            sim = _cosine(embedding, f.embedding)
-            if sim >= min_similarity:
-                out.append((f, sim))
+        out: list[tuple[Fact, float]] = self._facts.within(embedding, min_similarity)
 
         fn = getattr(self._checker, "neighbors", None)
         if fn is not None:
@@ -315,6 +310,7 @@ class ProxyConsolidator:
         funnel: Any | None = None,
         adjudicator: Any | None = None,
         neighbor_source: Any | None = None,
+        embed_ledger: Any | None = None,
     ) -> None:
         self._embedder = embedder
         self._novelty_threshold = novelty_threshold
@@ -326,6 +322,9 @@ class ProxyConsolidator:
         # 对象**拆开**。默认构造 = 本轮内存集 + （若有 checker）库内视图；
         # 全量重建 novelty_checker=None 时自动退化为纯内存集——正确语义：
         # 旧库不进裁决，但本轮已产出的候选必须互相可见。
+        #: 批 AB · MQ-I27：判重矩阵（`_is_novel`）与嵌入台账（`_embed_chunked`）。
+        self._novelty_matrix = UnitMatrix()
+        self._embed_ledger = embed_ledger
         self._neighbor_source = (
             neighbor_source if neighbor_source is not None
             else InRunNeighborSource(checker=novelty_checker))
@@ -511,6 +510,8 @@ class ProxyConsolidator:
 
         # 准备已有 facts 的嵌入矩阵（G3: 有 novelty_checker 时不需全量加载）
         existing_embeddings: list[list[float]] = []
+        # 批 AB2 · MQ-I44：矩阵与这个局部列表同生命周期（见 `UnitMatrix` docstring）
+        self._novelty_matrix = UnitMatrix()
         # 方案 B：实体集合与嵌入矩阵并行（within-batch 实体感知去重用）
         existing_entities: list[list[str]] = []
         # ADR-0028 E6.5：标识符前置放行用的已存文本（与 embeddings 同序）
@@ -715,13 +716,18 @@ class ProxyConsolidator:
         if not fact.embedding:
             return out
 
-        # 批内（已应用）
-        for other in running:
-            if other.id == fact.id or not other.embedding:
-                continue
-            sim = _cosine(fact.embedding, other.embedding)
-            if sim >= min_sim:
-                out.append((other, sim))
+        # 批内（已应用）。批 AB · MQ-I27：`_adjudicate` 传的是矩阵化的 IndexedFacts
+        vectors = getattr(running, "vectors", None)
+        if vectors is not None:
+            out.extend((o, s) for o, s in vectors.within(fact.embedding, min_sim)
+                       if o.id != fact.id)
+        else:
+            for other in running:
+                if other.id == fact.id or not other.embedding:
+                    continue
+                sim = _cosine(fact.embedding, other.embedding)
+                if sim >= min_sim:
+                    out.append((other, sim))
 
         # 本轮 pending + 库内（neighbor_source 合并视图）
         try:
@@ -754,7 +760,7 @@ class ProxyConsolidator:
 
         now = datetime.now(UTC)
         by_id: dict[str, Fact] = {f.id: f for f in existing}
-        running: list[Fact] = list(existing)   # 批内可见（同批矛盾要能互相看见）
+        running: list[Fact] = IndexedFacts(existing)   # 批内可见（同批矛盾要能互相看见）
         kept: list[Fact] = []
         pending: list[tuple[Fact, Any]] = []   # 需要 LLM 裁决的 (fact, input)
         records: list[dict[str, Any]] = []
@@ -829,8 +835,11 @@ class ProxyConsolidator:
 
         # ② 其余打包交裁决器（一次调用判多条）
         if pending:
+            from bladex_core.adjudication import AdjudicationUpstreamUnavailable
             try:
                 verdicts = self._adjudicator.adjudicate([pkg for _, pkg in pending])
+            except AdjudicationUpstreamUnavailable:
+                raise      # 批 AA · MQ-I35：没人可问 ≠ 判不出，整轮中止，不兜成 ADD
             except Exception as e:  # noqa: BLE001 —— 宁多勿丢：判不出就全 ADD
                 logger.warning("adjudicate_call_failed err=%s -> all add", e)
                 verdicts = []
@@ -900,6 +909,34 @@ class ProxyConsolidator:
         if prog and len(prog) >= _MIN_PROGRESS_CHARS:
             return prog, Provenance.PROGRESS.value
         return "", ""
+
+    def _embed_via_ledger(self, texts: list[str], identity: str, *, phase: str) -> list[list[float]]:
+        """批 AB · MQ-I27：按文本 hash 的嵌入台账。同文只算一次；第二跑零计算。
+
+        🔴 **缺的那些一条一条算（batch=1），不进批**：实测（`embed_batch_probe.py`，400 条真实正文）
+        fastembed 批内 padding 会让同一文本的向量随同批最长那条变（最大绝对差 1.6e-5，只有约 1/4
+        逐位相同）。进批的话向量取决于「它和谁一批」，同一 Hub 重建两次可能得到不同向量，判重阈值边上
+        的条目就会翻——这正是台账要消除的东西。batch=1 ⇒ 向量只取决于文本。
+        """
+        import time as _time
+
+        uniq = list(dict.fromkeys(texts))
+        found = self._embed_ledger.get_embeddings(identity, uniq)
+        missing = [t for t in uniq if t not in found]
+        total, t0 = len(missing), _time.perf_counter()
+        for done, text in enumerate(missing, 1):
+            found[text] = self._embed_ledger.put_embedding(
+                identity, text, self._embedder.embed([text])[0])
+            if done % 200 == 0 or done == total:
+                rate = done / max(_time.perf_counter() - t0, 1e-6)
+                self._report(phase=f"embed:{phase}", done=done, total=total,
+                             rate=round(rate, 1), eta_s=int((total - done) / max(rate, 1e-6)))
+                logger.info("consolidate_embed_ledger_progress phase=%s computed=%d/%d "
+                            "uniq=%d texts=%d rate=%.1f/s", phase, done, total, len(uniq),
+                            len(texts), rate)
+        logger.info("consolidate_embed_ledger phase=%s texts=%d uniq=%d hit=%d computed=%d",
+                    phase, len(texts), len(uniq), len(uniq) - total, total)
+        return [found[t] for t in texts]
 
     def _collect_candidates_v4(
         self, turns: list[ConversationTurn]
@@ -1108,6 +1145,10 @@ class ProxyConsolidator:
 
         if not texts:
             return []
+        identity = getattr(self._embedder, "model_identity", "") or ""
+        ledger = getattr(self, "_embed_ledger", None)       # 只测分块的用例会绕过 __init__
+        if ledger is not None and isinstance(identity, str) and identity:
+            return self._embed_via_ledger(texts, identity, phase=phase)
         size = max(1, int(flag_number("BLADEX_EMBED_BATCH")))
         out: list[list[float]] = []
         total = len(texts)
@@ -1667,13 +1708,9 @@ class ProxyConsolidator:
             q = np.asarray(candidate_emb, dtype=np.float32)
             q_norm = q / (float(np.linalg.norm(q)) or 1.0)
 
-            mat = np.stack([np.asarray(e, dtype=np.float32) for e in existing_embeddings])
-            # 归一化已有向量
-            norms = np.linalg.norm(mat, axis=1, keepdims=True)
-            norms = np.where(norms == 0, 1.0, norms)
-            mat_norm = mat / norms
-
-            sims = mat_norm @ q_norm
+            # 批 AB · MQ-I27：已有向量只在入池时归一化一次（修前每条候选重建整个矩阵）。
+            self._novelty_matrix.sync(existing_embeddings)
+            sims = self._novelty_matrix.sims(q_norm)
             max_sim = float(sims.max())
             if max_sim < self._novelty_threshold:
                 return True  # 相似度不够，新颖
@@ -1685,9 +1722,7 @@ class ProxyConsolidator:
             if not cand_ents:
                 return False  # 候选无实体，退化纯 cosine
             # 遍历所有高相似已有 fact，任一实体高度重叠 -> 判重
-            for idx, sim in enumerate(sims):
-                if float(sim) < self._novelty_threshold:
-                    continue
+            for idx in np.flatnonzero(sims >= self._novelty_threshold).tolist():
                 if idx >= len(existing_entities):
                     break
                 ex_ents = {x.strip().lower() for x in (existing_entities[idx] or []) if x and x.strip()}
@@ -1700,6 +1735,7 @@ class ProxyConsolidator:
             return True
         except Exception as e:
             logger.warning("consolidate_novelty_error err=%s", e)
+            self._novelty_matrix = UnitMatrix()     # 半截状态不留到下一条
             return True  # 出错时保守写入
 
 

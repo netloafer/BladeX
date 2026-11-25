@@ -182,7 +182,7 @@ CHANGELOG 不是发版那天写出来的，是一路攒的（MQ-V37 ⑤ 的真�
   - 受影响：给本地小窗口模型配了 `context_window` 的用户（MQ-A34 病例：hermes + ollama 32K）；其余用户无变化。
 - **注入稳定层会话首轮定格 ⇒ 升级后每个进行中会话的前缀 cache 冷启一次**（批 Z · Z2.4，MQ-A58，ADR-0032 §3.1 兑现）。
   BladeX 的自我介绍块此前每轮按"最后一条 agent `system` 之后"重新定位，Claude Code 往数组末尾追加 `role=system` 的 system-reminder
-  ⇒ 它在一个会话里漂十几次（Z2.0 读数：CC 67 次注入变了 32 次；hermes / codex / dsh 0 次）。现在首轮定格位置与内容，之后按**内容锚点**复位，
+  ⇒ 它在一个会话里漂十几次（Z2.0 读数：CC 67 次注入变了 32 次；hermes / codex / 另一个 agent 0 次）。现在首轮定格位置与内容，之后按**内容锚点**复位，
   agent 新追加的 system 一律排在它之后；锚点找不到（agent 压缩了历史）⇒ 回落老规则重新定格 + INFO `agency_about_anchor_lost`；
   账本面翻转 / proxy 升级改了 TOOLS.md ⇒ 内容合法地变一次 + INFO `agency_about_refrozen reason=ledger_face|notes_changed`。
   `agency_about_injected` 新增 `freeze=frozen|anchored|anchor_lost|none` 列。**一次性代价与 F4 / Y1c / Z3 合并描述**：
@@ -213,7 +213,7 @@ CHANGELOG 不是发版那天写出来的，是一路攒的（MQ-V37 ⑤ 的真�
 
 ### 5.2 0.4.0 收集点
 
-（0.4.0 起每批改了用户可见行为就在这里加一行；格式同 5.1。）
+（0.4.0 起每批改了用户可见行为就在这里加一行；格式同 5.1。**0.4.0 对外发版说明定稿 = `docs/release-notes-0.4.0.md`**，已整理自 README「0.4.0 已交付」、Known Limitations 与 0.5.0 破坏性变更预告；本节只留内部收集点。）
 
 - **适配 fastembed 0.9**（MQ-W21，拍板 (47)）：0.3.0 依赖限定 `fastembed>=0.3,<0.9`；0.9 把模型仓库名大小写改了（`qdrant/…` → `Qdrant/…`）⇒ 缓存目录大小写。**放开上限前先在 Linux 上实测老缓存是否被认出**（认不出 = 首启重下约 2 GB，要写进 0.4.0 发版说明「升级前必读」）。
 

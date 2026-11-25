@@ -6,21 +6,36 @@
 consolidator 是后台批处理进程（非热路径），走 Router 网关的同步调用
 （与 `LLMDistiller` / `LLMLinkJudge` 一致）。
 
-降级（宁多勿丢）：超时/失败/解析失败 → **全部 ADD**，并置 `fallback=True` 供计数。
+降级（宁多勿丢）：本块输入的问题（解析失败 / 4xx）→ **全部 ADD**，并置 `fallback=True` 供计数。
 理由与 L4 裁决相反：L4 判不出就 uncertain（留池，不归属），代价是"这条暂时没归属"；
 这里判不出就 ADD，代价是"库里多一条重复" —— 而反过来（判不出就丢弃）
 会**静默丢记忆**，那是不可接受的一侧。
+
+🔴 **上游不可达不是"判不出"**（批 AA · MQ-I35，2026-10-22）：5xx / 429 / 超时 / 连接错误
+（`router_sdk.is_transient_upstream_error`，与热路径 failover 同一判据）→ **暂停、指数退避、
+恢复后重试同一块**；单次断网等满 `BLADEX_ADJUDICATE_OUTAGE_MAX_WAIT_S` → 抛
+`AdjudicationUpstreamUnavailable`，调用方整轮中止。此前它们与解析失败走同一条降级 ADD 路径，
+两次夜间断网各把 30% / 43% 的候选判成 blanket ADD、各作废一跑 7–8 h。
+与蒸馏侧的对齐：蒸馏把失败分成 `call`（上游的问题，不计重试次数）与 `parse`（这条输入的问题，
+计次超限放行）；这里同一刀切法——上游的问题等它，输入的问题降级。
+
+判决缓存（批 AA · 步骤 5）：`journal` 非空时按**单条候选的完整输入**（模型 + prompt 版本 +
+该条渲染后的 NEW/neighbors 段）缓存非降级判决。中断后重跑，已判过的块零调用；
+降级判决不缓存（下次还要真判）。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import time
 from typing import Any
 
 from bladex_core.adjudication import (
     AdjudicationInput,
     AdjudicationOp,
+    AdjudicationUpstreamUnavailable,
     AdjudicationVerdict,
 )
 from bladex_core.flags import flag_number
@@ -35,6 +50,14 @@ logger = logging.getLogger(__name__)
 #: **现在 bump 是零成本的** —— 裁决台账尚无存量（M2 落地至今未跑过真实重建）。
 #: M5 全量重建之后再 bump 就要重烧全部裁决，所以这一次要趁早。
 ADJ_VER = "v2-adj-001"
+
+#: 上游不可达时的退避：首次等待与单次等待上限（秒）。总上限是旋钮
+#: （`BLADEX_ADJUDICATE_OUTAGE_MAX_WAIT_S`），这两个是退避曲线的形状，不是策略。
+_BACKOFF_BASE_S = 15.0
+_BACKOFF_MAX_S = 300.0
+#: 测试注入点（真实路径 = 墙钟 + 真睡）。
+_sleep = time.sleep
+_monotonic = time.monotonic
 
 _ADJ_SYSTEM = """\
 You are a memory write-time adjudicator. For each NEW item below you are given its
@@ -100,8 +123,20 @@ class LLMAdjudicator:
         max_tokens: int = 1024,
         timeout: float = 30.0,
         no_think: bool = True,
+        journal: Any | None = None,
     ) -> None:
         self._model = model
+        #: 判决缓存（`get_adjudication(key)` / `put_adjudication(key, rec)`；None = 不缓存）。
+        self._journal = journal
+        self._cache_hits = 0
+        # 批 AB · MQ-I39：full 同块就地重试（`begin_rebuild_pass`）
+        self._block_retries = 0
+        self._blocks_total = 0
+        self._blocks_ok = 0
+        self._exhausted_ids: set[str] = set()
+        self._cache_hits_this_pass = False
+        self._outage_waits = 0          # 进入退避的次数（每次断网算一次）
+        self._outage_wait_s = 0.0       # 累计等待秒数
         self._api_base = api_base
         self._api_key = api_key
         self._temperature = temperature
@@ -144,20 +179,119 @@ class LLMAdjudicator:
         """
         if not items:
             return []
+        cached: dict[str, AdjudicationVerdict] = {}
+        todo = items
+        if self._journal is not None:
+            todo = []
+            for it in items:
+                v = self._cache_get(it)
+                if v is None:
+                    todo.append(it)
+                else:
+                    cached[it.candidate_id] = v
+            if cached:
+                self._cache_hits += len(cached)
+                self._item_count += len(cached)   # 分母口径不变：候选条数
+                self._cache_hits_this_pass = True
+                logger.info("adjudicate_cache_hits hits=%d todo=%d", len(cached), len(todo))
         chunk = max(1, int(flag_number("BLADEX_ADJUDICATE_CHUNK")))
-        if len(items) <= chunk:
-            return self._adjudicate_chunk(items)
-        out: list[AdjudicationVerdict] = []
-        for i in range(0, len(items), chunk):
-            out.extend(self._adjudicate_chunk(items[i:i + chunk]))
-        logger.info("adjudicate_chunked total=%d chunk=%d calls=%d",
-                    len(items), chunk, (len(items) + chunk - 1) // chunk)
-        return out
+        fresh: list[AdjudicationVerdict] = []
+        for i in range(0, len(todo), chunk):
+            part = todo[i:i + chunk]
+            got = self._adjudicate_chunk(part)
+            self._cache_put(part, got)       # 逐块落盘：中途被 kill，已判的块不丢
+            fresh.extend(got)
+        if len(todo) > chunk:
+            logger.info("adjudicate_chunked total=%d chunk=%d calls=%d",
+                        len(todo), chunk, (len(todo) + chunk - 1) // chunk)
+        if not cached:
+            return fresh
+        by_id = {v.candidate_id: v for v in fresh}
+        by_id.update(cached)
+        return [by_id[it.candidate_id] for it in items]
+
+    # ── 判决缓存 ──
+    def _cache_key(self, it: AdjudicationInput) -> str:
+        h = hashlib.sha256(
+            f"{self._model}\0{ADJ_VER}\0{_build_prompt([it])}".encode()).hexdigest()
+        return h[:32]
+
+    def _cache_get(self, it: AdjudicationInput) -> AdjudicationVerdict | None:
+        try:
+            rec = self._journal.get_adjudication(self._cache_key(it))
+        except Exception as e:  # noqa: BLE001 —— 缓存读失败 = 当它没命中
+            logger.warning("adjudicate_cache_get_failed err=%s", e)
+            return None
+        if not rec:
+            return None
+        return AdjudicationVerdict(
+            candidate_id=it.candidate_id, op=AdjudicationOp(rec.get("op", "add")),
+            target_fact_ids=list(rec.get("targets") or []),
+            reason=str(rec.get("reason", "")))
+
+    def _cache_put(self, items: list[AdjudicationInput],
+                   verdicts: list[AdjudicationVerdict]) -> None:
+        if self._journal is None:
+            return
+        by_id = {v.candidate_id: v for v in verdicts}
+        for it in items:
+            v = by_id.get(it.candidate_id)
+            if v is None or v.fallback:     # 降级判决不缓存：下次还要真判
+                continue
+            try:
+                self._journal.put_adjudication(self._cache_key(it), {
+                    "op": v.op.value, "targets": list(v.target_fact_ids),
+                    "reason": v.reason})
+            except Exception as e:  # noqa: BLE001 —— 写缓存失败只损失"下次免调"
+                logger.warning("adjudicate_cache_put_failed err=%s", e)
+
+    def begin_rebuild_pass(self, block_retries: int) -> None:
+        """批 AB · MQ-I39：每个重建 pass 开头调。`block_retries` > 0 = 解析型失败就地重试。
+
+        只有 full 传非 0：full 中止后重跑的是同一份输入，跨跑计次没有意义（计次写在暂存里，
+        中止的暂存不收割），确定性解析失败会让它永远重建不完。增量传 0，照旧跨 pass 计次。
+        """
+        self._block_retries = max(0, block_retries)
+        self._blocks_total = 0
+        self._blocks_ok = 0
+        self._exhausted_ids = set()
+        self._cache_hits_this_pass = False
+
+    def block_outcome(self) -> tuple[int, int, set[str]]:
+        """本 pass 的 `(总块数, 有成功判决的块数, 就地重试耗尽的候选)`。命中缓存的候选算成功过。"""
+        ok = self._blocks_ok + (1 if self._cache_hits_this_pass else 0)
+        return self._blocks_total, ok, set(self._exhausted_ids)
+
+    def _retry_parse_failures(self, items: list[AdjudicationInput],
+                              out: list[AdjudicationVerdict]) -> list[AdjudicationVerdict]:
+        """解析型降级的候选就地重判，最多 `_block_retries` 次（与增量「计满 N 次后放行」同一套次数）。
+
+        🔴 只认解析型：401 / 400 这类调用错误重试也没用，也不该被放行；上游不可达在
+        `_complete_with_backoff` 里等，根本到不了这里（抛 `AdjudicationUpstreamUnavailable`）。
+        """
+        by_id = {v.candidate_id: v for v in out}
+        for _ in range(self._block_retries):
+            bad = [it for it in items
+                   if by_id[it.candidate_id].fallback
+                   and _is_parse_failure(by_id[it.candidate_id].reason)]
+            if not bad:
+                break
+            logger.warning("adjudicate_block_retry items=%d", len(bad))
+            for v in self._adjudicate_chunk_inner(bad):
+                by_id[v.candidate_id] = v
+        self._exhausted_ids.update(
+            it.candidate_id for it in items
+            if by_id[it.candidate_id].fallback and _is_parse_failure(by_id[it.candidate_id].reason))
+        return [by_id[it.candidate_id] for it in items]
 
     def _adjudicate_chunk(
         self, items: list[AdjudicationInput],
     ) -> list[AdjudicationVerdict]:
         out = self._adjudicate_chunk_inner(items)
+        if self._block_retries:
+            out = self._retry_parse_failures(items, out)
+        self._blocks_total += 1
+        self._blocks_ok += 0 if all(getattr(v, "fallback", False) for v in out) else 1
         # 单一记账点：三条降级路径（异常 / empty_output / parse_failed）都要经过它。
         self._item_count += len(items)
         self._degraded_items += sum(1 for v in out if getattr(v, "fallback", False))
@@ -190,7 +324,7 @@ class LLMAdjudicator:
             if self._no_think:
                 kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
-            resp = router_sdk.completion(**kwargs)
+            resp = self._complete_with_backoff(kwargs, len(items))
             raw = resp.choices[0].message.content or ""
             # 🔴 截断 ≠ 坏 JSON。此前两者都打 `json_err`，于是 2026-08-08 复盘时
             #   被读成"模型输出质量问题"，实际是**我们把它剪断的**。
@@ -205,15 +339,65 @@ class LLMAdjudicator:
                                "budget=%d -> 尝试打捞完整对象",
                                len(items), len(raw), max(self._max_tokens, len(items) * 160 + 256))
             return _parse(raw, items)
+        except AdjudicationUpstreamUnavailable:
+            raise           # 没人可问 ≠ 判不出：不兜成 ADD（MQ-I35）
         except Exception as e:  # noqa: BLE001 —— 降级不抛（宁多勿丢）
             self._fail_count += 1
             logger.warning("adjudicate_failed model=%s err=%s -> all add",
                            self._model, router_sdk.error_text(e))
             return _all_add(items, f"adjudicator_error:{router_sdk.error_text(e)}")
 
+    def _complete_with_backoff(self, kwargs: dict[str, Any], n_items: int) -> Any:
+        """调一次上游；遇上游不可达就暂停、指数退避、重试**同一块**，等满上限再抛。
+
+        "连续 N 块失败才暂停"在这里 N = 1：块是串行的，失败的那块原地重试就是探测，
+        不存在"先跳到下一块"——跳过去的那块只能被判成 ADD，正是要消灭的东西。
+        """
+        t0: float | None = None
+        delay = _BACKOFF_BASE_S
+        attempt = 0
+        while True:
+            try:
+                resp = router_sdk.completion(purpose="adjudicate", **kwargs)
+            except Exception as e:  # noqa: BLE001 —— 分类后要么等、要么原样抛给降级
+                if not router_sdk.is_transient_upstream_error(e):
+                    raise
+                now = _monotonic()
+                if t0 is None:
+                    t0 = now
+                    self._outage_waits += 1
+                waited = now - t0
+                cap = float(flag_number("BLADEX_ADJUDICATE_OUTAGE_MAX_WAIT_S"))
+                if waited >= cap:
+                    self._outage_wait_s += waited
+                    logger.warning("adjudicate_upstream_gave_up waited_s=%.0f cap_s=%.0f "
+                                   "attempts=%d items=%d err=%s -> abort this pass",
+                                   waited, cap, attempt + 1, n_items,
+                                   router_sdk.error_text(e))
+                    raise AdjudicationUpstreamUnavailable(
+                        f"upstream unreachable for {waited:.0f}s (cap {cap:.0f}s): "
+                        f"{router_sdk.error_text(e)}") from e
+                attempt += 1
+                pause = min(delay, _BACKOFF_MAX_S, cap - waited)
+                logger.warning("adjudicate_upstream_unavailable attempt=%d pause_s=%.0f "
+                               "waited_s=%.0f cap_s=%.0f items=%d err=%s -> pausing, will "
+                               "retry the same chunk", attempt, pause, waited, cap, n_items,
+                               router_sdk.error_text(e))
+                _sleep(pause)
+                delay *= 2
+                continue
+            if t0 is not None:
+                waited = _monotonic() - t0
+                self._outage_wait_s += waited
+                logger.warning("adjudicate_upstream_recovered waited_s=%.0f attempts=%d",
+                               waited, attempt)
+            return resp
+
     def stats(self) -> dict[str, Any]:
         return {"calls": self._call_count, "fails": self._fail_count,
                 "items": self._item_count, "degraded_items": self._degraded_items,
+                "cache_hits": self._cache_hits, "outage_waits": self._outage_waits,
+                "outage_wait_s": round(self._outage_wait_s, 1),
                 "model": self._model, "prompt_ver": ADJ_VER}
 
 
@@ -277,6 +461,13 @@ def _salvage_objects(text: str) -> list[dict[str, Any]]:
             out.append(obj)
         i = end
     return out
+
+
+_PARSE_FAILURE_REASONS = ("empty_output", "parse_failed", "missing_in_output")
+
+
+def _is_parse_failure(reason: str) -> bool:
+    return (reason or "").startswith(_PARSE_FAILURE_REASONS)
 
 
 def _parse(raw: str, items: list[AdjudicationInput]) -> list[AdjudicationVerdict]:

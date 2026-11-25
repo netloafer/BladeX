@@ -34,12 +34,20 @@ import os
 import re
 import time
 from collections.abc import Callable
-from datetime import UTC
+from datetime import UTC, datetime
 
 import structlog
-from bladex_core.flash import SCOPE_PERSONAL, behavior_path, write_if_changed
-from bladex_core.ledger import Ledger, ledger_md_path, parse_ledger_md, render_ledger_md
+from bladex_core.flash import SCOPE_PERSONAL, STATE_FILE, behavior_path, write_if_changed
+from bladex_core.ledger import (
+    Ledger,
+    LedgerError,
+    ledger_md_path,
+    merge_md_edit,
+    parse_ledger_md,
+    render_ledger_md,
+)
 
+from bladex_proxy.storage.memory_hub import HubRequiresNewerVersion
 from bladex_proxy.storage.startup import open_hub_with_startup_window
 
 logger = structlog.get_logger()
@@ -64,6 +72,31 @@ def rendered_rev(text: str) -> int:
     """
     m = _REV_LINE_RE.search(text)
     return int(m.group(1)) if m else -1
+
+
+#: `.flash_state.json` 里被拒直编那一段的键（批 DS2，MQ-F16）。
+USER_EDIT_REFUSED_KEY = "user_edit_refused"
+REFUSED_LINE = "refused"              # 段内有读不懂的行（LedgerError）
+REFUSED_UNPARSEABLE = "unparseable"   # 解析时抛了别的异常
+REFUSED_ID_MISMATCH = "id_mismatch"   # `- ledger:` 行被删或改坏
+_REFUSAL_REASON_MAX = 300
+
+
+def read_user_edit_refused(root: str) -> list[dict[str, str]] | None:
+    """被拒直编的唯一读取点（`/admin/status`、`bladex status`、`bladex doctor` 共用）。
+
+    None = 没有读数（daemon 没跑过，或是还不写这一段的旧版）；[] = daemon 说没有。两者不能混（原则 13 层 4）。
+    """
+    try:
+        with open(os.path.join(root, STATE_FILE), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    rows = data.get(USER_EDIT_REFUSED_KEY) if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return None
+    return [{k: str(r.get(k, "")) for k in ("ledger_id", "reason", "at", "kind")}
+            for r in rows if isinstance(r, dict)]
 
 
 class FlashDaemon:
@@ -134,6 +167,12 @@ class FlashDaemon:
         self._reemit_last: dict[str, float] = {}
         #: path -> 已重发次数（进程内；≥ REEMIT_CAP 停发并告警一次）。
         self._reemit_count: dict[str, int] = {}
+        #: 因读不懂而拒绝采纳的文件内容 sha（只为不每轮重报；不持久化，重启后再报一次）。
+        self._refused_sha: dict[str, str] = {}
+        #: 被拒的直编（批 DS2，MQ-F16）：ledger_id -> {ledger_id, reason, at, kind, sha}。持久化，
+        #: status / admin 经 `read_user_edit_refused` 读。不走事件：这是投影层的运行状态，不是账本的历史。
+        self._edit_refusals: dict[str, dict[str, str]] = {}
+        self._refusals_dirty = False
         self._load_state()
         #: 预留钩子（机制先立、规则后到；铁律"无署名消费者的字段不许生产"——
         #: 所以**不加配置 flag**，钩子非 None 才进调度）：
@@ -163,6 +202,10 @@ class FlashDaemon:
             st = data.get("behavior_status")
             if isinstance(st, dict):
                 self._bh_status = dict(st)
+            refused = data.get(USER_EDIT_REFUSED_KEY)
+            if isinstance(refused, list):
+                self._edit_refusals = {str(r["ledger_id"]): dict(r) for r in refused
+                                       if isinstance(r, dict) and r.get("ledger_id")}
         except (OSError, ValueError):
             pass               # 首次运行/状态损坏：从零开始（见字段注释）
 
@@ -174,7 +217,9 @@ class FlashDaemon:
                            "adopted": self._adopted_sha,
                            "adopted_rev": self._adopted_rev,
                            "behavior": self._bh_state,
-                           "behavior_status": self._bh_status}, f)
+                           "behavior_status": self._bh_status,
+                           USER_EDIT_REFUSED_KEY: [self._edit_refusals[k]
+                                                   for k in sorted(self._edit_refusals)]}, f)
             os.replace(tmp, self._state_path)
         except OSError as e:
             logger.warning("flash_daemon_state_save_failed", error=str(e))
@@ -191,11 +236,91 @@ class FlashDaemon:
         """
         try:
             pool, _ = self._source()
+        except HubRequiresNewerVersion:  # 批 UE 步骤 2：运行中的拒绝不许被吞
+            raise
         except Exception as e:  # noqa: BLE001 —— 投影读失败不阻断直编捕获
             logger.warning("flash_daemon_base_lookup_failed",
                            ledger=ledger_id, error=str(e))
             return None
         return pool.get(ledger_id)
+
+    @staticmethod
+    def _user_version(text: str, base: Ledger | None) -> Ledger:
+        """磁盘上的用户版 → 要采纳的账本。**本文件唯一的解析点**（MQ-F15，批 CB2）。
+
+        渲染再解析不是恒等的（`text` 带 `<sub>` 尾巴、`ref` 带 ` · @writer` 的条目会变样，
+        live 池里 24 条）。整本采纳解析结果 = 用户改一条，这些也跟着变。所以：
+        - 条目、标题、Goal：只应用 `merge_md_edit` 认定用户改过的（合并逻辑只有那一份）；
+        - 元数据行（status 等）：与同一份渲染相比改过才取文件里的，否则留 base 的；
+        - MD 不携带的字段（`closed_*`、`goal_revisions`…）：一律留 base 的。
+
+        Goal 变化时的身份与修订计数归端点（MQ-L107 `update_goal`），这里不碰。
+        没有 base（取不到池 / 新出现的本）⇒ 无从比较，退回解析结果。
+
+        :raises LedgerError: 段内有读不懂的行等 —— 不静默丢用户写的字。
+        """
+        parsed = parse_ledger_md(text, base=base)
+        if base is None or parsed.ledger_id != base.ledger_id:
+            return parsed
+        edit = merge_md_edit(base, text)
+        unchanged = parse_ledger_md(render_ledger_md(base), base=base)
+        updates: dict[str, object] = {
+            f: getattr(parsed, f)
+            for f in ("status", "matter_id", "parent_ledger_id", "superseded_by",
+                      "created_at", "updated_at")
+            if getattr(parsed, f) != getattr(unchanged, f)
+        }
+        if edit.title is not None:
+            updates["title"] = edit.title
+        if edit.goal is not None:
+            updates["goal"] = edit.goal
+        if edit.sections:
+            updates["sections"] = {**base.sections, **edit.sections}
+        if edit.new_sections:
+            updates["section_order"] = [*base.section_order, *edit.new_sections]
+        return base.model_copy(update=updates)
+
+    # ── 被拒的直编（批 DS2，MQ-F16）──
+    def _refuse_edit(self, path: str, current: str, kind: str, reason: str) -> None:
+        """拒收一份直编：不采纳、**快照不更新** ⇒ 物化不覆盖用户的文件（红线 2），直到内容变了再判。
+
+        🔴 三类都走这里。修前 `unparseable` / `id_mismatch` 把快照更新成坏文件以「防每轮重报」，
+        结果下一次有流量物化时 `on_disk == snapshot`，用户的文件被投影静默盖掉（注释还写着「不覆盖」）。
+        重启后 `_refused_sha` 没了会再判一次：内容没变就保留原记录（`at` 不变），文件改过就按新内容算。
+        """
+        ledger_id = os.path.splitext(os.path.basename(path))[0]
+        sha = self._sha(current)
+        self._refused_sha[path] = sha
+        prev = self._edit_refusals.get(ledger_id)
+        if prev is not None and prev.get("sha") == sha and prev.get("kind") == kind:
+            return
+        self._edit_refusals[ledger_id] = {
+            "ledger_id": ledger_id, "reason": reason[:_REFUSAL_REASON_MAX], "kind": kind,
+            "at": datetime.now(UTC).isoformat(timespec="seconds"), "sha": sha}
+        self._refusals_dirty = True
+
+    def _settle_refusals(self) -> None:
+        """移除已经不成立的记录：文件没了（比如账本墓碑）、内容变了、或与投影相同。
+
+        内容变了且仍读不懂时，`_capture_user_edits` 已在本轮写了新记录（sha 相同，不会被这里移除）。
+        """
+        for ledger_id, rec in list(self._edit_refusals.items()):
+            path = ledger_md_path(self._root, self._principal, ledger_id, scope=self._scope)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    current = f.read()
+            except OSError:
+                current = None
+            if (current is None or self._sha(current) != rec.get("sha")
+                    or current == self._snapshots.get(path)):
+                del self._edit_refusals[ledger_id]
+                self._refused_sha.pop(path, None)
+                self._refusals_dirty = True
+                logger.info("flash_daemon_user_edit_refusal_cleared", ledger=ledger_id)
+
+    def refusals_pending(self) -> bool:
+        """有被拒的直编：主循环按兜底间隔再看一眼文件，用户改好后不用等下一次流量才移除。"""
+        return bool(self._edit_refusals)
 
     # ── 收件箱（多源 push、单写者消费）──
     def push(self, kind: str = "turn") -> None:
@@ -219,6 +344,8 @@ class FlashDaemon:
             logger.warning("flash_daemon_skeleton_failed", dir=d, error=str(e))
         try:
             pool, _ = self._source()
+        except HubRequiresNewerVersion:  # 批 UE 步骤 2：运行中的拒绝不许被吞
+            raise
         except Exception as e:  # noqa: BLE001 —— Hub 不在也要把骨架立起来
             logger.warning("flash_daemon_startup_source_failed", error=str(e))
             pool = {}
@@ -306,7 +433,7 @@ class FlashDaemon:
         True=响应带池版且已当轮写回（收敛）；False=响应无 `ledger`（旧 proxy），
         已进 pending 等 Hub 收敛。解析失败也返回 None（调用方已各自处理日志）。"""
         try:
-            ledger = parse_ledger_md(current, base=base)
+            ledger = self._user_version(current, base)
         except Exception:  # noqa: BLE001
             return None
         try:
@@ -377,8 +504,10 @@ class FlashDaemon:
             self._behavior_last = now
             self._behavior_dirty = False
             written += self._materialize_behavior()
-        if written or edits or removed:
+        self._settle_refusals()
+        if written or edits or removed or self._refusals_dirty:
             self._save_state()
+            self._refusals_dirty = False
         return {"written": written, "user_edits": edits, "removed": removed}
 
     def pending_wait_s(self) -> float | None:
@@ -416,18 +545,25 @@ class FlashDaemon:
             if current == snapshot:
                 continue
             # 用户改了这份投影 ⇒ 捕获为事件；事件流回前不重写（红线 2）。
+            if self._refused_sha.get(path) == self._sha(current):
+                continue               # 这份内容报过了：等用户改文件，不每轮重报
             expected_id = os.path.splitext(os.path.basename(path))[0]
             try:
                 # 🔴 带 base：`goal_verbatim` / `goal_revisions` 不在 MD 里
                 # （`render_ledger_md` 的产物就是注入块，渲染原话 = 又注一遍）。
                 # 不带 base 解析出来的账本会把这两个字段清空，而这里正是
                 # "拿解析结果当完整状态发事件"的形态 —— 那就是静默数据丢失。
-                ledger = parse_ledger_md(current, base=self._base_of(expected_id))
+                ledger = self._user_version(current, self._base_of(expected_id))
+            except LedgerError as e:
+                # MQ-F15：读不懂的行不静默丢。**快照不更新** ⇒ 文件不被物化覆盖（红线 2），
+                # 用户修好文件后内容变了，下轮照常捕获。
+                self._refuse_edit(path, current, REFUSED_LINE, str(e))
+                logger.warning("flash_daemon_user_edit_refused", path=path, error=str(e))
+                continue
             except Exception as e:  # noqa: BLE001 —— 手编坏格式不炸循环
                 logger.warning("flash_daemon_user_edit_unparseable",
                                path=path, error=str(e))
-                self._snapshots[path] = current   # 防每轮重报同一份坏文件
-                self._baseline_sha[path] = self._sha(current)
+                self._refuse_edit(path, current, REFUSED_UNPARSEABLE, str(e))
                 continue
             if ledger.ledger_id != expected_id:
                 # `- ledger:` 元数据行被删/改坏 ⇒ 解析出的是随机新 id 的空账本，
@@ -435,9 +571,10 @@ class FlashDaemon:
                 logger.warning("flash_daemon_user_edit_id_mismatch",
                                path=path, parsed=ledger.ledger_id,
                                expected=expected_id)
-                self._snapshots[path] = current
-                self._baseline_sha[path] = self._sha(current)
+                self._refuse_edit(path, current, REFUSED_ID_MISMATCH,
+                                  f"the ledger line in this file does not say {expected_id}")
                 continue
+            self._refused_sha.pop(path, None)
             try:
                 resp = self._emit("ledger_user_edit", {"ledger": ledger.model_dump()})
             except Exception as e:  # noqa: BLE001 —— proxy 不在/网络抖动
@@ -590,7 +727,7 @@ class FlashDaemon:
         self._reemit_last[path] = now_m
         self._reemit_count[path] = n + 1
         try:
-            ledger = parse_ledger_md(on_disk, base=self._base_of(eid))
+            ledger = self._user_version(on_disk, self._base_of(eid))
             resp = self._emit("ledger_user_edit", {"ledger": ledger.model_dump()})
         except Exception as e:  # noqa: BLE001 —— 下轮再试（计次）
             logger.warning("flash_daemon_reemit_failed", ledger=eid,
@@ -646,6 +783,7 @@ class FlashDaemon:
         from datetime import datetime
 
         from bladex_core.behavior import TurnMeta
+        from bladex_core.project import canonical_project_id
         st = self._bh_state
         projects = st["projects"]
         out = []
@@ -655,6 +793,9 @@ class FlashDaemon:
                 continue
             for entry, (ts_ms, flags, pi) in ents.items():
                 pid, pname, proot = projects[pi] if 0 <= pi < len(projects) else ("", "", "")
+                # 批 BA2c（MQ-A101）：翻译在汇合点，不在 fold —— 状态里的存值原样留着，
+                # 迁移前落盘的旧键行不用迁移就归到新键，删映射文件（回滚）也不留痕。
+                pid = canonical_project_id(pid)
                 out.append(TurnMeta(principal=parts[0], agent_id=parts[1], session_id=parts[2],
                                     ts=datetime.fromtimestamp(ts_ms / 1000, tz=UTC),
                                     key=f"{sk}/{entry}", project_id=pid, project_name=pname,
@@ -779,7 +920,11 @@ def hub_behavior_source(hub: object, *, index_path: str | None = None,
     from bladex_core.behavior import HabitRef
     from bladex_core.fact import fact_lane
 
-    from bladex_proxy.ledger_events import load_ledger_events, tombstoned_ledgers
+    from bladex_proxy.ledger_events import (
+        load_ledger_events,
+        refresh_project_key_map,
+        tombstoned_ledgers,
+    )
 
     cache: dict = {"fact_count": -1, "habits": []}
 
@@ -821,6 +966,8 @@ def hub_behavior_source(hub: object, *, index_path: str | None = None,
             hub.catch_up()  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001,S110
             pass
+        # 批 BA2c：快照没有 `_path` 装不了表；画像轨道独立节流，这一 tick 不一定走过账本轨道。
+        refresh_project_key_map(hub)
         snap = hub.scan_meta_snapshot()  # type: ignore[attr-defined]
         events = load_ledger_events(snap, keep_tombstoned_pool=True)
         tool_stats, habits = _index_part()
@@ -970,6 +1117,10 @@ def wait_for_proxy(base_url: str, *, max_wait_s: float | None = None,
         sleep(_PROXY_POLL_INTERVAL_S)
 
 
+#: 单实例锁的文件对象：留到进程结束，被回收就等于放锁。
+_INSTANCE_LOCK = None
+
+
 def main() -> int:  # pragma: no cover —— 进程入口；接线件各有单测
     """`bladex-flash` console entry。env/配置读取只在这里（红线 4）。"""
     import argparse
@@ -1007,6 +1158,21 @@ def main() -> int:  # pragma: no cover —— 进程入口；接线件各有单�
               "(module registry is the single source of truth; refusing to run a "
               "daemon whose module is off).")
         return 2
+
+    # 🔴 批 W33（MQ-W35）：单实例锁。11-05 pidfile 丢失后两个 flash 抢写同一批文件约 3 小时
+    # （flash_write_failed / flash_daemon_state_save_failed）。打开 Hub 之前取，起不来就别碰任何东西。
+    from bladex_proxy.deployment import deployment_root
+    from bladex_proxy.storage.redis_launch import InstanceLockHeld, acquire_instance_lock
+    global _INSTANCE_LOCK
+    try:
+        _INSTANCE_LOCK = acquire_instance_lock("flash", deployment_root())
+    except InstanceLockHeld as e:
+        logger.error("flash_daemon_already_running", holder=str(e), lock=str(e.path))
+        return 3
+    except OSError as e:
+        logger.error("flash_daemon_lock_failed", error=str(e),
+                     hint="cannot take the single-instance lock under logs/; refusing to start")
+        return 3
 
     from bladex_proxy.cli import _admin_key
     from bladex_proxy.config import ProxyConfig, resolve_flash_path
@@ -1080,7 +1246,8 @@ def main() -> int:  # pragma: no cover —— 进程入口；接线件各有单�
             woken = consumer.wait(timeout)
             if woken:
                 daemon.push()
-            if woken or daemon.behavior_wait_s() == 0.0 or daemon.pending_wait_s() == 0.0:
+            if (woken or daemon.behavior_wait_s() == 0.0 or daemon.pending_wait_s() == 0.0
+                    or daemon.refusals_pending()):
                 stats = daemon.run_once()
                 if stats.get("written") or stats.get("user_edits"):
                     logger.info("flash_daemon_round", **stats)

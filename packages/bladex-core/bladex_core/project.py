@@ -43,9 +43,73 @@ MAX_DESCRIPTION_CHARS = 200
 MAX_PROGRESS_CHARS = 200
 
 
+def normalize_git_remote(url: str) -> str:
+    """git remote URL 归一（批 BA2，拍板 (32)-b，**唯一实现点**）：同一个仓库的不同写法归到一个串。
+
+    规则 = scheme 归一 + host 小写 + `.git` 剥除 + 去尾 `/`。形状统一成 `host[:port]/path`：
+    `https://GitHub.com/a/B.git/`、`ssh://git@github.com/a/B`、`git@github.com:a/B.git`
+    ⇒ `github.com/a/B`。**凭证不进键**（`user:token@` 整段丢）。路径大小写保留——
+    不是所有服务器都大小写不敏感，合错仓库比拆开更贵。
+    本地路径 remote（`/srv/x.git`、`file:///srv/x.git`）没有 host，只去 `.git` 与尾 `/`。
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    if "://" in raw:
+        scheme, _, rest = raw.partition("://")
+        if scheme.lower() == "file":
+            host, path = "", rest
+        else:
+            authority, _, path = rest.partition("/")
+            host = authority.rpartition("@")[2].lower()
+    elif raw.startswith(("/", ".", "~")) or ":" not in raw.partition("/")[0]:
+        host, path = "", raw                  # 本地路径
+    else:
+        authority, _, path = raw.partition(":")   # scp 形：[user@]host:path
+        host = authority.rpartition("@")[2].lower()
+    path = path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4].rstrip("/")
+    if not host:
+        return path
+    return f"{host}/{path.lstrip('/')}"
+
+
+def git_remote_project_id(url: str) -> str:
+    """git-remote 档的项目键（拍板 (32)-b）：`p-` + sha256(`git-remote:{归一}`)[:16]。"""
+    key = f"git-remote:{normalize_git_remote(url)}"
+    return "p-" + hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def legacy_git_remote_project_id(url: str) -> str:
+    """批 BA2 之前的 git-remote 键（原始 URL、12 位）。**只给迁移对账用**：Hub 里的老事件存的
+    是这个哈希，哈希不可逆，只能从 remote 原文正向算一遍来确认「这个旧键确实来自这个仓库」。"""
+    return "p-" + hashlib.sha256(f"git-remote:{url}".encode()).hexdigest()[:12]
+
+
 def project_id_for(root_path: str) -> str:
-    """Project id = sha256(root_path)[:12]（确定性，重建稳定）。"""
-    return hashlib.sha256((root_path or "").encode()).hexdigest()[:12]
+    """磁盘上已认不出来的根目录的项目键：与 `resolve_project` 的 git-root 档**同一公式**。
+
+    批 BA2（MQ-A75 甲）：此前是 sha256(root_path)[:12]，与账本 scope 的 `identity.project_id`
+    从不相交。能走磁盘的一律先走 `resolve_project`（见 `MemoryIndex._project_key_for_root`），
+    这里只兜目录已不在的情形——老 bench 目录都是 git-root 档，键因此仍与存量对得上。
+    """
+    return "p-" + hashlib.sha256(f"git-root:{root_path or ''}".encode()).hexdigest()[:12]
+
+
+#: 旧项目键 → 现行键（批 BA2 一次性迁移的产物，派生层 `data/project_key_map.json`）。
+#: 老事件 / 老轮次存的是旧键的哈希，Hub 不改写，读的时候在这里翻译。空表 = 翻译不生效。
+_project_key_map: dict[str, str] = {}
+
+
+def set_project_key_map(mapping: dict[str, str]) -> None:
+    _project_key_map.clear()
+    _project_key_map.update(mapping)
+
+
+def canonical_project_id(project_id: str) -> str:
+    """旧键 → 现行键；不在表里的原样返回。**读路径的唯一翻译点**。"""
+    return _project_key_map.get(project_id, project_id)
 
 
 class Project(BaseModel):

@@ -363,6 +363,29 @@ class ToolFaceHandlersMixin:
                            scope=self.scope_of(str(context.get("agent_id", "")),
                                                str(context.get("project_id", ""))))
             return "Error: no active ledger; switch/create one first."
+        # 🔴 批 PW · 步骤 2（拍板 (98)，MQ-L121/L122）：子本回写父本**不必 switch**。
+        # 给了 `ledger_id` ⇒ 只允许它是**激活本 Next 里某条 `[sub-task]` 条目的 ref**（子本回写义务
+        # 指向的那一本），写入目标换成那一本、激活位不动——此前回写必须先 switch，于是与 S5
+        # 「do NOT switch」相撞、回写后激活位还留在父本。目标一经解析，下面 rev 锁 / Goal 保护 /
+        # 落库 / 事件全按目标本走（**单一实现点**，不在此分支复制校验）。
+        # 不扩大写入面：只能写它被明确要求回报的那本（三红线之 1 不变）。
+        _wb_child = ""
+        _wb_target = str(args.get("ledger_id", "") or "").strip()
+        if _wb_target and _wb_target != led.ledger_id:
+            _is_parent = any(
+                getattr(_e, "ref", "") == _wb_target and SUBTASK_TAG in (_e.text or "")
+                for _e in led.entries("next"))
+            _parent_led = self.pool.get(_wb_target) if _is_parent else None
+            if _parent_led is None:
+                logger.warning("agency_ledger_update_refused", reason="not_subtask_parent",
+                               agent=str(context.get("agent_id", "")),
+                               active=led.ledger_id, target=_wb_target,
+                               known=_wb_target in self.pool)
+                return (f"Error: ledger_id {_wb_target!r} is not the parent named in a "
+                        "[sub-task] Next entry of the active ledger. Omit ledger_id to "
+                        "update the active ledger.")
+            _wb_child = led.ledger_id
+            led = _parent_led
         # rev 乐观锁（2026-08-29）：模型基于旧视图的 remove 会错删、双方互不知情
         # 的写会冲突。带 rev 且落后 ⇒ 拒写 + 返回最新正文让模型合并重试（内循环
         # 一轮内完成，不到达 agent）；不带 rev = 旧调用面，照旧不拦。
@@ -448,6 +471,13 @@ class ToolFaceHandlersMixin:
         # MQ-L49 判据的读数点：`n_edits≥2` 占比 = 批量形态被用起来了没有。
         # 分母挂"落地成功的 update 调用"（被 rev 锁拒的、报错的都不到这里）。
         _ops = update_edit_ops(args)
+        if _wb_child:
+            # 子本回写落地的分子（对应修前的 `agency_switch_evidence source=child_writeback`）。
+            logger.info("agency_child_writeback_update", child=_wb_child,
+                        parent=new.ledger_id, parent_status=new.status,
+                        agent=str(context.get("agent_id", "")),
+                        session=str(context.get("session_id", "")),
+                        n_edits=len(_ops), rev=new.rev)
         logger.info("agency_ledger_update_applied", ledger=new.ledger_id,
                     n_edits=len(_ops), ops=",".join(_ops), rev=new.rev,
                     agent=str(context.get("agent_id", "")))
@@ -458,7 +488,7 @@ class ToolFaceHandlersMixin:
         # （`bladex_ledger_update` 恒写激活本，无 ledger_id 参数），日志零痕迹。只记不拦——
         # 用户在 A 任务里插一句 B 也会响，那是该响的：读数目标是逐条可解释，不是 0。
         _best = max(self._last_candidates, key=lambda m: m.score, default=None)
-        if (_best is not None and _best.score >= _DESPITE_MATCH_SCORE
+        if (_best is not None and _best.score >= _DESPITE_MATCH_SCORE and not _wb_child
                 and new.ledger_id not in {m.ledger_id for m in self._last_candidates}):
             logger.warning("ledger_update_off_candidate",
                            active=new.ledger_id, candidate=_best.ledger_id,
@@ -504,6 +534,19 @@ class ToolFaceHandlersMixin:
             # `parent_ledger_id` 既不表达层级也不表达顺序，是纯噪声且随注入传播。
             # 子任务是 LLM 的决策（三红线：BladeX 不做作者），所以它得自己说。
             _parent = str(args.get("parent_ledger_id", "")).strip()
+            _parent_explicit = bool(_parent)
+            if not _parent:
+                # 批 BA2（MQ-A94 R3）：子会话建本自动挂母本。这不是 MQ-L1 否决的「当时激活的那本」：
+                # 值来自母会话 spawn 位置的记录，主会话 / 无母候选 / 派出时无激活本 ⇒ 空（S6、N6）。
+                from bladex_proxy.subtask_lineage import lineage as _lineage
+                _auto_parent = _lineage.parent_for(str(agent_id), str(session_id))
+                if _auto_parent and _auto_parent in self.pool:
+                    _parent = _auto_parent
+                    logger.info("ledger_parent_attached", parent=_parent, agent=agent_id,
+                                session=session_id, rule="spawn_position")
+                elif _auto_parent:
+                    logger.info("ledger_parent_skipped", reason="parent_not_in_pool",
+                                parent=_auto_parent, agent=agent_id, session=session_id)
             if _parent and _parent not in self.pool:
                 logger.warning("agency_ledger_switch_refused",
                                reason="unknown_parent", target=_parent,
@@ -551,14 +594,14 @@ class ToolFaceHandlersMixin:
                     led, "next",
                     LedgerEntry(text=f"{SUBTASK_TAG} on completion: report status and "
                                      f"results back to parent ledger {_parent} "
-                                     f"(bladex_ledger_switch to it, then "
-                                     f"bladex_ledger_update).",
+                                     f"with bladex_ledger_update(ledger_id={_parent}); "
+                                     f"do not switch.",
                                 source="model", ref=_parent, writer=agent_id),
                     actor=ACTOR_MODEL, updated_at=now_iso)
                 self._mark_subtask_on_parent(_parent, led, updated_at=now_iso,
                                              writer=agent_id)
                 logger.info("agency_ledger_child_created", child=led.ledger_id,
-                            parent=_parent, session=session_id, explicit=True)
+                            parent=_parent, session=session_id, explicit=_parent_explicit)
             # ── V-L5 · 账本↔Matter 绑定（ADR-0032 §4.5）──
             # 建账本这一刻就把锚写死：id 由 ledger_id **确定性派生**，无需与
             # Memory Index 协调（它算出的是同一个 id）。这正是"边界记录"的

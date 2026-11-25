@@ -1,4 +1,4 @@
-"""运维命令：`sync` / `config` / `queue` / `sticky` / `connector` / `backup` / `restore` / `export` / `import`。
+"""运维命令：`sync` / `config` / `queue` / `sticky` / `project` / `usage` / `connector` / `backup` / `restore` / `export` / `import`。
 
 09-06 F0.1 自 `cli.py` 拆出，零行为（函数体逐字搬家）。共享 helper（`_admin_call` / `_http_json` / `_probe_ready` / pidfile 族…）留在门面 `bladex_proxy.cli`；本模块经 `from bladex_proxy.cli import …` 取用，
 🔴 故 monkeypatch 要打在**本模块**上（`bladex_proxy.cli.<本模块>.<helper>`），打门面不生效。
@@ -420,7 +420,7 @@ def render_effective_config(cfg, root: Path | None = None) -> str:
         src = "env" if name in os.environ else "default"
         out.append(f"  {name:<44} {flag_number(name):<7g} {src}")
 
-    out += ["", "[2] Embedding               value    source (env > routing.toml > default)"]
+    out += ["", "[2] Embedding               value    source (env > bladex.toml > routing.toml > default)"]
     try:
         from bladex_proxy.embedding import resolve_embed_settings
         s = resolve_embed_settings(cfg)
@@ -550,6 +550,41 @@ def config_check() -> int:
                  "compare against config/routing.toml.example: model pool / strategies / capability vocabulary")
         except Exception as e:  # noqa: BLE001
             _bad("routing.toml", str(e), f"check {rpath}")
+
+    # bladex.toml（可选；批 DS2，MQ-V46）。解析只走 AE 的单一读取点 `global_config`，这里不另读文件。
+    from bladex_proxy.global_config import (
+        GlobalConfigError,
+        global_config_path,
+        load_global_embedding,
+        migration_hint,
+        unknown_keys,
+    )
+    gpath = global_config_path(cfg)
+    global_readable = True
+    try:
+        load_global_embedding(cfg)
+        bad_sections, bad_keys = unknown_keys(cfg)
+    except GlobalConfigError as e:
+        global_readable = False
+        _bad("bladex.toml", str(e),
+             f"fix the reported line in {gpath}; compare against config/bladex.toml.example")
+    else:
+        if not gpath.is_file():
+            _ok("bladex.toml", f"{gpath} not present -> embedding from routing.toml or defaults (a valid state)")
+        elif bad_sections or bad_keys:
+            names = [f"[{s}]" for s in bad_sections] + [f"[embedding] {k}" for k in bad_keys]
+            _bad("bladex.toml", f"not read by BladeX: {', '.join(names)}",
+                 f"check the spelling in {gpath}, or keep sections that have not moved yet in routing.toml")
+        else:
+            _ok("bladex.toml", str(gpath))
+    # 旧段与新文件并存是合法状态（保留旧段才能回滚 0.3.0）：只提示，不算问题。
+    if global_readable and rpath.is_file():
+        try:
+            hint = migration_hint(cfg)
+        except tomllib.TOMLDecodeError:   # routing.toml 的语法错误上面已报过
+            hint = []
+        for i, line in enumerate(hint):
+            print(("  ⚠ " if i == 0 else "    ") + line)
 
     # identity.toml（可选；存在才校验）
     ipath = Path(cfg.identity_config_path)
@@ -826,6 +861,104 @@ def sticky_flush(
               f"  origin={e.get('origin')}  held={'-' if held is None else f'{held:.0f}s'}")
     if not data.get("cleared"):
         print("  (nothing was pinned -- next turn already re-picks a model)")
+    return 0
+
+
+def _usage_lines(d: dict) -> list[str]:
+    """`/admin/usage` 的响应 → 表格行。只排版，不汇总（汇总的单一实现点是服务端 `usage.aggregate`）。"""
+    w, f = d.get("window") or {}, d.get("filters") or {}
+    lines = [f"Window: [{w.get('since') or '-'}, {w.get('until') or 'now'})  tz {w.get('tz')}"]
+    active = {k: v for k, v in f.items() if v}
+    if active:
+        lines.append("Filters: " + "  ".join(f"{k}={v}" for k, v in active.items()))
+
+    def _n(b: dict, field: str) -> str:
+        nd = b.get(f"{field}_nodata") or 0
+        # 这一桶全部没有读数 ⇒ 不是 0（dashboard `usageCell` 同一口径）
+        shown = "n/a" if nd and nd >= (b.get("turns") or 0) else f"{b.get(field, 0):,}"
+        return shown + (f" (+{nd} n/d)" if nd else "")
+
+    head = f"  {'':<34} {'turns':>7} {'input':>22} {'output':>18} {'cache_read':>22}"
+    lines += ["", "Totals", head]
+    for lane, b in (d.get("totals") or {}).items():
+        lines.append(f"  {lane:<34} {b.get('turns', 0):>7} {_n(b, 'input'):>22} "
+                     f"{_n(b, 'output'):>18} {_n(b, 'cache_read'):>22}")
+    groups = d.get("groups") or []
+    lines += ["", f"By day x agent x model x lane x session ({len(groups)} rows)",
+              f"  {'day':<10} {'agent':<14} {'model':<26} {'lane':<6} {'session':<12} "
+              f"{'turns':>6} {'input':>16} {'output':>12} {'cache_read':>16}"]
+    for g in groups:
+        lines.append(f"  {g['day']:<10} {g['agent'][:14]:<14} {g['model'][:26]:<26} "
+                     f"{g['lane']:<6} {g['session'][:12]:<12} {g['turns']:>6} "
+                     f"{_n(g, 'input'):>16} {_n(g, 'output'):>12} {_n(g, 'cache_read'):>16}")
+    lines += ["", "n/d = turns with no data for that field (not counted as 0). "
+              "BladeX's own distill / adjudicate / link calls are not in the Hub and not shown."]
+    return lines
+
+
+project_app = typer.Typer(help="Projects known to the Memory Index (via the proxy admin API)",
+                          no_args_is_help=True)
+
+
+@project_app.command("list")
+def project_list(
+    limit: int = typer.Option(100, "--limit", help="How many to show"),
+    offset: int = typer.Option(0, "--offset", help="Skip this many"),
+    as_json: bool = typer.Option(False, "--json", help="Print the server's JSON as-is"),
+) -> int:
+    """List projects, most recently updated first."""
+    # CLI 不自己算：只调 /admin/projects（批 DS2，G1）。--json 与端点、dashboard 逐字相等。
+    code, data = _admin_call("GET", "/admin/projects", params={"limit": limit, "offset": offset})
+    if code != 200:
+        print(f"✗ /admin/projects HTTP {code}: {json.dumps(data, ensure_ascii=False)}", file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps(data, ensure_ascii=False))
+        return 0
+    projects = data.get("projects") or []
+    if not projects:
+        print(f"No projects to show ({data.get('total', 0)} in total).")
+        return 0
+    for p in projects:
+        agents = ", ".join(p.get("agent_ids") or []) or "-"
+        print(f"  {p.get('project_id', ''):<22} {p.get('name') or '(unnamed)':<24} "
+              f"{p.get('root_path') or 'n/a'}  agents: {agents}")
+    print(f"{len(projects)} shown of {data.get('total', 0)}.")
+    return 0
+
+
+@app.command("usage")
+def usage_cmd(
+    days: float = typer.Option(None, "--days", help="Window: the last N days (default 7)"),
+    since: str = typer.Option("", "--since", help="Window start, ISO time, inclusive. Not with --days"),
+    until: str = typer.Option("", "--until", help="Window end, ISO time, exclusive. Not with --days"),
+    tz: str = typer.Option("", "--tz", help="Timezone for day buckets and for times with no offset: "
+                                            "IANA name or +08:00 (default: where the proxy runs)"),
+    agent: str = typer.Option("", "--agent", help="Only this agent id"),
+    model: str = typer.Option("", "--model", help="Only this model"),
+    session: str = typer.Option("", "--session", help="Only this session id"),
+    as_json: bool = typer.Option(False, "--json", help="Print the server's JSON as-is"),
+) -> int:
+    """Token usage from the Memory Hub, by day / agent / model / lane / session."""
+    # 🔴 CLI 不自己算：只调 /admin/usage（批 AC2）。--json 与端点逐字相等，守卫 test_ac2_usage_endpoint。
+    # `--days` 每次的起点都是「现在」，两次调用窗口不同；要与别处对账用 --since / --until（批 DS2，MQ-V45）。
+    if days is not None and (since or until):
+        print("✗ --days cannot be combined with --since / --until: give either the last N days "
+              "or an absolute window", file=sys.stderr)
+        return 2
+    if days is None and not (since or until):
+        days = 7.0
+    code, data = _admin_call("GET", "/admin/usage", params={
+        "days": days, "since": since, "until": until, "tz": tz,
+        "agent": agent, "model": model, "session": session}, timeout=60.0)
+    if code != 200:
+        print(f"✗ /admin/usage HTTP {code}: {json.dumps(data, ensure_ascii=False)}")
+        return 1
+    if as_json:
+        print(json.dumps(data, ensure_ascii=False))
+        return 0
+    for line in _usage_lines(data):
+        print(line)
     return 0
 
 

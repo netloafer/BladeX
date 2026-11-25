@@ -45,6 +45,7 @@ import typer
 # 部署根发现与 .env 加载的**唯一实现**在 deployment.py（2026-08-06 收敛）。
 # 此处只留薄封装：历史调用点与测试都按这些名字来，改名不值当。
 from bladex_proxy import deployment  # noqa: E402
+from bladex_proxy.process_probe import PID_DEAD, is_denied, pid_state, tcp_state  # noqa: E402
 
 
 def _repo_root() -> str:
@@ -154,28 +155,31 @@ def _read_pidfile(path: str) -> int | None:
 
 
 def _pid_alive(pid: int) -> bool:
-    """进程是否还活着。
+    """进程是否**可能**还在。只有确认不存在才返回 False（EPERM 算在，见 `process_probe.pid_state`）。"""
+    return _pid_state(pid) != PID_DEAD
 
-    🔴 先 `waitpid(WNOHANG)`（批 Z1 实测，2026-09-23）：`bladex start` 自己 Popen 出来的
-    proxy 若在启动期退出，CLI 作为父进程从不 `wait` ⇒ 它成了**僵尸**，而 `kill(pid, 0)`
-    对僵尸照样成功。后果：MQ-L62 ①"进程死了立刻停等、把日志尾部打到终端"从未对 CLI 自己
-    拉起的子进程生效——实测一个 1 秒内就因 MQ-A38 冲突退出的 proxy，CLI 等满 30 秒后报
-    "the proxy process is alive but /ready did not answer"，真正的报错只在日志里。
-    是自己的子进程 ⇒ 顺手回收并如实返回；不是（ChildProcessError）⇒ 退回 `kill(pid, 0)`。
+
+def _pid_state(pid: int) -> str:
+    """进程三态（`process_probe.PID_*`）。判定本身只有 `process_probe.pid_state` 一个实现；
+
+    CLI 是 `bladex start` 拉起的那些进程的父进程，所以带 `reap_child=True`（僵尸回收，批 Z1 / 批 W33 的缘由见那边的文档）。
     """
-    try:
-        done, _status = os.waitpid(pid, os.WNOHANG)
-        if done == pid:
-            return False
-    except ChildProcessError:
-        pass
-    except OSError:
-        pass
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+    return pid_state(pid, reap_child=True)
+
+
+#: 当前 shell 碰不到进程或端口时的退出码。不与 1（失败）、3（降级）共用：
+#: 这里的意思是「没判定」，调用方该换个环境重跑，不该据此重启任何东西。
+RC_UNDETERMINED = 4
+_UNDETERMINED_TEXT = "cannot determine (this shell is restricted by a sandbox or permissions)"
+
+
+class ShellRestricted(Exception):
+    """探测被系统拒绝（EPERM / EACCES）。**不是「连不上」**；`main` 统一按 `RC_UNDETERMINED` 收口。"""
+
+
+# 批 LC：实现收进 `process_probe`，这里保留旧名字（全 CLI 与测试按这两个名字取）。
+_is_denied = is_denied
+_tcp_state = tcp_state
 
 
 def _consolidator_pid() -> int | None:
@@ -204,8 +208,34 @@ def _http_json(url: str, key: str = "", timeout: float = 3.0) -> dict | None:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             return json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError):
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        if _is_denied(e):
+            raise ShellRestricted(f"reaching {url} was denied: {e}") from e
         return None
+
+
+def _admin_status_probe(url: str, key: str = "", timeout: float = 3.0) -> str:
+    """`GET /admin/status` 是否在 `timeout` 内**回答**：`answered` / `timeout` / `refused`。
+
+    批 LC（MQ-W40）：`bladex start` 判 ready 用的是免鉴权的 `/ready`，而 `bladex status` 的 Memory 行靠
+    `/admin/status`——它要等 Hub 的进程内索引首次建成（live 规模 ≈ 6–10 s），期间读超时。
+    HTTP 错误码（401 / 404 / 5xx）也算「回答了」：那是配置或别的缺陷，不是慢，不该在这里干等。
+    连接被拒不算慢（/ready 刚答过，被拒只会是竞态或被替换），不继续等。
+    """
+    req = urllib.request.Request(url)  # noqa: S310 —— 本机 admin 面
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            resp.read()
+        return "answered"
+    except urllib.error.HTTPError:
+        return "answered"
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        if _is_denied(e):
+            raise ShellRestricted(f"reaching {url} was denied: {e}") from e
+        reason = getattr(e, "reason", e)
+        return "timeout" if isinstance(reason, TimeoutError) or "timed out" in str(e) else "refused"
 
 
 def _print_admin_unavailable() -> None:
@@ -272,7 +302,9 @@ def _probe_ready(url: str, timeout: float = 2.0) -> dict | None:
             return json.loads(e.read().decode("utf-8"))
         except (ValueError, OSError):
             return {"ready": False, "checks": {}}
-    except (urllib.error.URLError, OSError, ValueError):
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        if _is_denied(e):
+            raise ShellRestricted(f"reaching {url} was denied: {e}") from e
         return None
 
 
@@ -324,6 +356,8 @@ def _http_request(method: str, url: str, key: str = "",
         except ValueError:
             return e.code, {}
     except (urllib.error.URLError, OSError) as e:
+        if _is_denied(e):
+            raise ShellRestricted(f"reaching {url} was denied: {e}") from e
         reason = getattr(e, "reason", None)
         if isinstance(e, TimeoutError) or isinstance(reason, TimeoutError):
             print(f"Warning: request was issued, but this client timed out after "
@@ -437,11 +471,21 @@ def _run_repo_script(rel: str, args: list[str], runner: str = "bash") -> int:
     return subprocess.run(cmd, check=False).returncode  # noqa: S603
 
 
-
 # ── 子命令族登记（顺序与拆前逐字相同：sync/config → storage/memory/matter/queue/sticky/inspect/ledger → connector）──
 # 🔴 必须放在上面全部 helper 之后：子模块在 import 时 `from bladex_proxy.cli import app, _admin_call …`，
 #    此时本包处于半初始化状态，只有已执行过的名字可见。
-from bladex_proxy.cli import ledger_cmds, lifecycle, memory_cmds, ops_cmds  # noqa: E402,F401
+from bladex_proxy.cli import ledger_cmds, lifecycle  # noqa: E402,F401
+
+# 批 LC：`init` / `doctor` 自 lifecycle 拆出。顶层命令的登记顺序 = 导入顺序，所以必须紧跟 lifecycle
+# （start…restart）、先于 ops_cmds（usage / backup / …），`bladex --help` 的命令表才与拆前逐字相同。
+# isort: split
+from bladex_proxy.cli import init_cmd  # noqa: E402,F401
+
+# isort: split
+from bladex_proxy.cli import doctor_cmd  # noqa: E402,F401
+
+# isort: split
+from bladex_proxy.cli import memory_cmds, ops_cmds  # noqa: E402,F401
 
 app.add_typer(ops_cmds.sync_app, name="sync")
 app.add_typer(ops_cmds.config_app, name="config")
@@ -453,8 +497,31 @@ app.add_typer(ops_cmds.sticky_app, name="sticky")
 app.add_typer(memory_cmds.inspect_app, name="inspect")
 app.add_typer(ledger_cmds.ledger_app, name="ledger")
 app.add_typer(ops_cmds.connector_app, name="connector")
+app.add_typer(ops_cmds.project_app, name="project")
 
 # ── 门面 re-export：拆前 `bladex_proxy.cli` 上的全部顶层名（守卫 `test_facade_exports.py`）──
+from bladex_proxy.cli.doctor_cmd import (  # noqa: E402,F401
+    _E2E_RECALL_QUERY,
+    _E2E_TEMPLATE,
+    _hidden_pth_files,
+    _probe_port,
+    _probe_upstream,
+    _run_e2e_check,
+    doctor,
+)
+from bladex_proxy.cli.embed_preflight import (  # noqa: E402,F401
+    _embed_api_probe,
+    _preflight_embedding,
+)
+from bladex_proxy.cli.init_cmd import (  # noqa: E402,F401
+    _ASSET_TARGETS,
+    _BLADEX_TOML_TEMPLATE,
+    _ENV_MINIMAL_TEMPLATE,
+    _ROUTING_MINIMAL_TEMPLATE,
+    _install_model_facing_assets,
+    _stale_data_dirs,
+    init,
+)
 from bladex_proxy.cli.ledger_cmds import (  # noqa: E402,F401
     _DOCTOR_GOAL_PREFIX,
     _DOCTOR_STALE_DAYS,
@@ -473,13 +540,6 @@ from bladex_proxy.cli.ledger_cmds import (  # noqa: E402,F401
     ledger_show,
 )
 from bladex_proxy.cli.lifecycle import (  # noqa: E402,F401
-    _ASSET_TARGETS,
-    _E2E_RECALL_QUERY,
-    _E2E_TEMPLATE,
-    _ENV_MINIMAL_TEMPLATE,
-    _ROUTING_MINIMAL_TEMPLATE,
-    _ago,
-    _consolidator_activity,
     _consolidator_command,
     _embed_listening,
     _embed_pid,
@@ -488,34 +548,18 @@ from bladex_proxy.cli.lifecycle import (  # noqa: E402,F401
     _flash_command,
     _flash_pid,
     _flash_status_line,
-    _fmt_bytes,
-    _fmt_traffic_row,
-    _format_queue,
-    _hidden_pth_files,
-    _install_model_facing_assets,
     _is_local_host,
-    _print_degradation_banner,
-    _print_funnel,
-    _print_memory_config,
-    _print_traffic,
-    _probe_port,
-    _probe_upstream,
     _prune_logs,
     _redis_hostport,
     _redis_ping,
     _report_startup_state,
-    _run_e2e_check,
-    _scrape_metrics,
-    _stale_data_dirs,
     _start_consolidator,
     _start_embed,
     _start_flash,
     _start_proxy,
     _stop_by_pidfile,
     consolidator,
-    doctor,
     embed,
-    init,
     restart,
     start,
     status,
@@ -578,6 +622,19 @@ from bladex_proxy.cli.ops_cmds import (  # noqa: E402,F401
     sync_run,
     sync_status,
 )
+from bladex_proxy.cli.status_display import (  # noqa: E402,F401
+    _ago,
+    _consolidator_activity,
+    _fmt_bytes,
+    _fmt_traffic_row,
+    _format_backlog_trend,
+    _format_queue,
+    _print_degradation_banner,
+    _print_funnel,
+    _print_memory_config,
+    _print_traffic,
+    _scrape_metrics,
+)
 
 # ── 入口（兼容层：scripts/bladex.py 与 test_sync_cli 依赖 main(argv)->int）──
 
@@ -589,6 +646,10 @@ def main(argv: list[str] | None = None) -> int:
     import click
     try:
         rv = app(args=argv, standalone_mode=False, prog_name="bladex")
+    except ShellRestricted as e:
+        print(f"  {_UNDETERMINED_TEXT}: {e}")
+        print("  Nothing was changed. Run this from a normal terminal.")
+        return RC_UNDETERMINED
     except (typer.Exit, click.exceptions.Exit) as e:
         return int(getattr(e, "exit_code", 0) or 0)
     except SystemExit as e:

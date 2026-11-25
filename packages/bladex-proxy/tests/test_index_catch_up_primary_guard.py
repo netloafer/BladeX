@@ -32,6 +32,7 @@ def _bare_index(read_only: bool) -> MemoryIndex:
     idx._meta_db = _FakeMetaDb()
     idx._last_catchup_monotonic = 0.0
     idx._catchup_throttle_s = 0.0
+    idx._reopen_if_swapped = lambda: None   # 批 AB · MQ-I38：换名检测另有用例，这里只测分流
     return idx
 
 

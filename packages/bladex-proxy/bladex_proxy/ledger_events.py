@@ -32,9 +32,15 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
+import structlog
 from bladex_core.ledger import LEDGER_EVENT_TYPES, apply_ledger_tombstones
+from bladex_core.project import canonical_project_id, set_project_key_map
+
+logger = structlog.get_logger()
 
 #: 账本墓碑的 target_type 字面量。取字符串而非 import 枚举：本模块被 core 侧
 #: 逻辑与 proxy 存储层共用，避免把 proxy 的 models 拖进更浅的依赖层。
@@ -77,14 +83,59 @@ def tombstoned_ledger_ids(hub: Any) -> set[str]:
     return set(tombstoned_ledgers(hub))
 
 
+#: 批 BA2（拍板 (32)-b）：一次性迁移写在 Hub 旁边的派生文件；Hub 本身不改写。
+PROJECT_KEY_MAP_NAME = "project_key_map.json"
+_key_map_state: dict[str, Any] = {"path": None, "mtime": None}
+
+
+def refresh_project_key_map(hub: Any) -> None:
+    """按 Hub 目录找映射文件并装进 `canonical_project_id`。文件缺失 = 空表（回滚 = 删文件）。
+
+    **唯一的装载实现**，按 mtime 去重、重复调用无开销。两个调用点：这里下面的
+    `load_ledger_events`，以及 `MemoryIndex._rebuild_from_hub_impl` 入口（批 BA2b：逐轮写 Project
+    早于锚层装事件，新进程第一趟要在第一条轮次之前就有表）。
+    """
+    hub_path = getattr(hub, "_path", None)
+    if hub_path is None:
+        return                       # 快照包装器等没有路径的 Hub：不动已装载的表
+    path = Path(hub_path).parent / PROJECT_KEY_MAP_NAME
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        mtime = None
+    if _key_map_state["path"] == path and _key_map_state["mtime"] == mtime:
+        return
+    mapping: dict[str, str] = {}
+    if mtime is not None:
+        try:
+            mapping = dict(json.loads(path.read_text(encoding="utf-8")).get("map") or {})
+        except (OSError, ValueError, AttributeError) as e:
+            logger.warning("project_key_map_load_failed", path=str(path), error=str(e))
+    set_project_key_map(mapping)
+    _key_map_state.update(path=path, mtime=mtime)
+    if mapping:
+        logger.info("project_key_map_loaded", entries=len(mapping))
+
+
+def _translate_project_keys(payload: Any) -> Any:
+    """事件载荷里的旧项目键换现行键；**不改原对象**（payload 是 Hub 读出来的）。"""
+    if not isinstance(payload, dict):
+        return payload
+    changed = {f: canonical_project_id(payload[f])
+               for f in ("project_id", "from_project", "to_project")
+               if payload.get(f) and canonical_project_id(payload[f]) != payload[f]}
+    return {**payload, **changed} if changed else payload
+
+
 def load_ledger_events(hub: Any, *, keep_tombstoned_pool: bool = False) -> list[dict]:
     """从 Hub 装载账本事件（已过滤类型、已应用墓碑）。三个消费方共用。"""
+    refresh_project_key_map(hub)
     tombs = tombstoned_ledgers(hub)
     events: list[dict] = []
     for _key, ev in hub.scan_admin_events():
         etype = getattr(ev.event_type, "value", str(ev.event_type))
         if etype in LEDGER_EVENT_TYPES:
-            events.append({"type": etype, "payload": ev.payload,
+            events.append({"type": etype, "payload": _translate_project_keys(ev.payload),
                            "ts": getattr(ev, "ts", None)})
     filtered = apply_ledger_tombstones(events, set(tombs), tombstone_ts_ms=tombs)
     if not keep_tombstoned_pool or not tombs:
