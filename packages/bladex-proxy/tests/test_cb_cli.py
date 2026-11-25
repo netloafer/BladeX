@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import stat
 import sys
 from pathlib import Path
@@ -106,7 +107,10 @@ def test_help_says_review_before_sending_and_trust_boundary(monkeypatch, capsys)
     with pytest.raises(SystemExit):
         cli.main(["ledger", "handoff", "--help"]) and None
         raise SystemExit
-    text = " ".join(capsys.readouterr().out.split())
+    out = capsys.readouterr().out
+    out = re.sub(r"\x1b\[[0-9;]*m", "", out)  # GITHUB_ACTIONS=true makes rich colour output
+    out = re.sub(r"[│╭╮╰╯─]", " ", out)  # rich panel borders
+    text = " ".join(out.split())
     assert "NOT filtered for personal information" in text
     assert "only import packages you trust" in text
     assert "catches damage, not forgery" in text
